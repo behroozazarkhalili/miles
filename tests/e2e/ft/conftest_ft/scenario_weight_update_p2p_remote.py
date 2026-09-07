@@ -63,9 +63,15 @@ def assert_hook_outcome(run: TargetedHookRun) -> None:
 
     victim = assert_remote_victim_was_harmed(fire, run.events, armed=armed, assignment=assignment)
     harm_observed_at = compute_victim_harm_observed_at(run.events, fire=fire)
-    assert_remote_victim_recovered(run.events, fire=fire, since=harm_observed_at)
+    victim_recovered_at = assert_remote_victim_recovered(run.events, fire=fire, since=harm_observed_at)
     assert_unrelated_target_kept_serving(run.events, armed=armed, assignment=assignment, since=harm_observed_at)
-    assert_weights_published_after(run.event_dir, after=assignment.timestamp)
+    assert_weights_published_after(
+        run.event_dir,
+        fire=fire,
+        trainer_model_id=armed.expected_source.model_id,
+        required_cell_ids={victim},
+        recovered_at=victim_recovered_at,
+    )
 
     print(f"Remote fault confined to {victim}")
 

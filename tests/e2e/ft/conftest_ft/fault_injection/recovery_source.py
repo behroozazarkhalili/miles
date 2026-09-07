@@ -40,4 +40,4 @@ def completed_a_step(event: TrainGroupStepEndEvent) -> bool:
 
 
 def carries_checksums(event: InferenceEngineWeightChecksumEvent) -> bool:
-    return any(checksums for checksums in event.engine_checksums)
+    return any(checksums for checksums in event.engine_checksums.values())

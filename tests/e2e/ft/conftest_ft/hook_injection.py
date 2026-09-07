@@ -567,9 +567,10 @@ def assert_trainer_cell_healed(event_dir: Path, *, assignment: WeightUpdateAssig
 
 def assert_assigned_targets_isolated(
     events: list[Event], *, assignment: WeightUpdateAssignmentEvent, since: datetime
-) -> None:
+) -> datetime:
     incarnations = compute_incarnations_of_cell(events, cell_type=ROLLOUT_CELL_TYPE)
 
+    served_again_at: list[datetime] = []
     for cell_id, workers_hash in sorted(assignment.assigned_workers_hash_of_cell_id.items()):
         observed = incarnations.get(cell_id, [])
         assert workers_hash in observed, (
@@ -581,16 +582,19 @@ def assert_assigned_targets_isolated(
             f"Isolation witness failed: {cell_id} still runs {workers_hash} at the end of the run, so a target of "
             f"the sender that died mid-update was never taken out of service ({last})"
         )
-        assert _was_serving_after(events, cell_name=cell_id, other_than=workers_hash, since=since), (
+        recovered_at = _first_served_after(events, cell_name=cell_id, other_than=workers_hash, since=since)
+        assert recovered_at is not None, (
             f"Isolation witness failed: {cell_id} was never observed healthy and Serving under a replacement of "
             f"{workers_hash}, so the run ended with one of the harmed sender's targets missing "
             f"(observed: {incarnations})"
         )
+        served_again_at.append(recovered_at)
 
     print(
         f"Isolation witness passed: every assigned target {sorted(assignment.assigned_workers_hash_of_cell_id)} lost "
         f"the incarnation the harmed sender wrote to and served again under a replacement"
     )
+    return max(served_again_at)
 
 
 def assert_unrelated_target_kept_serving(
@@ -622,19 +626,57 @@ def assert_unrelated_target_kept_serving(
     return survivors[0]
 
 
-def assert_weights_published_after(event_dir: Path, *, after: datetime) -> None:
+def assert_weights_published_after(
+    event_dir: Path,
+    *,
+    fire: FaultHookFireEvent,
+    trainer_model_id: str | None,
+    required_cell_ids: set[str],
+    recovered_at: datetime,
+) -> None:
+    assert fire.weight_version is not None, (
+        f"Progress witness failed: request {fire.request_id!r} names no weight update, so no publication can be "
+        f"called later than the one it fired in"
+    )
+    assert recovered_at >= fire.timestamp, (
+        f"Progress witness failed: {sorted(required_cell_ids)} were called recovered at "
+        f"{recovered_at.isoformat()}, before request {fire.request_id!r} fired at {fire.timestamp.isoformat()}, so "
+        f"the recovery this witness builds on happened before the harm it is supposed to answer"
+    )
     published = [
         event
         for event in read_events(event_dir)
         if isinstance(event, InferenceEngineWeightChecksumEvent)
-        and event.timestamp > after
+        and event.trainer_model_id == trainer_model_id
+        and event.timestamp > fire.timestamp
+        and event.weight_version > fire.weight_version
         and carries_checksums(event)
     ]
     assert published, (
-        f"Progress witness failed: no non-empty weight publication reached an engine after {after.isoformat()}, so "
-        f"the run did not go on updating weights past the injected fault (events in {event_dir})"
+        f"Progress witness failed: model {trainer_model_id!r} published no weight version past "
+        f"{fire.weight_version} with a non-empty checksum after request {fire.request_id!r} fired at "
+        f"{fire.timestamp.isoformat()}, so the run did not go on updating weights past the injected fault, and an "
+        f"earlier publication cannot pay for it (events in {event_dir})"
     )
-    print(f"Progress witness passed: {len(published)} non-empty weight publication(s) after {after.isoformat()}")
+
+    audited = {
+        cell_id
+        for event in published
+        if event.timestamp > recovered_at
+        for cell_id, checksums in event.engine_checksums.items()
+        if checksums
+    }
+    missing = sorted(required_cell_ids - audited)
+    assert not missing, (
+        f"Progress witness failed: {missing} took no published weight version after they were observed serving "
+        f"again at {recovered_at.isoformat()}, so a publication their harmed incarnation may have taken, or another "
+        f"cell's progress, is all this run can show for them (audited {sorted(audited)})"
+    )
+    print(
+        f"Progress witness passed: model {trainer_model_id!r} published "
+        f"{sorted({event.weight_version for event in published})} past request {fire.request_id!r}, reaching "
+        f"{sorted(required_cell_ids)} after they served again at {recovered_at.isoformat()}"
+    )
 
 
 # ============================== observation utils ==============================
@@ -678,15 +720,32 @@ def _was_serving_after(
     exactly: str | None = None,
     other_than: str | None = None,
 ) -> bool:
-    for info in _observations_of_since(events, cell_name=cell_name, since=since):
-        if not info.alive or info.state is not ObservedCellState.SERVING:
+    return (
+        _first_served_after(events, cell_name=cell_name, since=since, exactly=exactly, other_than=other_than)
+        is not None
+    )
+
+
+def _first_served_after(
+    events: list[Event],
+    *,
+    cell_name: str,
+    since: datetime,
+    exactly: str | None = None,
+    other_than: str | None = None,
+) -> datetime | None:
+    for event in events:
+        if not isinstance(event, ObservationsEvent) or event.timestamp < since:
+            continue
+        info = event.cell_infos.get(cell_name)
+        if info is None or not info.alive or info.state is not ObservedCellState.SERVING:
             continue
         if exactly is not None and info.workers_hash != exactly:
             continue
         if other_than is not None and info.workers_hash == other_than:
             continue
-        return True
-    return False
+        return event.timestamp
+    return None
 
 
 # ============================== remote victim witnesses ==============================
@@ -726,13 +785,15 @@ def assert_remote_victim_was_harmed(
     return victim
 
 
-def assert_remote_victim_recovered(events: list[Event], *, fire: FaultHookFireEvent, since: datetime) -> None:
+def assert_remote_victim_recovered(events: list[Event], *, fire: FaultHookFireEvent, since: datetime) -> datetime:
     victim = fire.victim_cell_id
-    assert _was_serving_after(events, cell_name=victim, other_than=fire.victim_workers_hash, since=since), (
+    recovered_at = _first_served_after(events, cell_name=victim, other_than=fire.victim_workers_hash, since=since)
+    assert recovered_at is not None, (
         f"Remote fault witness failed: {victim} was never observed healthy and Serving under a replacement of "
         f"{fire.victim_workers_hash}, so the run ended with the harmed engine missing"
     )
     print(f"Remote recovery witness passed: {victim} served again under a replacement of {fire.victim_workers_hash}")
+    return recovered_at
 
 
 def compute_victim_harm_observed_at(events: list[Event], *, fire: FaultHookFireEvent) -> datetime:

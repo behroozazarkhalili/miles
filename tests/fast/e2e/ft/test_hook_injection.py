@@ -39,6 +39,7 @@ _ARMED_CELL = "trainer-engine-actor-00001"
 _ARMED_HASH = "trainer-generation-0"
 _ASSIGNED = {"rollout-engine-00000": "engine-generation-0", "rollout-engine-00001": "engine-generation-0"}
 _UNRELATED = {"rollout-engine-00002": "engine-generation-0", "rollout-engine-00003": "engine-generation-0"}
+_ASSIGNED_CHECKSUMS = {cell_id: {"w": f"hash-{cell_id}"} for cell_id in _ASSIGNED}
 
 _T0 = datetime(2020, 1, 1, tzinfo=timezone.utc)
 _CONTROLLER = TrainerControllerProcessIdentity(trainer_id="actor")
@@ -166,9 +167,21 @@ def _reconfigure(*, at: datetime, alive: list[int], healed: list[int]) -> CellRe
     )
 
 
-def _publication(*, at: datetime, checksums: list[dict[str, str]], rollout_id: int = 1):
+def _publication(
+    *,
+    at: datetime,
+    checksums: dict[str, dict[str, str]],
+    weight_version: int = _WEIGHT_VERSION + 1,
+    rollout_id: int = 1,
+    trainer_model_id: str | None = None,
+):
     return InferenceEngineWeightChecksumEvent(
-        timestamp=at, source=_DRIVER, rollout_id=rollout_id, engine_checksums=checksums
+        timestamp=at,
+        source=_DRIVER,
+        rollout_id=rollout_id,
+        weight_version=weight_version,
+        trainer_model_id=trainer_model_id,
+        engine_checksums=checksums,
     )
 
 
@@ -249,7 +262,7 @@ class TestRecoverySourceGate:
         _write_events(
             tmp_path / "events",
             file_name="main.jsonl",
-            events=[_step_end(), _publication(at=_T0, checksums=[{"w": "h"}])],
+            events=[_step_end(), _publication(at=_T0, checksums={"cell-a": {"w": "h"}})],
         )
 
         assert not hook_injection.recovery_source_exists(
@@ -263,7 +276,7 @@ class TestRecoverySourceGate:
         _write_events(
             tmp_path / "events",
             file_name="main.jsonl",
-            events=[_step_end(), _publication(at=_T0, checksums=[{"w": "h"}])],
+            events=[_step_end(), _publication(at=_T0, checksums={"cell-a": {"w": "h"}})],
         )
 
         assert not hook_injection.recovery_source_exists(
@@ -284,7 +297,7 @@ class TestRecoverySourceGate:
         _write_events(
             tmp_path / "events",
             file_name="main.jsonl",
-            events=[_step_end(), _publication(at=_T0, checksums=[{"w": "h"}], rollout_id=-1)],
+            events=[_step_end(), _publication(at=_T0, checksums={"cell-a": {"w": "h"}}, rollout_id=-1)],
         )
 
         assert not hook_injection.recovery_source_exists(
@@ -298,7 +311,7 @@ class TestRecoverySourceGate:
         _write_events(
             tmp_path / "events",
             file_name="main.jsonl",
-            events=[_step_end(), _publication(at=_T0, checksums=[{}])],
+            events=[_step_end(), _publication(at=_T0, checksums={"cell-a": {}})],
         )
 
         assert not hook_injection.recovery_source_exists(
@@ -314,7 +327,7 @@ class TestRecoverySourceGate:
             file_name="main.jsonl",
             events=[
                 _step_end(outcome=TrainStepOutcome.DISCARDED_SHOULD_RETRY),
-                _publication(at=_T0, checksums=[{"w": "h"}]),
+                _publication(at=_T0, checksums={"cell-a": {"w": "h"}}),
             ],
         )
 
@@ -329,7 +342,7 @@ class TestRecoverySourceGate:
         _write_events(
             tmp_path / "events",
             file_name="main.jsonl",
-            events=[_step_end(), _publication(at=_T0, checksums=[{"w": "h"}])],
+            events=[_step_end(), _publication(at=_T0, checksums={"cell-a": {"w": "h"}})],
         )
 
         assert hook_injection.recovery_source_exists(event_dir=tmp_path / "events", checkpoint_dir=tmp_path / "ckpt")
@@ -629,6 +642,14 @@ class TestIsolationWitness:
 
         hook_injection.assert_assigned_targets_isolated(log.events, assignment=_assignment(), since=_T0)
 
+    def test_the_moment_every_target_was_back_is_returned(self):
+        """The progress witness dates the weights it demands from this moment, not from the fault."""
+        log = _healthy_run_log(trainer_hashes=[_ARMED_HASH, "trainer-generation-1"])
+
+        recovered_at = hook_injection.assert_assigned_targets_isolated(log.events, assignment=_assignment(), since=_T0)
+
+        assert recovered_at == log.events[-1].timestamp
+
 
 class TestBlastRadiusWitness:
     def test_an_unrelated_engine_that_was_replaced_too_fails_the_run(self):
@@ -684,29 +705,129 @@ class TestBlastRadiusWitness:
 
 
 class TestProgressWitness:
-    def test_no_publication_after_the_fault_fails_the_run(self, tmp_path: Path):
-        """A run that stops publishing after the fault has not survived it, however cleanly it exits."""
-        _write_events(tmp_path, file_name="main.jsonl", events=[_publication(at=_at(1), checksums=[{"w": "h"}])])
+    @staticmethod
+    def _assert(
+        tmp_path: Path,
+        *,
+        required: set[str] | None = None,
+        model_id: str | None = None,
+        recovered_at: datetime | None = None,
+    ) -> None:
+        hook_injection.assert_weights_published_after(
+            tmp_path,
+            fire=_fire(),
+            trainer_model_id=model_id,
+            required_cell_ids=set(_ASSIGNED) if required is None else required,
+            recovered_at=_at(15) if recovered_at is None else recovered_at,
+        )
 
-        with pytest.raises(AssertionError, match="no non-empty weight publication"):
-            hook_injection.assert_weights_published_after(tmp_path, after=_at(5))
-
-    def test_an_empty_publication_after_the_fault_is_not_progress(self, tmp_path: Path):
-        """An engine list that is empty, or full of empty dicts, records that nothing was pushed anywhere."""
+    def test_a_publication_from_before_the_fault_is_not_progress(self, tmp_path: Path):
+        """A publication the fault has not touched yet cannot show that the run went on past it."""
         _write_events(
             tmp_path,
             file_name="main.jsonl",
-            events=[_publication(at=_at(9), checksums=[]), _publication(at=_at(10), checksums=[{}, {}])],
+            events=[_publication(at=_at(1), weight_version=_WEIGHT_VERSION - 1, checksums=_ASSIGNED_CHECKSUMS)],
         )
 
-        with pytest.raises(AssertionError, match="no non-empty weight publication"):
-            hook_injection.assert_weights_published_after(tmp_path, after=_at(5))
+        with pytest.raises(AssertionError, match="published no weight version past"):
+            self._assert(tmp_path)
 
-    def test_a_non_empty_publication_after_the_fault_passes(self, tmp_path: Path):
-        """Weights reaching an engine after the fault is the evidence that the update path recovered."""
-        _write_events(tmp_path, file_name="main.jsonl", events=[_publication(at=_at(9), checksums=[{"w": "h"}])])
+    def test_republishing_the_version_the_fault_fired_in_is_not_progress(self, tmp_path: Path):
+        """The update the fault landed in finishes for the survivors; going on means the next version."""
+        _write_events(
+            tmp_path,
+            file_name="main.jsonl",
+            events=[_publication(at=_at(20), weight_version=_WEIGHT_VERSION, checksums=_ASSIGNED_CHECKSUMS)],
+        )
 
-        hook_injection.assert_weights_published_after(tmp_path, after=_at(5))
+        with pytest.raises(AssertionError, match="published no weight version past"):
+            self._assert(tmp_path)
+
+    def test_an_empty_publication_after_the_fault_is_not_progress(self, tmp_path: Path):
+        """A cell map that is empty, or full of empty dicts, records that nothing was pushed anywhere."""
+        _write_events(
+            tmp_path,
+            file_name="main.jsonl",
+            events=[
+                _publication(at=_at(20), weight_version=_WEIGHT_VERSION + 1, checksums={}),
+                _publication(at=_at(21), weight_version=_WEIGHT_VERSION + 2, checksums={"rollout-engine-00000": {}}),
+            ],
+        )
+
+        with pytest.raises(AssertionError, match="published no weight version past"):
+            self._assert(tmp_path)
+
+    def test_another_policys_publication_does_not_pay_for_this_one(self, tmp_path: Path):
+        """A run that trains two policies must not let one policy's progress cover the one that was harmed."""
+        _write_events(
+            tmp_path,
+            file_name="main.jsonl",
+            events=[_publication(at=_at(20), checksums=_ASSIGNED_CHECKSUMS, trainer_model_id="other")],
+        )
+
+        with pytest.raises(AssertionError, match="published no weight version past"):
+            self._assert(tmp_path)
+
+    def test_a_publication_that_skipped_the_harmed_targets_fails(self, tmp_path: Path):
+        """Publishing only to the engines that were never harmed leaves the fault's own targets out of service."""
+        _write_events(
+            tmp_path,
+            file_name="main.jsonl",
+            events=[_publication(at=_at(20), checksums={"rollout-engine-00002": {"w": "h"}})],
+        )
+
+        with pytest.raises(AssertionError, match="took no published weight version"):
+            self._assert(tmp_path)
+
+    def test_a_later_publication_reaching_every_harmed_target_passes(self, tmp_path: Path):
+        """Weights reaching the fault's own targets afterwards is the evidence that the update path recovered."""
+        _write_events(
+            tmp_path, file_name="main.jsonl", events=[_publication(at=_at(20), checksums=_ASSIGNED_CHECKSUMS)]
+        )
+
+        self._assert(tmp_path)
+
+    def test_the_victim_of_a_remote_fault_must_publish_again_itself(self, tmp_path: Path):
+        """Another engine's progress says nothing about the engine the write actually killed."""
+        _write_events(
+            tmp_path,
+            file_name="main.jsonl",
+            events=[_publication(at=_at(20), checksums={"rollout-engine-00001": {"w": "h"}})],
+        )
+
+        with pytest.raises(AssertionError, match="took no published weight version"):
+            self._assert(tmp_path, required={"rollout-engine-00000"})
+
+    def test_a_publication_the_harmed_incarnation_took_before_it_recovered_does_not_count(self, tmp_path: Path):
+        """A receiver can still answer a push between the fire and its replacement, and that is not recovery."""
+        _write_events(
+            tmp_path, file_name="main.jsonl", events=[_publication(at=_at(14), checksums=_ASSIGNED_CHECKSUMS)]
+        )
+
+        with pytest.raises(AssertionError, match="took no published weight version"):
+            self._assert(tmp_path, recovered_at=_at(15))
+
+    def test_a_publication_after_the_verified_recovery_counts(self, tmp_path: Path):
+        """Only weights the replacement itself took prove the harmed target is back in the fan-out."""
+        _write_events(
+            tmp_path,
+            file_name="main.jsonl",
+            events=[
+                _publication(at=_at(14), checksums=_ASSIGNED_CHECKSUMS),
+                _publication(at=_at(20), weight_version=_WEIGHT_VERSION + 2, checksums=_ASSIGNED_CHECKSUMS),
+            ],
+        )
+
+        self._assert(tmp_path, recovered_at=_at(15))
+
+    def test_a_recovery_recorded_before_the_fault_fired_is_refused(self, tmp_path: Path):
+        """An observation from before the fire answers an earlier harm, not this one."""
+        _write_events(
+            tmp_path, file_name="main.jsonl", events=[_publication(at=_at(20), checksums=_ASSIGNED_CHECKSUMS)]
+        )
+
+        with pytest.raises(AssertionError, match="before request"):
+            self._assert(tmp_path, recovered_at=_at(9))
 
 
 _VICTIM = "rollout-engine-00000"
@@ -855,7 +976,9 @@ class TestRemoteVictimWitness:
         """Recovery of an engine is a Serving reading under a generation the killed one cannot produce."""
         log = _healthy_run_log(trainer_hashes=[_ARMED_HASH, _ARMED_HASH])
 
-        hook_injection.assert_remote_victim_recovered(log.events, fire=_remote_fire(), since=_T0)
+        recovered_at = hook_injection.assert_remote_victim_recovered(log.events, fire=_remote_fire(), since=_T0)
+
+        assert recovered_at == log.events[-1].timestamp
 
     def test_a_victim_that_never_changed_incarnation_has_no_harm_moment(self):
         """Without an observation of the replacement there is no point in time after the harm to read anything at."""

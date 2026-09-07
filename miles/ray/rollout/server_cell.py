@@ -326,6 +326,9 @@ class ServerCell:
     async def abort_all(self):
         return await self.api_client.abort_all_requests(timeout=ABORT_REQUEST_TIMEOUT_SECONDS)
 
+    async def get_weight_version(self) -> Any:
+        return await self.api_client.get_weight_version()
+
     async def check_weights(self, action: str, allow_quant_error: bool, selector: str, skip_list: list[str] | None):
         return await self.api_client.check_weights(
             action=action, allow_quant_error=allow_quant_error, selector=selector, skip_list=skip_list

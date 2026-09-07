@@ -1,29 +1,39 @@
 from collections.abc import Iterable
 
 from miles.utils.audit_utils.event_analyzer.rules.checksum_compare import ChecksumMismatchIssue, compare_flat_dicts
-from miles.utils.audit_utils.event_logger.models import Event, InferenceEngineWeightChecksumEvent
+from miles.utils.audit_utils.event_logger.models import Event
+from miles.utils.audit_utils.inference_engine_checksum_grouping import (
+    CellObservation,
+    PublicationKey,
+    format_publication,
+    group_observations_by_publication,
+)
 
 __all__ = ["check"]
 
 
 def check(events: list[Event]) -> list[ChecksumMismatchIssue]:
-    """Check: all engines of one rollout must hold exactly the same weights."""
+    """Check: every cell that took one published weight version must hold exactly the same weights."""
     issues: list[ChecksumMismatchIssue] = []
-    for event in events:
-        if isinstance(event, InferenceEngineWeightChecksumEvent):
-            issues += list(_check_one_rollout(event))
+    for key, observations in group_observations_by_publication(events).items():
+        issues += list(_check_one_publication(key=key, observations=observations))
     return issues
 
 
-def _check_one_rollout(event: InferenceEngineWeightChecksumEvent) -> Iterable[ChecksumMismatchIssue]:
-    engines = event.engine_checksums
-    if len(engines) < 2:
+def _check_one_publication(
+    *, key: PublicationKey, observations: list[CellObservation]
+) -> Iterable[ChecksumMismatchIssue]:
+    if len(observations) < 2:
         return
-    baseline = engines[0]
-    for engine_index in range(1, len(engines)):
+    baseline = observations[0]
+    for other in observations[1:]:
         yield from compare_flat_dicts(
-            a=baseline,
-            b=engines[engine_index],
-            label_a=f"rollout_{event.rollout_id}/engine_0",
-            label_b=f"rollout_{event.rollout_id}/engine_{engine_index}",
+            a=baseline.checksums,
+            b=other.checksums,
+            label_a=_label(key=key, cell_id=baseline.cell_id),
+            label_b=_label(key=key, cell_id=other.cell_id),
         )
+
+
+def _label(*, key: PublicationKey, cell_id: str) -> str:
+    return f"{format_publication(key)}/cell_{cell_id}"

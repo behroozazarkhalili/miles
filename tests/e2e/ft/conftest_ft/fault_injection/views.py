@@ -12,6 +12,7 @@ from tests.e2e.ft.conftest_ft.fault_injection.state import (
     InjectionEvent,
     ObservationsEvent,
     ObservedCellState,
+    WeightPublicationEvent,
     cell_info_is_in_service,
     cell_info_is_paused_for_weight_update,
 )
@@ -200,6 +201,8 @@ class HookHarm:
     victim_cell_name: str | None
     victim_workers_hash: str | None
     recovered: bool
+    recovered_at: datetime | None
+    published: bool
     refused_because: str | None
     harmless_because: str | None
 
@@ -209,7 +212,7 @@ class HookHarm:
 
     @property
     def completed(self) -> bool:
-        return self.delivered and self.recovered
+        return self.delivered and self.recovered and self.published
 
     @property
     def resolved_without_harm(self) -> bool:
@@ -231,7 +234,9 @@ def compute_hook_harms(events: list[Event]) -> list[HookHarm]:
             _absorb_hook_fire(harms, event)
         elif isinstance(event, ObservationsEvent):
             _absorb_hook_recovery(harms, event)
-    return list(harms.values())
+
+    publications = [event for event in events if isinstance(event, WeightPublicationEvent)]
+    return [_absorb_hook_publications(harm, publications) for harm in harms.values()]
 
 
 def compute_unresolved_hook_harms(events: list[Event]) -> list[HookHarm]:
@@ -265,6 +270,8 @@ def _absorb_hook_arm(harms: dict[str, HookHarm], event: HookArmEvent) -> None:
         victim_cell_name=None,
         victim_workers_hash=None,
         recovered=False,
+        recovered_at=None,
+        published=False,
         refused_because=None,
         harmless_because=None,
     )
@@ -313,11 +320,29 @@ def _absorb_hook_fire(harms: dict[str, HookHarm], event: HookFireEvent) -> None:
 
 def _absorb_hook_recovery(harms: dict[str, HookHarm], event: ObservationsEvent) -> None:
     for request_id, harm in list(harms.items()):
-        if harm.recovered or harm.victim_cell_name is None:
+        if harm.recovered or harm.victim_cell_name is None or harm.fire is None:
+            continue
+        if event.timestamp < harm.fire.fired_at:
             continue
         info = event.cell_infos.get(harm.victim_cell_name)
         if info is not None and info.workers_hash != harm.victim_workers_hash and cell_info_is_in_service(info):
-            harms[request_id] = dataclasses.replace(harm, recovered=True)
+            harms[request_id] = dataclasses.replace(harm, recovered=True, recovered_at=event.timestamp)
+
+
+def _absorb_hook_publications(harm: HookHarm, publications: list[WeightPublicationEvent]) -> HookHarm:
+    fire = harm.fire
+    if not harm.delivered or (recovered_at := harm.recovered_at) is None or fire.weight_version is None:
+        return harm
+
+    required = set(fire.assigned_cell_ids) if fire.target == FaultHookTarget.LOCAL.value else {harm.victim_cell_name}
+    covered: set[str] = set()
+    for event in publications:
+        if event.trainer_model_id != fire.trainer_model_id or event.weight_version <= fire.weight_version:
+            continue
+        if event.published_at <= recovered_at or event.published_at <= fire.fired_at:
+            continue
+        covered |= set(event.cell_ids)
+    return dataclasses.replace(harm, published=bool(required) and required.issubset(covered))
 
 
 def _compute_hook_victim(harm: HookHarm, event: HookFireEvent) -> tuple[str | None, str | None]:

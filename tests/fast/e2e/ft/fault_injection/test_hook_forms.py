@@ -110,12 +110,13 @@ def _fire(
     victim_workers_hash: str | None = None,
     receiver_identity: bool = True,
     delay_ms: int = 0,
+    at: datetime | None = None,
 ) -> FaultHookFireEvent:
     if outcome is None:
         outcome = hook_forms.EXPECTED_OUTCOME_OF_TARGET[target]
     remote = target is FaultHookTarget.REMOTE_INFERENCE_CELL
     return FaultHookFireEvent(
-        timestamp=_T0 + timedelta(seconds=10),
+        timestamp=at if at is not None else _T0 + timedelta(seconds=10),
         source=source if source is not None else _source_identity(),
         hook=hook,
         mode=mode,
@@ -132,6 +133,23 @@ def _fire(
         victim_receiver_rank=0 if remote and receiver_identity else None,
         victim_receiver_boot_uuid="boot-uuid" if remote and receiver_identity else None,
         victim_session_id="session-1" if remote and receiver_identity else None,
+    )
+
+
+def _publication(
+    *,
+    at: datetime,
+    weight_version: int = _WEIGHT_VERSION + 1,
+    cell_ids: tuple[str, ...] = (_ENGINE,),
+    trainer_model_id: str | None = None,
+) -> InferenceEngineWeightChecksumEvent:
+    return InferenceEngineWeightChecksumEvent(
+        timestamp=at,
+        source=_CONTROLLER,
+        rollout_id=1,
+        weight_version=weight_version,
+        trainer_model_id=trainer_model_id,
+        engine_checksums={cell_id: {"w": f"hash-{cell_id}"} for cell_id in cell_ids},
     )
 
 
@@ -616,6 +634,21 @@ class TestTheSoakArmsADrawnDelay:
 
         (harm,) = compute_hook_harms(log.events)
         assert harm.delivered and harm.fire.delay_ms == 500
+
+    def test_the_record_keeps_the_moment_production_reached_the_hook(self, tmp_path: Path) -> None:
+        """The collector reads the log later, and its own clock would date the fault to whenever it looked."""
+        log = EventLog()
+        _observe_cluster(log)
+        _arm(log)
+        fire = _fire()
+        _write_events(tmp_path / "events", file_name="controller.jsonl", events=[_assignment()])
+        _write_events(tmp_path / "events", file_name="actor.jsonl", events=[fire])
+
+        _collect(log, tmp_path)
+
+        (harm,) = compute_hook_harms(log.events)
+        assert harm.fire.fired_at == fire.timestamp
+        assert harm.fire.timestamp > fire.timestamp
 
     def test_a_fire_that_waited_another_time_leaves_the_request_outstanding(self, tmp_path: Path) -> None:
         """A fault that landed inside the update it was armed to outlive tested the moment nobody asked about."""
@@ -1146,9 +1179,8 @@ def test_a_second_assignment_of_the_same_update_and_cell_is_rejected(tmp_path: P
 
 
 class TestRecovery:
-    def test_a_harm_is_resolved_only_by_a_replacement_back_in_service(self, tmp_path: Path) -> None:
-        """A form counts as successful once the incarnation the fire named has been replaced."""
-        log = EventLog()
+    @staticmethod
+    def _harm_a_remote_victim(log: EventLog, tmp_path: Path) -> None:
         _observe_cluster(log)
         _arm(log, target=FaultHookTarget.REMOTE_INFERENCE_CELL)
         _write_events(tmp_path / "events", file_name="controller.jsonl", events=[_assignment()])
@@ -1158,13 +1190,115 @@ class TestRecovery:
             events=[_fire(target=FaultHookTarget.REMOTE_INFERENCE_CELL)],
         )
         _collect(log, tmp_path)
+
+    @staticmethod
+    def _publish(tmp_path: Path, **kwargs) -> None:
+        _write_events(
+            tmp_path / "events",
+            file_name="main.jsonl",
+            events=[_publication(at=datetime.now(timezone.utc), **kwargs)],
+        )
+
+    def test_a_harm_is_resolved_by_a_replacement_that_took_new_weights(self, tmp_path: Path) -> None:
+        """A form counts as successful once the replacement of the harmed incarnation is publishing again."""
+        log = EventLog()
+        self._harm_a_remote_victim(log, tmp_path)
         _observe_cluster(log, engine_hash="engine-generation-1")
+        self._publish(tmp_path)
+        _collect(log, tmp_path)
 
         assert compute_successful_form_names(log.events, cell_type=ROLLOUT_CELL_TYPE) == {
             hook_forms.REMOTE_HOOK_FORM_NAME
         }
         assert compute_unresolved_hook_harms(log.events) == []
         assert compute_pending_injections(log.events) == []
+
+    def test_a_replacement_that_never_took_weights_again_stays_pending(self, tmp_path: Path) -> None:
+        """Serving is not proof it rejoined the fan-out, and the next fault must wait for that proof."""
+        log = EventLog()
+        self._harm_a_remote_victim(log, tmp_path)
+        _observe_cluster(log, engine_hash="engine-generation-1")
+        _collect(log, tmp_path)
+
+        assert compute_unresolved_hook_harms(log.events)
+        assert compute_pending_injections(log.events)
+
+    def test_a_publication_from_before_the_recovery_does_not_resolve_it(self, tmp_path: Path) -> None:
+        """The harmed incarnation can still answer a push, and reading the log later does not make it later."""
+        log = EventLog()
+        self._harm_a_remote_victim(log, tmp_path)
+        self._publish(tmp_path)
+        _observe_cluster(log, engine_hash="engine-generation-1")
+        _collect(log, tmp_path)
+
+        assert compute_unresolved_hook_harms(log.events)
+
+    def test_another_cells_publication_does_not_resolve_it(self, tmp_path: Path) -> None:
+        """Weights reaching an engine the fault never touched say nothing about the one it killed."""
+        log = EventLog()
+        self._harm_a_remote_victim(log, tmp_path)
+        _observe_cluster(log, engine_hash="engine-generation-1")
+        self._publish(tmp_path, cell_ids=(_OTHER_ENGINE,))
+        _collect(log, tmp_path)
+
+        assert compute_unresolved_hook_harms(log.events)
+
+    def test_another_policys_publication_does_not_resolve_it(self, tmp_path: Path) -> None:
+        """Another policy's weights never travel the path this fault broke."""
+        log = EventLog()
+        self._harm_a_remote_victim(log, tmp_path)
+        _observe_cluster(log, engine_hash="engine-generation-1")
+        self._publish(tmp_path, trainer_model_id="other")
+        _collect(log, tmp_path)
+
+        assert compute_unresolved_hook_harms(log.events)
+
+    def test_republishing_the_version_the_fault_fired_in_does_not_resolve_it(self, tmp_path: Path) -> None:
+        """That update is the one the fault landed in, so finishing it is not going on past it."""
+        log = EventLog()
+        self._harm_a_remote_victim(log, tmp_path)
+        _observe_cluster(log, engine_hash="engine-generation-1")
+        self._publish(tmp_path, weight_version=_WEIGHT_VERSION)
+        _collect(log, tmp_path)
+
+        assert compute_unresolved_hook_harms(log.events)
+
+    def test_a_replacement_observed_before_the_fault_fired_does_not_resolve_it(self, tmp_path: Path) -> None:
+        """The collector reads the log late, and an observation from before the fire answers an earlier harm."""
+        log = EventLog()
+        _observe_cluster(log)
+        _arm(log, target=FaultHookTarget.REMOTE_INFERENCE_CELL)
+        _write_events(tmp_path / "events", file_name="controller.jsonl", events=[_assignment()])
+        _write_events(
+            tmp_path / "events",
+            file_name="actor.jsonl",
+            events=[
+                _fire(
+                    target=FaultHookTarget.REMOTE_INFERENCE_CELL,
+                    at=datetime.now(timezone.utc) + timedelta(hours=1),
+                )
+            ],
+        )
+        _collect(log, tmp_path)
+        _observe_cluster(log, engine_hash="engine-generation-1")
+        self._publish(tmp_path)
+        _collect(log, tmp_path)
+
+        assert compute_unresolved_hook_harms(log.events)
+
+    def test_a_local_harm_is_resolved_by_its_assigned_targets_publishing_again(self, tmp_path: Path) -> None:
+        """A trainer fault costs the engines it was writing to, so those are the cells that owe the evidence."""
+        log = EventLog()
+        _observe_cluster(log)
+        _arm(log)
+        _write_events(tmp_path / "events", file_name="controller.jsonl", events=[_assignment()])
+        _write_events(tmp_path / "events", file_name="actor.jsonl", events=[_fire()])
+        _collect(log, tmp_path)
+        _observe_cluster(log, trainer_hash="trainer-generation-1")
+        self._publish(tmp_path)
+        _collect(log, tmp_path)
+
+        assert compute_unresolved_hook_harms(log.events) == []
 
     def test_the_harmed_generation_reading_healthy_again_does_not_resolve_it(self, tmp_path: Path) -> None:
         """The killed incarnation reads healthy for a long time; only a new one is evidence."""
@@ -1257,7 +1391,11 @@ def _write_recovery_source(tmp_path: Path) -> None:
                 timestamp=_T0, source=_CONTROLLER, rollout_id=1, cell_outcomes={0: [TrainStepOutcome.NORMAL]}
             ),
             InferenceEngineWeightChecksumEvent(
-                timestamp=_T0, source=_CONTROLLER, rollout_id=1, engine_checksums=[{"embedding": "abc"}]
+                timestamp=_T0,
+                source=_CONTROLLER,
+                rollout_id=1,
+                weight_version=1,
+                engine_checksums={"rollout-engine-00000": {"embedding": "abc"}},
             ),
         ],
     )
@@ -1319,3 +1457,23 @@ def test_a_rollout_only_soak_arms_a_trainer_it_never_crashes(tmp_path: Path) -> 
     observed = {name for event in log.events if isinstance(event, ObservationsEvent) for name in event.cell_infos}
     assert observed == {_ENGINE, _OTHER_ENGINE}
     assert not [event for event in log.events if isinstance(event, InjectionEvent)]
+
+
+def test_the_loop_reads_the_production_log_once_more_after_it_is_told_to_stop() -> None:
+    """Weights published in the last moments of the run are the ones the final harm is still owed."""
+    stop_event = threading.Event()
+    stop_event.set()
+    collected: list[int] = []
+
+    run_fault_injection_loop(
+        base_url="http://control",
+        seed=0,
+        mean_interval_seconds_of_cell_type={ROLLOUT_CELL_TYPE: 1e-9},
+        stop_event=stop_event,
+        event_log=EventLog(),
+        cell_fault_forms={ROLLOUT_CELL_TYPE: []},
+        collect_hook_fires=lambda: collected.append(1),
+        poll_interval_seconds=1e-6,
+    )
+
+    assert collected == [1]

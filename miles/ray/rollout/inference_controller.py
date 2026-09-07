@@ -1,10 +1,11 @@
 import asyncio
 import logging
 import time
-from collections.abc import Sequence
+from collections.abc import Awaitable, Sequence
 from dataclasses import dataclass
 from typing import Any
 
+import httpx
 from sglang.srt.constants import GPU_MEMORY_TYPE_CUDA_GRAPH, GPU_MEMORY_TYPE_KV_CACHE, GPU_MEMORY_TYPE_WEIGHTS
 
 from miles.backends.sglang_utils.sglang_api_client import SGLangApiClient
@@ -42,6 +43,18 @@ CELLS_READY_POLL_INTERVAL_SECONDS = 2.0
 CELLS_READY_TIMEOUT_SECONDS = 3600.0
 HEALTH_PAUSED_FOR_WEIGHT_UPDATE = "WeightUpdateInProgress"
 HEALTH_PAUSED_FOR_OFFLOAD = "EnginesOffloaded"
+
+_CONFIRMED_TERMINATION_OUTCOMES = frozenset({CellTerminationOutcome.TERMINATED, CellTerminationOutcome.ALREADY_GONE})
+
+
+class _CellUnresponsiveError(Exception):
+    pass
+
+
+@dataclass(frozen=True)
+class _PublishedCells:
+    serving: list[ServerCell]
+    absent: dict[str, str]
 
 
 @enforce_lock_discipline
@@ -252,10 +265,178 @@ class InferenceController:
             snapshot_cell_id_to_hashes=snapshot_cell_id_to_hashes, cell_ids=list(snapshot_cell_id_to_hashes)
         )
 
+    @with_lock
+    async def snapshot_weight_checksums(
+        self,
+        *,
+        expected_weight_version: int,
+        published_cell_id_to_hashes: dict[str, str],
+        model_id: str | None = None,
+    ) -> dict[str, Any]:
+        assert published_cell_id_to_hashes, (
+            f"weight version {expected_weight_version} is said to have been published to no cell at all, so there is "
+            f"nothing this audit could read and nothing it could confirm gone"
+        )
+        srv = self._get_updatable_server(model_id=model_id)
+        assert srv is not None, (
+            f"weight version {expected_weight_version} was published to {sorted(published_cell_id_to_hashes)}, but "
+            f"this controller drives no updatable model, so those checksums belong to nothing it serves"
+        )
+
+        published = self._partition_published_cells(srv=srv, published_cell_id_to_hashes=published_cell_id_to_hashes)
+        results = await asyncio.gather(
+            *[
+                self._read_cell_weight_checksum(cell, expected_weight_version=expected_weight_version)
+                for cell in published.serving
+            ],
+            return_exceptions=True,
+        )
+
+        bodies: dict[str, Any] = {}
+        unresponsive: list[tuple[ServerCell, BaseException]] = []
+        rejected: list[BaseException] = []
+        for cell, result in zip(published.serving, results, strict=True):
+            if isinstance(result, _CellUnresponsiveError):
+                unresponsive.append((cell, result))
+            elif isinstance(result, BaseException):
+                rejected.append(result)
+            else:
+                bodies[cell.meta.cell_id] = result
+
+        await self._retire_cells_that_left_the_audit(unresponsive)
+        await self._retire_published_targets(
+            published.absent, reason="no longer served the incarnation this weight update published to"
+        )
+        if rejected:
+            raise rejected[0]
+        if not bodies:
+            logger.error(
+                f"No cell of weight version {expected_weight_version} could be audited: the publication reached "
+                f"{sorted(published_cell_id_to_hashes)}, of which "
+                f"{sorted(cell.meta.cell_id for cell, _ in unresponsive)} answered nothing and "
+                f"{sorted(published.absent)} had already left the incarnation it was published to; every one of "
+                f"them is confirmed gone, so this publication is recorded nowhere rather than as an audit that "
+                f"read nothing"
+            )
+        return bodies
+
+    @requires_lock
+    def _partition_published_cells(
+        self, *, srv: RolloutServer, published_cell_id_to_hashes: dict[str, str]
+    ) -> _PublishedCells:
+        foreign = sorted(
+            cell_id
+            for other in self.servers.values()
+            if other is not srv
+            for cell_id in published_cell_id_to_hashes
+            if cell_id in other.server_cells
+        )
+        assert not foreign, (
+            f"cells {foreign} serve another model of this run, so their weights are no evidence about the "
+            f"publication of {srv.model_name}"
+        )
+
+        serving: list[ServerCell] = []
+        absent: dict[str, str] = {}
+        for cell_id, workers_hash in sorted(published_cell_id_to_hashes.items()):
+            cell = srv.server_cells.get(cell_id)
+            if cell is not None and cell.meta.workers_hash == workers_hash and cell.is_serving:
+                serving.append(cell)
+            else:
+                absent[cell_id] = workers_hash
+        return _PublishedCells(serving=serving, absent=absent)
+
+    @requires_lock
+    async def _read_cell_weight_checksum(self, cell: ServerCell, *, expected_weight_version: int) -> Any:
+        reported_version = await self._request_of_audited_cell(cell, cell.get_weight_version())
+        assert str(reported_version) == str(expected_weight_version), (
+            f"cell {cell.meta.cell_id} serves weight version {reported_version!r}, but the trainer published "
+            f"{expected_weight_version}: its checksum would audit weights nobody asked it to hold"
+        )
+        return await self._request_of_audited_cell(
+            cell, cell.check_weights(action="checksum", allow_quant_error=False, selector="all", skip_list=None)
+        )
+
+    @requires_lock
+    async def _request_of_audited_cell(self, cell: ServerCell, request: Awaitable[Any]) -> Any:
+        timeout = self.args.update_weight_engine_request_timeout
+        try:
+            return await asyncio.wait_for(request, timeout=timeout)
+        except (TimeoutError, httpx.TransportError) as e:
+            raise _CellUnresponsiveError(
+                f"cell {cell.meta.cell_id} ({cell.meta.workers_hash}) did not answer the weight checksum audit "
+                f"within {timeout}s"
+            ) from e
+
+    @requires_lock
+    async def _retire_cells_that_left_the_audit(self, unresponsive: list[tuple[ServerCell, BaseException]]) -> None:
+        if not unresponsive:
+            return
+
+        if "rollout" not in self.args.ft_components:
+            raise unresponsive[0][1]
+
+        await self._retire_published_targets(
+            {cell.meta.cell_id: cell.meta.workers_hash for cell, _ in unresponsive},
+            reason="stopped answering while their weights were being audited",
+        )
+
+    @requires_lock
+    async def _retire_published_targets(self, cell_id_to_hashes: dict[str, str], *, reason: str) -> None:
+        if not cell_id_to_hashes:
+            return
+
+        assert "rollout" in self.args.ft_components, (
+            f"cells {sorted(cell_id_to_hashes)} {reason}, and this run tolerates no rollout fault, so nothing would "
+            f"replace them and the weight update fails instead of retiring them"
+        )
+        logger.error(
+            f"Cells {sorted(cell_id_to_hashes)} {reason}, so they are retired: an engine whose weights this "
+            f"publication cannot account for must not keep serving them"
+        )
+
+        known = self._cells_of_snapshot(snapshot_cell_id_to_hashes=cell_id_to_hashes, cell_ids=list(cell_id_to_hashes))
+        outcomes = await self._mark_cells_errored(
+            snapshot_cell_id_to_hashes=cell_id_to_hashes, cell_ids=[cell.meta.cell_id for cell in known]
+        )
+        outcomes |= await self._terminate_published_incarnations(
+            {cell_id: one for cell_id, one in cell_id_to_hashes.items() if cell_id not in outcomes}
+        )
+
+        unconfirmed = {
+            cell_id: outcomes.get(cell_id)
+            for cell_id in sorted(cell_id_to_hashes)
+            if outcomes.get(cell_id) not in _CONFIRMED_TERMINATION_OUTCOMES
+        }
+        assert not unconfirmed, (
+            f"cells {sorted(unconfirmed)} {reason}, and their old incarnation was never confirmed gone "
+            f"({unconfirmed}), so this publication cannot be recorded as audited while a process that may still "
+            f"hold half of it is unaccounted for"
+        )
+
+    @requires_lock
+    async def _terminate_published_incarnations(
+        self, cell_id_to_hashes: dict[str, str]
+    ) -> dict[str, CellTerminationOutcome | BaseException]:
+        cell_ids = sorted(cell_id_to_hashes)
+        outcomes = await asyncio.gather(
+            *[
+                self._cell_operations.terminate_incarnation(
+                    cell_id=cell_id, expected_workers_hash=cell_id_to_hashes[cell_id]
+                )
+                for cell_id in cell_ids
+            ],
+            return_exceptions=True,
+        )
+        for cell_id, outcome in zip(cell_ids, outcomes, strict=True):
+            if isinstance(outcome, BaseException):
+                logger.error(f"Stopping the retired incarnation of cell {cell_id} failed", exc_info=outcome)
+        return dict(zip(cell_ids, outcomes, strict=True))
+
     @requires_lock
     async def _mark_cells_errored(
         self, *, snapshot_cell_id_to_hashes: dict[str, str], cell_ids: Sequence[str]
-    ) -> None:
+    ) -> dict[str, CellTerminationOutcome | BaseException]:
         cells = self._cells_of_snapshot(snapshot_cell_id_to_hashes=snapshot_cell_id_to_hashes, cell_ids=cell_ids)
         for cell in cells:
             await cell.mark_errored()
@@ -270,9 +451,10 @@ class InferenceController:
                     f"generate requests may hang until the external reconciler removes it",
                     exc_info=outcome,
                 )
+        return {cell.meta.cell_id: outcome for cell, outcome in zip(cells, outcomes, strict=True)}
 
     @requires_lock
-    async def _terminate_errored_cell(self, cell: ServerCell) -> None:
+    async def _terminate_errored_cell(self, cell: ServerCell) -> CellTerminationOutcome:
         outcome = await self._cell_operations.terminate_incarnation(
             cell_id=cell.meta.cell_id, expected_workers_hash=cell.meta.workers_hash
         )
@@ -281,8 +463,9 @@ class InferenceController:
                 f"Cell {cell.meta.cell_id} already runs a generation other than {cell.meta.workers_hash}, so this "
                 f"incarnation was left alone and its exit stays unconfirmed; its paused requests may still hang"
             )
-            return
+            return outcome
         logger.info(f"Cell {cell.meta.cell_id} ({cell.meta.workers_hash}) is confirmed stopped: {outcome.value}")
+        return outcome
 
     @requires_lock
     def _cells_of_snapshot(

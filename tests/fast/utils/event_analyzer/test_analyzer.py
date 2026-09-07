@@ -15,6 +15,7 @@ from miles.utils.audit_utils.event_analyzer.analyzer import (
 from miles.utils.audit_utils.event_logger.logger import EventLogger
 from miles.utils.audit_utils.event_logger.models import (
     InferenceEngineWeightChecksumEvent,
+    MetricEvent,
     TrainEngineLocalWeightChecksumEvent,
     TrainEngineLocalWeightChecksumState,
 )
@@ -125,11 +126,12 @@ def _log_inference_engine_checksum_event(
     event_logger: EventLogger,
     *,
     rollout_id: int,
-    engine_checksums: list[dict[str, str]],
+    weight_version: int,
+    engine_checksums: dict[str, dict[str, str]],
 ) -> None:
     event_logger.log(
         InferenceEngineWeightChecksumEvent,
-        dict(rollout_id=rollout_id, engine_checksums=engine_checksums),
+        dict(rollout_id=rollout_id, weight_version=weight_version, engine_checksums=engine_checksums),
     )
 
 
@@ -140,7 +142,10 @@ class TestInferenceEngineChecksumRuleWiredIn:
             log_dir=tmp_path, file_name="e.jsonl", source=SimpleProcessIdentity(component="main")
         )
         _log_inference_engine_checksum_event(
-            event_logger, rollout_id=0, engine_checksums=[{"rank0/w": "aaa"}, {"rank0/w": "zzz"}]
+            event_logger,
+            rollout_id=0,
+            weight_version=1,
+            engine_checksums={"cell-a": {"rank0/w": "aaa"}, "cell-b": {"rank0/w": "zzz"}},
         )
         event_logger.close()
 
@@ -153,11 +158,35 @@ class TestInferenceEngineChecksumRuleWiredIn:
             log_dir=tmp_path, file_name="e.jsonl", source=SimpleProcessIdentity(component="main")
         )
         _log_inference_engine_checksum_event(
-            event_logger, rollout_id=0, engine_checksums=[{"rank0/w": "aaa"}, {"rank0/w": "aaa"}]
+            event_logger,
+            rollout_id=0,
+            weight_version=1,
+            engine_checksums={"cell-a": {"rank0/w": "aaa"}, "cell-b": {"rank0/w": "aaa"}},
         )
         event_logger.close()
 
         assert run_analysis(event_dir=tmp_path) == []
+
+    def test_a_run_that_captured_no_checksums_at_all_is_still_valid(self, tmp_path: Path) -> None:
+        """The capture is opt-in, so a run that never enabled it must not be failed for having no evidence."""
+        event_logger = EventLogger(
+            log_dir=tmp_path, file_name="e.jsonl", source=SimpleProcessIdentity(component="main")
+        )
+        event_logger.log(MetricEvent, dict(rollout_id=0, metrics={"loss": 1.0}))
+        event_logger.close()
+
+        assert run_analysis(event_dir=tmp_path) == []
+
+    def test_a_publication_recorded_without_any_cell_is_rejected(self, tmp_path: Path) -> None:
+        """Silently dropping it is how a malformed event disappears from version coverage."""
+        event_logger = EventLogger(
+            log_dir=tmp_path, file_name="e.jsonl", source=SimpleProcessIdentity(component="main")
+        )
+        _log_inference_engine_checksum_event(event_logger, rollout_id=0, weight_version=1, engine_checksums={})
+        event_logger.close()
+
+        with pytest.raises(AssertionError, match="names no inference cell"):
+            run_analysis(event_dir=tmp_path)
 
 
 class TestRunAnalysisFromArgs:

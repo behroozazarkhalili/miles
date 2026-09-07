@@ -133,7 +133,10 @@ class HookArmRefusedEvent(BaseEvent):
 
 
 class HookFireEvent(BaseEvent):
+    fired_at: datetime
     request_id: str
+    trainer_model_id: str | None
+    assigned_cell_ids: list[str]
     hook: str
     mode: str
     target: str
@@ -152,7 +155,16 @@ class HookFireEvent(BaseEvent):
     harmless_because: str | None
 
 
-Event = InjectionEvent | ObservationsEvent | HookArmEvent | HookArmRefusedEvent | HookFireEvent
+class WeightPublicationEvent(BaseEvent):
+    published_at: datetime
+    trainer_model_id: str | None
+    weight_version: int
+    cell_ids: list[str]
+
+
+Event = (
+    InjectionEvent | ObservationsEvent | HookArmEvent | HookArmRefusedEvent | HookFireEvent | WeightPublicationEvent
+)
 
 
 class EventLog:
@@ -217,6 +229,9 @@ class EventLog:
         self._append(HookArmRefusedEvent(request_id=request_id, refused_because=refused_because))
 
     def note_hook_fire(self, event: HookFireEvent) -> None:
+        self._append(event)
+
+    def note_weight_publication(self, event: WeightPublicationEvent) -> None:
         self._append(event)
 
     def observe(self, cells: list[dict]) -> None:

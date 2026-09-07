@@ -143,20 +143,22 @@ class TestCellReconfigureEvent:
 
 class TestInferenceEngineWeightChecksumEvent:
     def test_json_roundtrip(self) -> None:
-        """An engine weight checksum event survives a JSON round-trip with its per-engine checksums intact."""
-        engine_checksums = [
-            {"rank0/embed.weight": "aaa"},
-            {"rank0/embed.weight": "aaa", "rank1/embed.weight": "bbb"},
-        ]
+        """An engine weight checksum event survives a JSON round-trip with its per-cell checksums intact."""
+        engine_checksums = {
+            "cell-a": {"rank0/embed.weight": "aaa"},
+            "cell-b": {"rank0/embed.weight": "aaa", "rank1/embed.weight": "bbb"},
+        }
         event = InferenceEngineWeightChecksumEvent(
             timestamp=_FIXED_TS,
             source=_FIXED_SOURCE,
             rollout_id=4,
+            weight_version=9,
             engine_checksums=engine_checksums,
         )
         parsed = _event_adapter.validate_json(event.model_dump_json())
         assert isinstance(parsed, InferenceEngineWeightChecksumEvent)
         assert parsed.rollout_id == 4
+        assert parsed.weight_version == 9
         assert parsed.engine_checksums == engine_checksums
 
 
@@ -219,7 +221,8 @@ class TestDiscriminatedUnionParsesAllEvents:
                 timestamp=_FIXED_TS,
                 source=_FIXED_SOURCE,
                 rollout_id=0,
-                engine_checksums=[{"rank0/w": "aaa"}],
+                weight_version=1,
+                engine_checksums={"cell-a": {"rank0/w": "aaa"}},
             ),
         ]
         for event in events:

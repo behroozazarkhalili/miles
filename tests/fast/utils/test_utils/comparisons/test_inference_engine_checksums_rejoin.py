@@ -20,8 +20,9 @@ def _write_updates(side_dir: Path, engines_per_rollout: list[int], *, trainer_mo
             InferenceEngineWeightChecksumEvent,
             dict(
                 rollout_id=rollout_id,
+                weight_version=rollout_id + 1,
                 trainer_model_id=trainer_model_id,
-                engine_checksums=[{"rank0/w": f"hash-{rollout_id}"} for _ in range(num_engines)],
+                engine_checksums={f"cell-{index}": {"rank0/w": f"hash-{rollout_id}"} for index in range(num_engines)},
             ),
             print_log=False,
         )

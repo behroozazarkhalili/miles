@@ -63,9 +63,15 @@ def assert_hook_outcome(run: TargetedHookRun) -> None:
 
     harm_observed_at = assert_armed_trainer_was_replaced(run.events, armed=armed, fire=fire)
     assert_trainer_cell_healed(run.event_dir, assignment=assignment)
-    assert_assigned_targets_isolated(run.events, assignment=assignment, since=harm_observed_at)
+    targets_recovered_at = assert_assigned_targets_isolated(run.events, assignment=assignment, since=harm_observed_at)
     assert_unrelated_target_kept_serving(run.events, armed=armed, assignment=assignment, since=harm_observed_at)
-    assert_weights_published_after(run.event_dir, after=assignment.timestamp)
+    assert_weights_published_after(
+        run.event_dir,
+        fire=fire,
+        trainer_model_id=armed.expected_source.model_id,
+        required_cell_ids=set(assignment.assigned_workers_hash_of_cell_id),
+        recovered_at=targets_recovered_at,
+    )
 
 
 if __name__ == "__main__":

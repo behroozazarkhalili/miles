@@ -11,8 +11,34 @@ class TestInferenceEngineWeightChecksumEvent:
             "timestamp": "2026-01-01T00:00:00Z",
             "source": {"component": "main"},
             "rollout_id": None,
-            "engine_checksums": [{"rank0/embed.weight": "aaa"}],
+            "weight_version": 3,
+            "engine_checksums": {"cell-a": {"rank0/embed.weight": "aaa"}},
         }
 
         with pytest.raises(ValidationError, match="rollout_id"):
+            InferenceEngineWeightChecksumEvent.model_validate(data)
+
+    def test_a_missing_weight_version_is_rejected(self) -> None:
+        """Without the published version, every consumer would have to guess which weights it is looking at."""
+        data = {
+            "timestamp": "2026-01-01T00:00:00Z",
+            "source": {"component": "main"},
+            "rollout_id": 3,
+            "engine_checksums": {"cell-a": {"rank0/embed.weight": "aaa"}},
+        }
+
+        with pytest.raises(ValidationError, match="weight_version"):
+            InferenceEngineWeightChecksumEvent.model_validate(data)
+
+    def test_a_positional_engine_list_is_rejected(self) -> None:
+        """Checksums keyed by list position cannot name the cell they came from, so the old shape must fail."""
+        data = {
+            "timestamp": "2026-01-01T00:00:00Z",
+            "source": {"component": "main"},
+            "rollout_id": 3,
+            "weight_version": 3,
+            "engine_checksums": [{"rank0/embed.weight": "aaa"}],
+        }
+
+        with pytest.raises(ValidationError, match="engine_checksums"):
             InferenceEngineWeightChecksumEvent.model_validate(data)

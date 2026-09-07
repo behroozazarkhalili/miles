@@ -129,6 +129,7 @@ def make_args(**overrides: Any) -> Namespace:
         offload_rollout=False,
         use_fault_tolerance=False,
         ft_components=[],
+        update_weight_engine_request_timeout=30.0,
         rollout_health_check_interval=30.0,
         rollout_health_check_timeout=30.0,
         rollout_health_check_first_wait=0.0,

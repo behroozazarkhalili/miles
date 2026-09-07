@@ -385,6 +385,16 @@ class TestUpdateWeights:
             start_rollout_id=start_rollout_id,
         )
 
+    @staticmethod
+    def _checksum_controller():
+        return MagicMock(
+            start_update_weights=AsyncMock(
+                return_value=SimpleNamespace(snapshot_cell_id_to_hashes={"cell-0": "hash-0", "cell-1": "hash-1"})
+            ),
+            end_update_weights=AsyncMock(),
+            snapshot_weight_checksums=AsyncMock(),
+        )
+
     def _record_checksum_events(self, monkeypatch) -> list[dict]:
         logged: list[dict] = []
         monkeypatch.setattr(placement_group_module, "is_event_logger_initialized", lambda: True)
@@ -393,7 +403,7 @@ class TestUpdateWeights:
             "get_event_logger",
             lambda: SimpleNamespace(log=lambda _event_class, payload: logged.append(payload)),
         )
-        monkeypatch.setattr(placement_group_module, "flatten_inference_engine_checksums", lambda _result: [])
+        monkeypatch.setattr(placement_group_module, "flatten_inference_engine_checksums", lambda _result: {})
         monkeypatch.setattr(
             placement_group_module,
             "FTTestActionOrchestrationExecutor",
@@ -406,9 +416,7 @@ class TestUpdateWeights:
         from miles.ray.placement_group import update_weights
 
         actor_model, rollout_executor = self._fakes(weight_version=7)
-        inference_controller = MagicMock(
-            start_update_weights=AsyncMock(), end_update_weights=AsyncMock(), check_weights=AsyncMock()
-        )
+        inference_controller = self._checksum_controller()
         logged = self._record_checksum_events(monkeypatch)
 
         await update_weights(
@@ -422,9 +430,7 @@ class TestUpdateWeights:
         from miles.ray.placement_group import update_weights
 
         actor_model, rollout_executor = self._fakes(weight_version=7)
-        inference_controller = MagicMock(
-            start_update_weights=AsyncMock(), end_update_weights=AsyncMock(), check_weights=AsyncMock()
-        )
+        inference_controller = self._checksum_controller()
         logged = self._record_checksum_events(monkeypatch)
 
         await update_weights(
@@ -438,9 +444,7 @@ class TestUpdateWeights:
         from miles.ray.placement_group import update_weights
 
         actor_model, rollout_executor = self._fakes(weight_version=7)
-        inference_controller = MagicMock(
-            start_update_weights=AsyncMock(), end_update_weights=AsyncMock(), check_weights=AsyncMock()
-        )
+        inference_controller = self._checksum_controller()
         logged = self._record_checksum_events(monkeypatch)
 
         await update_weights(
@@ -448,6 +452,69 @@ class TestUpdateWeights:
         )
 
         assert [payload["rollout_id"] for payload in logged] == [6]
+
+    async def test_the_event_carries_the_version_the_engines_were_asked_to_confirm(self, monkeypatch):
+        """Without the published version on the event, no consumer can tell which weights it is looking at."""
+        from miles.ray.placement_group import update_weights
+
+        actor_model, rollout_executor = self._fakes(weight_version=7)
+        inference_controller = self._checksum_controller()
+        logged = self._record_checksum_events(monkeypatch)
+
+        await update_weights(
+            self._checksum_args(start_rollout_id=0), actor_model, rollout_executor, inference_controller, rollout_id=2
+        )
+
+        assert [payload["weight_version"] for payload in logged] == [7]
+        inference_controller.snapshot_weight_checksums.assert_awaited_once_with(
+            expected_weight_version=7, published_cell_id_to_hashes={"cell-0": "hash-0"}, model_id=None
+        )
+
+    async def test_only_the_cells_this_update_published_to_are_audited(self, monkeypatch):
+        """A cell that never took these weights would answer for a version it was not given."""
+        from miles.ray.placement_group import update_weights
+
+        actor_model, rollout_executor = self._fakes(weight_version=7)
+        actor_model.update_weights = AsyncMock(
+            return_value=WeightUpdateReport(
+                weight_version=7, updated_cell_ids=("cell-1",), failed_cell_ids=("cell-0",)
+            )
+        )
+        inference_controller = self._checksum_controller()
+        self._record_checksum_events(monkeypatch)
+
+        await update_weights(self._checksum_args(), actor_model, rollout_executor, inference_controller)
+
+        inference_controller.snapshot_weight_checksums.assert_awaited_once_with(
+            expected_weight_version=7, published_cell_id_to_hashes={"cell-1": "hash-1"}, model_id=None
+        )
+
+    async def test_a_trainer_that_published_nothing_records_no_checksum_event(self, monkeypatch):
+        """A skipped broadcast leaves the engines on weights this update never published, so auditing them lies."""
+        from miles.ray.placement_group import update_weights
+
+        actor_model, rollout_executor = self._fakes(weight_version=None)
+        inference_controller = self._checksum_controller()
+        logged = self._record_checksum_events(monkeypatch)
+
+        await update_weights(self._checksum_args(), actor_model, rollout_executor, inference_controller)
+
+        assert logged == []
+        inference_controller.snapshot_weight_checksums.assert_not_awaited()
+
+    async def test_a_publication_whose_targets_all_left_records_no_checksum_event(self, monkeypatch):
+        """An empty audit read no engine at all, and recording one would pass as evidence it was served."""
+        from miles.ray.placement_group import update_weights
+
+        actor_model, rollout_executor = self._fakes(weight_version=7)
+        inference_controller = self._checksum_controller()
+        inference_controller.snapshot_weight_checksums = AsyncMock(return_value={})
+        logged = self._record_checksum_events(monkeypatch)
+
+        await update_weights(self._checksum_args(), actor_model, rollout_executor, inference_controller)
+
+        assert logged == []
+        rollout_executor.set_weight_version.assert_awaited_once_with(7, trainer_model_id=None)
 
     async def test_a_failed_update_closes_the_window_without_marking_anything_ready(self):
         """A trainer that raised leaves the controller lock held, wedging every later rollout call."""

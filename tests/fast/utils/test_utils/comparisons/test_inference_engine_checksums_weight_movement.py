@@ -15,10 +15,15 @@ def _write_checksums(side_dir: Path, checksums: list[str]) -> None:
         source=source,
         file_name=f"{source.to_name()}.jsonl",
     )
-    for rollout_id, checksum in enumerate(checksums):
+    for index, checksum in enumerate(checksums):
         event_logger.log(
             InferenceEngineWeightChecksumEvent,
-            dict(rollout_id=rollout_id, trainer_model_id=None, engine_checksums=[{"rank0/w": checksum}]),
+            dict(
+                rollout_id=index,
+                weight_version=index + 1,
+                trainer_model_id=None,
+                engine_checksums={"cell-a": {"rank0/w": checksum}},
+            ),
             print_log=False,
         )
     event_logger.close()

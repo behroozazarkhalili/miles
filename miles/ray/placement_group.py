@@ -316,7 +316,12 @@ async def update_weights(
     )
 
     await _maybe_log_inference_engine_weight_checksums(
-        args, inference_controller=inference_controller, rollout_id=rollout_id, trainer_model_id=trainer_model_id
+        args,
+        inference_controller=inference_controller,
+        rollout_id=rollout_id,
+        trainer_model_id=trainer_model_id,
+        report=report,
+        snapshot_cell_id_to_hashes=info.snapshot_cell_id_to_hashes,
     )
 
     if report.weight_version is not None:
@@ -333,7 +338,13 @@ async def _abort_update_window(
 
 
 async def _maybe_log_inference_engine_weight_checksums(
-    args, *, inference_controller: BaseWorkerHandle, rollout_id: int | None, trainer_model_id: str | None
+    args,
+    *,
+    inference_controller: BaseWorkerHandle,
+    rollout_id: int | None,
+    trainer_model_id: str | None,
+    report: WeightUpdateReport,
+    snapshot_cell_id_to_hashes: dict[str, str],
 ) -> None:
     if not args.save_inference_engine_weight_checksum:
         return
@@ -341,13 +352,30 @@ async def _maybe_log_inference_engine_weight_checksums(
         return
     if args.debug_train_only or args.debug_rollout_only:
         return
+    if (weight_version := report.weight_version) is None:
+        return
 
-    check_weights_result = await inference_controller.check_weights(action="checksum", model_id=trainer_model_id)
-    engine_checksums = flatten_inference_engine_checksums(check_weights_result)
+    snapshot = await inference_controller.snapshot_weight_checksums(
+        expected_weight_version=weight_version,
+        published_cell_id_to_hashes={
+            cell_id: snapshot_cell_id_to_hashes[cell_id] for cell_id in report.updated_cell_ids
+        },
+        model_id=trainer_model_id,
+    )
+    if not snapshot:
+        logger.error(
+            f"Weight version {weight_version} reached {sorted(report.updated_cell_ids)}, every one of which is now "
+            f"confirmed gone, so no checksum event is written: an empty audit is no evidence that the publication "
+            f"was ever served"
+        )
+        return
+
+    engine_checksums = flatten_inference_engine_checksums(snapshot)
     get_event_logger().log(
         InferenceEngineWeightChecksumEvent,
         dict(
             rollout_id=args.start_rollout_id - 1 if rollout_id is None else rollout_id,
+            weight_version=weight_version,
             trainer_model_id=trainer_model_id,
             engine_checksums=engine_checksums,
         ),

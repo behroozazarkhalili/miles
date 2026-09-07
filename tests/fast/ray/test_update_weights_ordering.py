@@ -183,7 +183,7 @@ async def test_the_window_is_scoped_to_the_policy_the_script_is_publishing():
 
     with patch("miles.ray.placement_group.is_event_logger_initialized", return_value=True), patch(
         "miles.ray.placement_group.get_event_logger"
-    ), patch("miles.ray.placement_group.flatten_inference_engine_checksums", return_value=[]):
+    ), patch("miles.ray.placement_group.flatten_inference_engine_checksums", return_value={}):
         await update_weights(
             _orchestration_args(),
             _actor_model(order),
@@ -195,7 +195,10 @@ async def test_the_window_is_scoped_to_the_policy_the_script_is_publishing():
 
     calls = {name: kwargs for name, _args, kwargs in inference_controller.calls}
     assert calls["start_update_weights"] == dict(model_id="alpha")
-    assert calls["check_weights"] == dict(action="checksum", model_id="alpha")
+    snapshot_kwargs = calls["snapshot_weight_checksums"]
+    assert snapshot_kwargs["expected_weight_version"] == 11
+    assert snapshot_kwargs["model_id"] == "alpha"
+    assert list(snapshot_kwargs["published_cell_id_to_hashes"]) == ["cell-0"]
 
 
 def test_fsdp_updater_flushes_only_after_every_engine_is_paused():
@@ -247,81 +250,134 @@ def test_fsdp_updater_flushes_only_after_every_engine_is_paused():
     assert pause_modes == ["retract", "retract"]
 
 
-def _checksum_response(engine_checksums: list[dict[str, str]]) -> list:
-    """Build a flat per-engine check_weights('checksum') response."""
-    return [
-        {
+def _checksum_response(cell_id_to_checksums: dict[str, dict[str, str]]) -> dict:
+    """Build a per-cell check_weights('checksum') snapshot."""
+    return {
+        cell_id: {
             "success": True,
             "message": "ok",
-            "ranks": [{"checksums": cs, "parallelism_info": [{"role": "target", "rank": 0}]}],
+            "ranks": [{"checksums": cs, "parallelism_info": [{"role": "target", "rank": 0, "size": 1}]}],
         }
-        for cs in engine_checksums
-    ]
+        for cell_id, cs in cell_id_to_checksums.items()
+    }
 
 
 class TestTheScriptLogsTheChecksumsTheEnginesNowServe:
     @staticmethod
     async def _log(
-        args: Namespace, *, response=None, initialized: bool = True, trainer_model_id: str | None = None
+        args: Namespace,
+        *,
+        response=None,
+        initialized: bool = True,
+        trainer_model_id: str | None = None,
+        report: WeightUpdateReport | None = None,
+        snapshot_cell_id_to_hashes: dict[str, str] | None = None,
     ) -> tuple[MagicMock, MagicMock]:
         from miles.ray.placement_group import _maybe_log_inference_engine_weight_checksums
 
         inference_controller = MagicMock()
-        inference_controller.check_weights = AsyncMock(return_value=response) if response is not None else MagicMock()
+        inference_controller.snapshot_weight_checksums = (
+            AsyncMock(return_value=response) if response is not None else MagicMock()
+        )
         event_logger = MagicMock()
         with patch("miles.ray.placement_group.is_event_logger_initialized", return_value=initialized), patch(
             "miles.ray.placement_group.get_event_logger", return_value=event_logger
         ):
             await _maybe_log_inference_engine_weight_checksums(
-                args, inference_controller=inference_controller, rollout_id=0, trainer_model_id=trainer_model_id
+                args,
+                inference_controller=inference_controller,
+                rollout_id=0,
+                trainer_model_id=trainer_model_id,
+                report=report
+                or WeightUpdateReport(weight_version=11, updated_cell_ids=("cell-a",), failed_cell_ids=()),
+                snapshot_cell_id_to_hashes=snapshot_cell_id_to_hashes or {"cell-a": "hash-a", "cell-b": "hash-b"},
             )
         return inference_controller, event_logger
 
-    async def test_no_event_logger_does_not_call_check_weights(self):
-        """Without an initialized event logger, no check_weights request is issued."""
+    async def test_no_event_logger_does_not_collect_checksums(self):
+        """Without an initialized event logger, no checksum snapshot is requested."""
         inference_controller, _ = await self._log(_orchestration_args(), initialized=False)
 
-        inference_controller.check_weights.assert_not_called()
+        inference_controller.snapshot_weight_checksums.assert_not_called()
 
     async def test_flag_off_skips_collection(self):
-        """Without --save-inference-engine-weight-checksum, no check_weights request is issued."""
+        """Without --save-inference-engine-weight-checksum, no checksum snapshot is requested."""
         inference_controller, _ = await self._log(_orchestration_args(save_inference_engine_weight_checksum=False))
 
-        inference_controller.check_weights.assert_not_called()
+        inference_controller.snapshot_weight_checksums.assert_not_called()
 
     async def test_debug_train_only_skips_collection(self):
-        """Without real rollout engines (debug_train_only), no check_weights request is issued."""
+        """Without real rollout engines (debug_train_only), no checksum snapshot is requested."""
         inference_controller, _ = await self._log(_orchestration_args(debug_train_only=True))
 
-        inference_controller.check_weights.assert_not_called()
+        inference_controller.snapshot_weight_checksums.assert_not_called()
 
     async def test_debug_rollout_only_skips_collection(self):
-        """Without real train engines pushing weights (debug_rollout_only), no check_weights request is issued."""
+        """Without real train engines pushing weights (debug_rollout_only), no checksum snapshot is requested."""
         inference_controller, _ = await self._log(_orchestration_args(debug_rollout_only=True))
 
-        inference_controller.check_weights.assert_not_called()
+        inference_controller.snapshot_weight_checksums.assert_not_called()
 
-    async def test_enabled_logs_one_event_per_rollout(self):
-        """With event logger on and real engines, one event holds every engine's checksums."""
-        response = _checksum_response([{"w": "e0"}, {"w": "e1"}])
+    async def test_an_update_that_published_no_version_skips_collection(self):
+        """A push that published nothing leaves the engines on weights this update cannot vouch for."""
+        inference_controller, _ = await self._log(
+            _orchestration_args(),
+            report=WeightUpdateReport(weight_version=None, updated_cell_ids=(), failed_cell_ids=("cell-a",)),
+        )
 
-        inference_controller, event_logger = await self._log(_orchestration_args(), response=response)
+        inference_controller.snapshot_weight_checksums.assert_not_called()
 
-        inference_controller.check_weights.assert_awaited_once_with(action="checksum", model_id=None)
+    async def test_enabled_logs_one_event_keyed_by_cell_id(self):
+        """With event logger on and real engines, one event holds every cell's checksums under its own id."""
+        response = _checksum_response({"cell-a": {"w": "e0"}, "cell-b": {"w": "e1"}})
+
+        inference_controller, event_logger = await self._log(
+            _orchestration_args(),
+            response=response,
+            report=WeightUpdateReport(weight_version=11, updated_cell_ids=("cell-a", "cell-b"), failed_cell_ids=()),
+        )
+
+        inference_controller.snapshot_weight_checksums.assert_awaited_once_with(
+            expected_weight_version=11,
+            published_cell_id_to_hashes={"cell-a": "hash-a", "cell-b": "hash-b"},
+            model_id=None,
+        )
         event_logger.log.assert_called_once()
         assert event_logger.log.call_args.args[1] == dict(
-            rollout_id=0, trainer_model_id=None, engine_checksums=[{"rank0/w": "e0"}, {"rank0/w": "e1"}]
+            rollout_id=0,
+            weight_version=11,
+            trainer_model_id=None,
+            engine_checksums={"cell-a": {"rank0/w": "e0"}, "cell-b": {"rank0/w": "e1"}},
+        )
+
+    async def test_a_cell_that_failed_this_update_is_left_out_of_the_audit(self):
+        """It never took these weights, so its answer would be filed under a version nobody gave it."""
+        response = _checksum_response({"cell-a": {"w": "e0"}})
+
+        inference_controller, _ = await self._log(
+            _orchestration_args(),
+            response=response,
+            report=WeightUpdateReport(weight_version=11, updated_cell_ids=("cell-a",), failed_cell_ids=("cell-b",)),
+        )
+
+        inference_controller.snapshot_weight_checksums.assert_awaited_once_with(
+            expected_weight_version=11, published_cell_id_to_hashes={"cell-a": "hash-a"}, model_id=None
         )
 
     async def test_a_named_policy_stamps_its_own_id_on_the_event(self):
         """A multi policy run's event names the policy, so the comparator can tell two policies apart."""
-        response = _checksum_response([{"w": "e0"}])
+        response = _checksum_response({"cell-a": {"w": "e0"}})
 
         inference_controller, event_logger = await self._log(
             _orchestration_args(), response=response, trainer_model_id="solver"
         )
 
-        inference_controller.check_weights.assert_awaited_once_with(action="checksum", model_id="solver")
+        inference_controller.snapshot_weight_checksums.assert_awaited_once_with(
+            expected_weight_version=11, published_cell_id_to_hashes={"cell-a": "hash-a"}, model_id="solver"
+        )
         assert event_logger.log.call_args.args[1] == dict(
-            rollout_id=0, trainer_model_id="solver", engine_checksums=[{"rank0/w": "e0"}]
+            rollout_id=0,
+            weight_version=11,
+            trainer_model_id="solver",
+            engine_checksums={"cell-a": {"rank0/w": "e0"}},
         )

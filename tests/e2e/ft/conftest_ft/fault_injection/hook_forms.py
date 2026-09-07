@@ -15,6 +15,7 @@ from tests.e2e.ft.conftest_ft.fault_injection.state import (
     ROLLOUT_CELL_TYPE,
     EventLog,
     HookFireEvent,
+    WeightPublicationEvent,
     cell_is_alive,
     cell_is_allocated,
     cell_workers_hash,
@@ -23,7 +24,11 @@ from tests.e2e.ft.conftest_ft.fault_injection.views import compute_hook_harms
 
 from miles.backends.megatron_utils.megatron_config import ACTOR_ROLE
 from miles.utils.audit_utils.event_logger.logger import read_events
-from miles.utils.audit_utils.event_logger.models import FaultHookFireEvent, WeightUpdateAssignmentEvent
+from miles.utils.audit_utils.event_logger.models import (
+    FaultHookFireEvent,
+    InferenceEngineWeightChecksumEvent,
+    WeightUpdateAssignmentEvent,
+)
 from miles.utils.audit_utils.process_identity import TrainProcessIdentity
 from miles.utils.test_utils.fault_hooks import (
     MAX_FAULT_HOOK_DELAY_MS,
@@ -374,10 +379,14 @@ class HookFireCollector:
             return
 
         harms = {harm.request_id: harm for harm in compute_hook_harms(self._event_log.events)}
+        awaiting_publication = [harm for harm in harms.values() if harm.delivered and not harm.published]
         if not harms:
             return
 
         events = read_events(self._event_dir)
+        if awaiting_publication:
+            self._collect_weight_publications(events)
+
         assignments = [event for event in events if isinstance(event, WeightUpdateAssignmentEvent)]
         for event in events:
             if not isinstance(event, FaultHookFireEvent):
@@ -416,6 +425,26 @@ class HookFireCollector:
             if harm.fire is None:
                 self._event_log.note_hook_fire(record)
             logger.info("Fault hook request %s reached its point: %s", event.request_id, record)
+
+    def _collect_weight_publications(self, events: list) -> None:
+        seen = {
+            (one.trainer_model_id, one.weight_version, one.published_at)
+            for one in self._event_log.events
+            if isinstance(one, WeightPublicationEvent)
+        }
+        for event in events:
+            if not isinstance(event, InferenceEngineWeightChecksumEvent):
+                continue
+            if (event.trainer_model_id, event.weight_version, event.timestamp) in seen:
+                continue
+            self._event_log.note_weight_publication(
+                WeightPublicationEvent(
+                    published_at=event.timestamp,
+                    trainer_model_id=event.trainer_model_id,
+                    weight_version=event.weight_version,
+                    cell_ids=sorted(cell_id for cell_id, checksums in event.engine_checksums.items() if checksums),
+                )
+            )
 
 
 def compute_fire_assignment(
@@ -475,7 +504,10 @@ def compute_hook_fire_record(
     )
     source = event.source
     return HookFireEvent(
+        fired_at=event.timestamp,
         request_id=event.request_id,
+        trainer_model_id=source.model_id if isinstance(source, TrainProcessIdentity) else None,
+        assigned_cell_ids=sorted(assignment.assigned_workers_hash_of_cell_id) if assignment is not None else [],
         hook=event.hook,
         mode=event.mode,
         target=event.target,
