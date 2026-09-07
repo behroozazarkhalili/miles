@@ -228,9 +228,9 @@ class TestInjectFault:
         finally:
             process_utils.kill_process_tree(actor._process)
 
-    @pytest.mark.parametrize("mode", ["exit", "segfault", "deadlock"])
+    @pytest.mark.parametrize("mode", ["exit", "segfault", "deadlock", "sigstop"])
     def test_every_other_failure_mode_is_rejected(self, monkeypatch: pytest.MonkeyPatch, mode: str):
-        """A process exits, segfaults and deadlocks from the inside; no signal an outsider sends reproduces that."""
+        """Only sigkill goes through the supervisor; a hang has to be aimed at the receiver process itself."""
         monkeypatch.setattr(process_utils, "kill_process_tree", _refuse_to_kill)
         actor = CommandActor()
         actor._process = _FakeProcess(pid=4321)

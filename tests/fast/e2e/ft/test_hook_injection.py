@@ -3,7 +3,15 @@ from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
-from tests.e2e.ft.conftest_ft import hook_injection
+from tests.e2e.ft.conftest_ft import (
+    hook_injection,
+    scenario_weight_update_all_gather,
+    scenario_weight_update_all_gather_deadlock,
+    scenario_weight_update_p2p_local,
+    scenario_weight_update_p2p_local_sigstop,
+    scenario_weight_update_p2p_remote,
+    scenario_weight_update_p2p_remote_sigstop,
+)
 from tests.e2e.ft.conftest_ft.fault_injection.state import EventLog
 from tests.fast.e2e.ft.fault_injection.utils import RUNNING_NOT_SERVING, SERVING, cell, staged
 
@@ -22,7 +30,7 @@ from miles.utils.audit_utils.process_identity import (
     TrainProcessIdentity,
 )
 from miles.utils.test_utils.fault_hooks import FaultHookName, FaultHookOutcome, FaultHookTarget
-from miles.utils.test_utils.fault_injector import FailureMode
+from miles.utils.test_utils.fault_injector import DEADLOCK_SLEEP_SECONDS, FailureMode
 
 _HOOK = FaultHookName.WEIGHT_UPDATE_BEFORE_ALL_GATHER
 _REQUEST_ID = "req-1"
@@ -122,6 +130,10 @@ def _fire(
         victim_receiver_boot_uuid=None if victim is None else "boot-1",
         victim_session_id=None if victim is None else "session-1",
     )
+
+
+def _fire_now(**kwargs) -> FaultHookFireEvent:
+    return _fire(at=datetime.now(timezone.utc), **kwargs)
 
 
 def _assignment(
@@ -453,37 +465,72 @@ class TestAssignmentWitness:
 class TestTrainerReplacementWitness:
     def test_a_cell_that_kept_the_armed_incarnation_fails_the_run(self):
         """A fault that left its target running is a fault that did not land."""
+        fire = _fire_now()
         log = _healthy_run_log(trainer_hashes=[_ARMED_HASH, _ARMED_HASH])
 
         with pytest.raises(AssertionError, match="never observed under an incarnation other than"):
-            hook_injection.assert_armed_trainer_was_replaced(log.events, armed=_armed())
+            hook_injection.assert_armed_trainer_was_replaced(log.events, armed=_armed(), fire=fire)
 
     def test_a_replacement_that_never_became_healthy_fails_the_run(self):
         """A cell that lost its incarnation and never came back leaves the run a replica short."""
+        fire = _fire_now()
         log = EventLog()
         _observe(log, trainer_hash=_ARMED_HASH, engines={**_ASSIGNED, **_UNRELATED})
         _observe(log, trainer_hash="trainer-generation-1", engines={**_ASSIGNED, **_UNRELATED}, trainer_alive=False)
 
         with pytest.raises(AssertionError, match="never observed healthy under a replacement"):
-            hook_injection.assert_armed_trainer_was_replaced(log.events, armed=_armed())
+            hook_injection.assert_armed_trainer_was_replaced(log.events, armed=_armed(), fire=fire)
 
     def test_an_armed_incarnation_still_alive_at_the_end_fails_the_run(self):
         """A hash that flickered and came back is the same process, so nothing was evicted."""
+        fire = _fire_now()
         log = EventLog()
         _observe(log, trainer_hash=_ARMED_HASH, engines={**_ASSIGNED, **_UNRELATED})
         _observe(log, trainer_hash="trainer-generation-1", engines={**_ASSIGNED, **_UNRELATED})
         _observe(log, trainer_hash=_ARMED_HASH, engines={**_ASSIGNED, **_UNRELATED})
 
         with pytest.raises(AssertionError, match="still running the armed incarnation"):
-            hook_injection.assert_armed_trainer_was_replaced(log.events, armed=_armed())
+            hook_injection.assert_armed_trainer_was_replaced(log.events, armed=_armed(), fire=fire)
 
     def test_losing_the_armed_incarnation_and_coming_back_healthy_passes(self):
         """The armed process is gone and its cell serves again, which is what recovery means for a trainer."""
+        fire = _fire_now()
         log = _healthy_run_log(trainer_hashes=[_ARMED_HASH, "trainer-generation-1"])
 
-        harm_observed_at = hook_injection.assert_armed_trainer_was_replaced(log.events, armed=_armed())
+        harm_observed_at = hook_injection.assert_armed_trainer_was_replaced(log.events, armed=_armed(), fire=fire)
 
         assert harm_observed_at is not None
+
+
+class TestHangEvictionWitness:
+    def test_the_deadline_is_the_time_a_deadlocked_process_returns_by_itself(self):
+        """A hang that outlives its own sleep would recover with no control plane doing anything."""
+        assert hook_injection.HANG_EVICTION_DEADLINE_SECONDS == DEADLOCK_SLEEP_SECONDS
+
+    def test_a_replacement_that_predates_the_fire_pays_off_nothing(self):
+        """A generation that was already there before the fault cannot be evidence that the fault cost anything."""
+        log = _healthy_run_log(trainer_hashes=[_ARMED_HASH, "trainer-generation-1"])
+        fire = _fire_now()
+
+        with pytest.raises(AssertionError, match="never observed under an incarnation other than"):
+            hook_injection.assert_armed_trainer_was_replaced(log.events, armed=_armed(), fire=fire)
+
+    def test_an_eviction_after_the_hang_would_have_returned_fails_the_run(self):
+        """Past that point a deadlocked worker returns on its own, so the run proves nothing about ending a hang."""
+        fire = _fire(at=datetime.now(timezone.utc) - timedelta(seconds=DEADLOCK_SLEEP_SECONDS + 60))
+        log = _healthy_run_log(trainer_hashes=[_ARMED_HASH, "trainer-generation-1"])
+
+        with pytest.raises(AssertionError, match="Hang witness failed"):
+            hook_injection.assert_armed_trainer_was_replaced(log.events, armed=_armed(), fire=fire)
+
+    def test_an_eviction_inside_the_deadline_passes(self):
+        """The control plane took the hung incarnation out well before it could have come back by itself."""
+        fire = _fire_now()
+        log = _healthy_run_log(trainer_hashes=[_ARMED_HASH, "trainer-generation-1"])
+
+        harm_observed_at = hook_injection.assert_armed_trainer_was_replaced(log.events, armed=_armed(), fire=fire)
+
+        assert harm_observed_at >= fire.timestamp
 
 
 class TestTrainerHealingWitness:
@@ -674,8 +721,11 @@ def _remote_armed(**kwargs) -> hook_injection.ArmedFaultHook:
     )
 
 
-def _remote_fire(*, victim=(_VICTIM, _VICTIM_HASH), outcome=FaultHookOutcome.ACCEPTED) -> FaultHookFireEvent:
+def _remote_fire(
+    *, victim=(_VICTIM, _VICTIM_HASH), outcome=FaultHookOutcome.ACCEPTED, at: datetime = _FIRED_AT
+) -> FaultHookFireEvent:
     return _fire(
+        at=at,
         hook=FaultHookName.WEIGHT_UPDATE_AFTER_P2P_SUBMIT.value,
         target=FaultHookTarget.REMOTE_INFERENCE_CELL,
         outcome=outcome,
@@ -809,10 +859,26 @@ class TestRemoteVictimWitness:
 
     def test_a_victim_that_never_changed_incarnation_has_no_harm_moment(self):
         """Without an observation of the replacement there is no point in time after the harm to read anything at."""
+        fire = _remote_fire(at=datetime.now(timezone.utc))
         log = _healthy_run_log(trainer_hashes=[_ARMED_HASH], assigned_after=dict(_ASSIGNED))
 
         with pytest.raises(AssertionError, match="never observed under an incarnation other than"):
-            hook_injection.compute_victim_harm_observed_at(log.events, fire=_remote_fire(), armed=_remote_armed())
+            hook_injection.compute_victim_harm_observed_at(log.events, fire=fire)
+
+    def test_a_victim_replaced_only_after_the_hang_would_have_ended_fails_the_run(self):
+        """A frozen receiver never returns by itself, so a replacement that late was not ended by this fault."""
+        fire = _remote_fire(at=datetime.now(timezone.utc) - timedelta(seconds=DEADLOCK_SLEEP_SECONDS + 60))
+        log = _healthy_run_log(trainer_hashes=[_ARMED_HASH, _ARMED_HASH])
+
+        with pytest.raises(AssertionError, match="Hang witness failed"):
+            hook_injection.compute_victim_harm_observed_at(log.events, fire=fire)
+
+    def test_a_victim_replaced_inside_the_deadline_gives_the_harm_moment(self):
+        """The engine the write reached lost its incarnation while the control plane was the only thing acting."""
+        fire = _remote_fire(at=datetime.now(timezone.utc))
+        log = _healthy_run_log(trainer_hashes=[_ARMED_HASH, _ARMED_HASH])
+
+        assert hook_injection.compute_victim_harm_observed_at(log.events, fire=fire) >= fire.timestamp
 
 
 class TestScenarioRecipe:
@@ -835,3 +901,103 @@ class TestScenarioRecipe:
             FaultHookTarget.LOCAL: FaultHookOutcome.FIRED,
             FaultHookTarget.REMOTE_INFERENCE_CELL: FaultHookOutcome.ACCEPTED,
         }
+
+    def test_the_run_shortens_every_deadline_a_hung_worker_would_otherwise_sit_behind(self):
+        """At the production defaults a deadlocked sender returns on its own before the update gives up on it."""
+        assert "--update-weights-timeout 120.0 " in hook_injection.TARGETED_DEADLINE_ARGS
+        assert "--update-weight-engine-request-timeout 30.0 " in hook_injection.TARGETED_DEADLINE_ARGS
+        assert "--p2p-transfer-timeout 10.0 " in hook_injection.TARGETED_DEADLINE_ARGS
+
+    def test_the_update_deadline_leaves_room_to_evict_before_a_deadlock_returns(self):
+        """The witness only means something if the controller gives up long before the sleep ends."""
+        assert hook_injection.UPDATE_WEIGHTS_TIMEOUT_SECONDS < hook_injection.HANG_EVICTION_DEADLINE_SECONDS
+
+
+class TestTargetedScenarioNaming:
+    def test_the_default_mode_keeps_the_names_the_existing_entries_run_under(self):
+        """A sigkill run's dump directory and request id are read by tooling that predates the other modes."""
+        assert (
+            hook_injection.compute_targeted_test_name(
+                test_name="weight_update_p2p_local", failure_mode=FailureMode.SIGKILL
+            )
+            == "weight_update_p2p_local"
+        )
+        assert (
+            hook_injection.compute_targeted_request_id(
+                request_id="weight-update-p2p-local", failure_mode=FailureMode.SIGKILL
+            )
+            == "weight-update-p2p-local"
+        )
+
+    @pytest.mark.parametrize("failure_mode", [FailureMode.DEADLOCK, FailureMode.SIGSTOP])
+    def test_another_mode_gets_a_dump_path_and_a_request_id_of_its_own(self, failure_mode: FailureMode):
+        """Two entries of the same scenario run side by side, and a shared path or id would mix their evidence."""
+        assert (
+            hook_injection.compute_targeted_test_name(test_name="weight_update_p2p_local", failure_mode=failure_mode)
+            == f"weight_update_p2p_local_{failure_mode.value}"
+        )
+        assert (
+            hook_injection.compute_targeted_request_id(request_id="weight-update-p2p-local", failure_mode=failure_mode)
+            == f"weight-update-p2p-local-{failure_mode.value}"
+        )
+
+
+_HANG_ENTRIES = [
+    (
+        scenario_weight_update_all_gather_deadlock,
+        scenario_weight_update_all_gather,
+        FaultHookName.WEIGHT_UPDATE_BEFORE_ALL_GATHER,
+        FaultHookTarget.LOCAL,
+        FailureMode.DEADLOCK,
+    ),
+    (
+        scenario_weight_update_p2p_local_sigstop,
+        scenario_weight_update_p2p_local,
+        FaultHookName.WEIGHT_UPDATE_BEFORE_P2P_WRITE,
+        FaultHookTarget.LOCAL,
+        FailureMode.SIGSTOP,
+    ),
+    (
+        scenario_weight_update_p2p_remote_sigstop,
+        scenario_weight_update_p2p_remote,
+        FaultHookName.WEIGHT_UPDATE_AFTER_P2P_SUBMIT,
+        FaultHookTarget.REMOTE_INFERENCE_CELL,
+        FailureMode.SIGSTOP,
+    ),
+]
+
+
+class TestTheDeterministicHangEntries:
+    @pytest.mark.parametrize("delegate, base, hook, target, failure_mode", _HANG_ENTRIES)
+    def test_an_entry_arms_its_own_fault_at_the_point_its_name_claims(
+        self, monkeypatch, delegate, base, hook, target, failure_mode
+    ):
+        """Waiting for the soak to draw a hang at the right point is luck; these three entries pin one each."""
+        armed: list[dict] = []
+        monkeypatch.setattr(base, "run_targeted_hook_scenario", lambda **kwargs: armed.append(kwargs))
+        monkeypatch.setattr(base, "assert_hook_outcome", lambda run: None)
+
+        delegate.run_ci("kill_train_rollout__dp2_tp2", num_steps=1)
+
+        (call,) = armed
+        assert call["failure_mode"] is failure_mode
+        assert call["hook"] is hook
+        assert call["target"] is target
+        assert call["test_name"] == base.TEST_NAME
+
+    @pytest.mark.parametrize("delegate, base, hook, target, failure_mode", _HANG_ENTRIES)
+    def test_an_entry_writes_where_its_name_says_it_does(self, delegate, base, hook, target, failure_mode):
+        """The scenario module's name is the index from a red CI job to its dump directory."""
+        assert (
+            hook_injection.compute_targeted_test_name(test_name=base.TEST_NAME, failure_mode=failure_mode)
+            == delegate.TEST_NAME
+        )
+
+    @pytest.mark.parametrize("delegate, base, hook, target, failure_mode", _HANG_ENTRIES)
+    def test_the_sigkill_entry_of_the_same_scenario_is_untouched(self, delegate, base, hook, target, failure_mode):
+        """These are additional boundaries, not replacements for the crash the scenario already covers."""
+        assert base.FAILURE_MODE is FailureMode.SIGKILL
+
+    def test_the_three_entries_cover_three_different_boundaries(self):
+        """A cartesian product of hooks and modes would buy repeats of the same shape at 8 gpu-hours each."""
+        assert len({(hook, target, failure_mode) for _, _, hook, target, failure_mode in _HANG_ENTRIES}) == 3

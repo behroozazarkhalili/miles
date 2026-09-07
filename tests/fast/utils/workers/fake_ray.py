@@ -6,6 +6,8 @@ import time
 from dataclasses import dataclass, field, replace
 from typing import Any
 
+import ray
+
 _ASYNC_METHOD_NODE_IP = "_get_node_ip"
 _ASYNC_METHOD_FREE_PORT_BLOCK = "_get_free_port_block"
 _ASYNC_METHOD_IS_PORT_AVAILABLE = "_is_port_available"
@@ -65,6 +67,7 @@ class FakeRayActorHandle:
     failing_methods: dict[str, BaseException] = field(default_factory=dict)
     hanging_methods: dict[str, float] = field(default_factory=dict)
     killed: bool = False
+    survives_kill: bool = False
 
     def __getattr__(self, name: str) -> FakeRayActorMethod:
         if name.startswith("__") or "cluster" not in self.__dict__:
@@ -169,10 +172,13 @@ class FakeRayCluster:
         return handle
 
     def kill_actor(self, handle: FakeRayActorHandle) -> None:
+        """A killed actor stops answering, as a real one does; set survives_kill to model one that does not die."""
         self.events.append(EVENT_KILL)
         if self.kill_error is not None:
             raise self.kill_error
         handle.killed = True
+        if not handle.survives_kill:
+            handle.failing_methods.setdefault(READINESS_METHOD, ray.exceptions.RayActorError())
 
     def dispatch(
         self, *, handle: FakeRayActorHandle, method: str, args: tuple[Any, ...], kwargs: dict[str, Any]

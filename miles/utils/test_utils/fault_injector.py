@@ -11,12 +11,15 @@ from enum import Enum
 
 logger = logging.getLogger(__name__)
 
+DEADLOCK_SLEEP_SECONDS: int = 600
+
 
 class FailureMode(Enum):
     SIGKILL = "sigkill"
     EXIT = "exit"
     SEGFAULT = "segfault"
     DEADLOCK = "deadlock"
+    SIGSTOP = "sigstop"
 
 
 def inject_fault(mode: str) -> None:
@@ -38,4 +41,7 @@ def inject_fault(mode: str) -> None:
             libc = ctypes.PyDLL(None)
             libc.sleep.argtypes = (ctypes.c_uint,)
             libc.sleep.restype = ctypes.c_uint
-            libc.sleep(600)
+            libc.sleep(DEADLOCK_SLEEP_SECONDS)
+
+        case FailureMode.SIGSTOP:
+            os.kill(os.getpid(), signal.SIGSTOP)

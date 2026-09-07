@@ -22,6 +22,9 @@
 | `scenario_weight_update_all_gather` | `kill_train_rollout__dp2_tp2` |
 | `scenario_weight_update_p2p_local` | `kill_train_rollout__dp2_tp2` |
 | `scenario_weight_update_p2p_remote` | `kill_train_rollout__dp2_tp2` |
+| `scenario_weight_update_all_gather_deadlock` | `kill_train_rollout__dp2_tp2` |
+| `scenario_weight_update_p2p_local_sigstop` | `kill_train_rollout__dp2_tp2` |
+| `scenario_weight_update_p2p_remote_sigstop` | `kill_train_rollout__dp2_tp2` |
 
 - **Forced absences**, one reason each:
     - `kill_train__dp4_cp2_tp2_pp2_ep2_etp2__moe_full` is multi-node, and no multi-node CI lane exists.
@@ -49,6 +52,9 @@
 | `scenario_weight_update_all_gather` | targeted | a trainer worker dying inside the weight update's own TP all-gather is survived |
 | `scenario_weight_update_p2p_local` | targeted | a sender dying at the p2p write it is about to issue is survived |
 | `scenario_weight_update_p2p_remote` | targeted | the engine a sender has just submitted a write to dying is survived, and confined to that engine |
+| `scenario_weight_update_all_gather_deadlock` | targeted | the same all-gather point, with a sender that hangs holding the GIL instead of dying |
+| `scenario_weight_update_p2p_local_sigstop` | targeted | the same p2p write point, with a sender frozen by SIGSTOP instead of killed |
+| `scenario_weight_update_p2p_remote_sigstop` | targeted | the receiver of a submitted write frozen by SIGSTOP instead of killed |
 
 ### Modes
 
@@ -119,7 +125,8 @@ PYTHONPATH=. python tests/e2e/ft/conftest_ft/scenario_trainer_no_failure.py run 
 - **Debugging**: prefer the individual subcommands over `run` — with a shared `--dump-dir` (plus `--phase` when multi-phase) you re-run only what changed.
 - **`scenario_rollout_deterministic`**: the comparison subcommands, with the injection constants fixed in the module rather than exposed as options.
 - **`scenario_random_crash`**: only `run`, with `--mode` / `--seed` / `--num-steps` / `--trainer-crash-interval-seconds` / `--rollout-crash-interval-seconds` / `--fully-async`.
-- **`scenario_weight_update_all_gather`**, **`scenario_weight_update_p2p_local`**, **`scenario_weight_update_p2p_remote`**: only `run`, with `--mode` / `--num-steps`; what each arms is fixed in its module.
+- **`scenario_weight_update_all_gather`**, **`scenario_weight_update_p2p_local`**, **`scenario_weight_update_p2p_remote`**: only `run`, with `--mode` / `--num-steps` / `--failure-mode`; the hook and the action are fixed in the module, the fault is not. `--failure-mode` defaults to `sigkill`, and any other value moves the dump directory and the request id with it, so two entries of one scenario never share evidence.
+- **`scenario_weight_update_all_gather_deadlock`**, **`scenario_weight_update_p2p_local_sigstop`**, **`scenario_weight_update_p2p_remote_sigstop`**: the same three runners with the fault pinned, so a hang is covered by an entry rather than by the soak happening to draw one.
 - **`scenario_realistic_gsm8k`**: only `run`, with `--seed` / `--num-rollout` / `--trainer-crash-interval-seconds` / `--rollout-crash-interval-seconds` / `--metric-threshold` / `--fully-async`; no `--mode`.
 - **`scenario_*_fully_async`**: only `run`, with the same options minus `--fully-async`, which they pin.
 - **Dumps**: `resolve_dump_dir` in `conftest_ft/app.py` puts them under `$MILES_TEST_DUMPS_ROOT/<run_id>/<test_name>/`, falling back to `/node_public/dumps` when the cluster sets no root. A comparison scenario's `run` deletes them when it ends; the soak scenarios (`scenario_random_crash`, `scenario_realistic_gsm8k`) only clear a stale directory before starting, so a finished soak leaves its dumps behind for inspection. The run id is what stops two agents running the same test from deleting each other's dumps.
@@ -200,20 +207,22 @@ hf upload --repo-type dataset fzyzcjy/miles-test-rollout-Qwen3-30B-A3B-5layer \
 
 | Backend | Cell type | Forms, drawn from uniformly |
 | --- | --- | --- |
-| ray | actor | `inject_fault:sigkill`, `inject_fault:exit`, `inject_fault:segfault` |
+| ray | actor | `inject_fault:sigkill`, `inject_fault:exit`, `inject_fault:segfault`, `inject_fault:deadlock`, `inject_fault:sigstop` |
 | ray | rollout | `inject_fault:sigkill` |
-| kubernetes | actor | those three kills, plus `delete_pod` |
+| kubernetes | actor | those five faults, plus `delete_pod` |
 | kubernetes | rollout | `exec_sigkill`, `delete_pod` |
 | either | actor | plus `fault_hook:local`, when the soak can reach the hooks |
 | either | rollout | plus `fault_hook:remote_inference_cell`, when the soak can reach the hooks |
 
 - **A form can be unavailable rather than absent**: `BaseFaultForm.is_available` is asked about the cell that was drawn, and a kind whose every form says no defers that injection instead of forcing one. Only the hook forms ever say no, and only until the run has an assignment and a recovery source to arm against.
 - **Where the soak finds its sources**: `GET /api/v1/fault-hook-sources` answers with the trainer cells of the run whether or not `--ft-components` names `train`, while `GET /api/v1/cells` keeps listing only the cell types this deployment heals. A rollout-only soak can therefore draw `fault_hook:remote_inference_cell` against a live trainer generation, and the mini FT controller still sees no trainer to suspend or resume.
-- **The soak draws the delay with everything else**: the hook forms draw their source, hook and `delay_ms` from the same seeded `random.Random` the rest of the injector uses, over `0..1000` ms through `draw_fault_hook_delay_ms`, so a failed run replays from its seed. The value goes into the arm request and into the arm record, and the fire collector rejects a fire whose `delay_ms` is not the one that was armed. The registry in the worker draws nothing itself.
+- **The soak draws the delay with everything else**: the hook forms draw their source, hook, failure mode and `delay_ms` from the same seeded `random.Random` the rest of the injector uses, in that order, over `0..1000` ms through `draw_fault_hook_delay_ms`, so a failed run replays from its seed. The value goes into the arm request and into the arm record, and the fire collector rejects a fire whose `delay_ms` is not the one that was armed. The registry in the worker draws nothing itself.
 - **A form can keep its own books**: `records_own_attempt` says the form writes what it did itself, so the loop does not record an `InjectionEvent` for it. Arming a hook is not harming a cell, and the one record the loop would write would claim it was.
 - **Each `FailureMode` is its own form**: pod deletion is a quarter of a kubernetes trainer injection, not half of it.
 - **The actor class decides what a kill means**, since an injection carries only a mode and a `sub_index`: `TrainRayActor` and `ServeActor` crash their own process, the only thing that costs torchft a member, while `CommandActor` SIGKILLs the isolated process group rooted at the engine subprocess. That includes the launch shell and every engine child it spawned, so a dead cell cannot leave an orphaned scheduler holding GPU memory while its replacement starts; the Ray actor observes the subprocess exit and reports the death as production sees it.
-- **Why an engine takes sigkill alone**: exiting and segfaulting are what a process does to itself from the inside, and no signal reproduces them from outside — SIGTERM is a clean shutdown, SIGSEGV is delivered rather than provoked. The other modes are refused, not approximated.
+- **Why an engine takes sigkill alone through its supervisor**: exiting, segfaulting and deadlocking are what a process does to itself from the inside, and no signal reproduces them from outside — SIGTERM is a clean shutdown, SIGSEGV is delivered rather than provoked. Stopping the supervisor's own subprocess group would freeze the launch shell, not the engine rank holding a weight transfer, so `CommandActor` refuses everything but sigkill; a frozen engine is reached instead by the remote hook form, which signals the receiver process itself.
+- **Why a trainer also takes deadlock and sigstop**: a rank wedged in a native collective and a rank stopped by a signal both stop answering without dying, which is the failure the update deadline and the control plane's confirm-dead path exist to end. Both are inflicted by the trainer worker on itself, so no outside process has to fake them.
+- **What ends a wall-clock hang, which lands at no particular phase**: the heartbeat rpc runs on its own concurrency group, but a `PyDLL` sleep holds the GIL and a stopped process runs nothing, so neither answers. After the trainer heartbeat checker's grace and `failure_threshold` consecutive misses the cell reads `Healthy=False`, and the mini FT controller suspends it — on ray by stopping its actors, on kubernetes by deleting its pods. That chain needs nothing from the hung process either, and is separate from the weight-update deadline the targeted entries rely on.
 - **How a kubernetes engine takes a kill**: its pod runs sglang as the entrypoint (`CommandWorkerSpec`), so no actor and no rpc server exist to receive `inject_fault`. The kill is delivered from outside instead, as a `kubectl exec` SIGKILL of the sglang processes in the engine container, and deleting the pod is the second, coarser form — the engine *is* the pod.
 - **Deletion is the test layer's own `kubectl delete pod`**, timeout-bounded and selecting on release, pool and cell index. It models an outsider, and deliberately avoids the production heal path `KubernetesCellOperations.suspend`, whose bugs an injector sharing it would hide.
 
@@ -421,6 +430,8 @@ Requires: real disaggregated engines, TP2, ft_components == ("train", "rollout")
 Regime: --update-weight-transfer-mode p2p
         --sglang-remote-instance-weight-loader-start-seed-via-transfer-engine
         --sglang-enable-p2p-fault-injection
+        --update-weights-timeout 120 --update-weight-engine-request-timeout 30
+        --p2p-transfer-timeout 10
         --save <dump>/ckpt --save-interval 1, --mini-ft-controller-enable
 
 1. A background thread polls /api/v1/cells every 2s and records every snapshot
@@ -437,8 +448,11 @@ Witnesses:
                 carrying the weight version of the update it fired in
   assignment -> exactly one WeightUpdateAssignmentEvent for that version and that trainer cell,
                 whose trainer_workers_hash is the incarnation that was armed
-  eviction   -> the armed cell observed under another workers_hash after the snapshot, healthy
+  eviction   -> the armed cell observed under another workers_hash after the fire, healthy
                 again under it, and never the armed hash alive at the end
+  hang       -> that first observation of another workers_hash falls between the fire's own
+                timestamp and 600s after it, the time a deadlocked worker would take to return
+                by itself
   healing    -> a CellReconfigureEvent after that assignment dropping the cell index, then a later
                 one healing it back
   isolation  -> every engine the assignment names left the incarnation it was written to, and each
@@ -452,7 +466,7 @@ Witnesses:
 - **Why the hook sits before the collective, not after the bucket loop**: a hook placed once the gathers are done crashes a rank that already survived the thing under test.
 - **Why the arm waits for a completed step, a checkpoint and a real publication**: killing a worker before those exist takes out the only source a replacement could be healed from, and the run would fail for a reason the scenario is not about. A tracker file that exists but names no iteration, and a checksum event carrying only empty dicts, are exactly the states that look ready and are not.
 - **Why an arm is not a fault**: the api server answering 200 only proves the request was accepted, so the run fails unless the fire event says production reached the point.
-- **Why the ack time is never used as the fault time**: the armed worker dies at the hook, so its rpc reply can be lost and the fire can be recorded before the arm is acknowledged. Every ordering the witnesses need comes from the pre-arm snapshot, from the assignment, or from the observations themselves.
+- **Why the ack time is never used as the fault time**: the armed worker dies at the hook, so its rpc reply can be lost and the fire can be recorded before the arm is acknowledged. Every ordering the witnesses need comes from the fire event, from the assignment, or from the observations themselves; the pre-arm snapshot supplies identities, never times.
 - **Why the fire is an event and not a log line**: the fault kills the process, arms and fires interleave across workers, and only a request id pairs them; `EventLogger` writes and closes per event, so the record survives the sigkill that follows it.
 - **Why the whole process identity is compared**: a run can hold two roles, several trained models and many cells, and every one of them numbers its cells and ranks from zero.
 - **Why an assignment event exists at all**: which engines a sender owned in one update is the controller's decision, and nothing in a cell name reproduces it. It is written after the assignment is computed and before any sender is called, so a fault fired inside the call always has it to be read against.
@@ -461,6 +475,12 @@ Witnesses:
 - **Why the healing witness is anchored to that assignment**: a run has other reconfigures, and picking any eviction and any healing from the whole log would let an earlier unrelated crash pay for this fault.
 - **Why both ft components**: a trainer that dies mid-update takes its assigned engines down with it, so the run only recovers if engines are recoverable too.
 - **What the progress witness cannot yet say**: `InferenceEngineWeightChecksumEvent` names no cell, so "an unrelated engine published after the fault" is asserted as that engine still Serving its original incarnation plus a non-empty publication of the run. Op33 gives the event a cell and a version, and this witness tightens to that engine's own publication.
+- **Why the eviction is measured from the fire and not from the arm**: a hang leaves the process alive, so the only thing separating "the control plane took it out" from "it came back on its own" is when the replacement appeared relative to the fault. The arm can precede the fire by many updates, and a replacement that appeared for its own reasons before the fault must not pay for it, so the witness reads only observations at or after the fire's own timestamp.
+- **Why 600s is the bound**: `FailureMode.DEADLOCK` sleeps in libc through `ctypes.PyDLL`, holding the GIL for `DEADLOCK_SLEEP_SECONDS`, and then returns. An eviction after that is indistinguishable from the worker waking up, so the witness reads the same constant the fault uses. `SIGSTOP` never returns at all, and is held to the same bound because nothing but the control plane can end it.
+- **Why the deadlines are shortened for these runs**: at the production defaults (`--update-weights-timeout 3600`, `--update-weight-engine-request-timeout 600`) the controller would still be waiting when a deadlocked sender woke up, so the run could not tell the two apart. 120s / 30s / 10s cover a Qwen3-0.6B transfer to the assigned engines with room to evict, and only the tests set them.
+- **Why the trainer heartbeat grace is left alone**: `--trainer-heartbeat-checker-first-wait` defaults to 300s and is re-armed on every resume, which is what keeps a legitimately initializing replacement from being read as a hang. The hang witnesses lean on the weight-update deadline, which is scoped to one update and cannot be confused with startup.
+- **How a hung worker is actually removed**: `mark_errored_and_kill` asks each worker to kill itself, and a stopped or deadlocked process answers neither that rpc nor the death probe — `_probe_is_dead` counts a timeout or any error as still running. After `CONFIRM_DEAD_TIMEOUT_S` the cell falls back to `CellOperations.terminate_incarnation`, which on ray stops the captured actors of that `workers_hash` and on kubernetes deletes their pods under a uid and resourceVersion precondition and waits until they are gone. Nothing in that path needs the frozen process to cooperate. Inference cells take the same external route through `_terminate_errored_cell`.
+- **Why a new generation cannot appear beside the old one**: on ray a stopped cell keeps its actors in a retiring set until every one of them is confirmed dead, and `start_cells` refuses a cell that still has any — a kill that raised, a probe that timed out, a cancelled stop and one surviving rank all keep the cell out of service instead of freeing its name. The refusal is bounded, so the heal loop retries and other cells keep starting. On kubernetes the conditional delete waits for the pods of that uid to disappear before it reports success. This is what lets the hang witnesses read a new `workers_hash` as evidence that the old incarnation is gone rather than merely replaced in the bookkeeping.
 
 ### `scenario_weight_update_p2p_local` and `scenario_weight_update_p2p_remote`
 
@@ -480,10 +500,33 @@ p2p_remote: arms weight_update.after_p2p_submit with sigkill, target remote_infe
   Witnesses: fire (one, in the armed worker, target remote, outcome fired rather than stale),
              assignment join, the fire carries the receiver uuid, session and rank of the peer it
              wrote to, the victim named by the fire is one of that assignment's engines at
-             the incarnation it held when the hook was armed, that incarnation gone by the end,
-             the victim Serving again under a replacement, an engine outside the assignment still
-             serving its original incarnation, and a non-empty publication after that assignment
+             the incarnation it held when the hook was armed, that incarnation gone within 600s
+             of the fire and by the end, the victim Serving again under a replacement, an engine
+             outside the assignment still serving its original incarnation, and a non-empty
+             publication after that assignment
 ```
+
+### The three hang entries
+
+```
+Type: targeted; the same three runners with --failure-mode pinned, so a hang is covered by an
+      entry rather than by the soak drawing one
+Entries: test_weight_update_all_gather_deadlock__kill_train_rollout__dp2_tp2.py,
+         test_weight_update_p2p_local_sigstop__kill_train_rollout__dp2_tp2.py,
+         test_weight_update_p2p_remote_sigstop__kill_train_rollout__dp2_tp2.py, all ft-short
+
+all_gather_deadlock: a sender that stops answering while holding the GIL, at the collective
+p2p_local_sigstop:   a sender frozen by a signal, at the write it was about to issue
+p2p_remote_sigstop:  the receiver of a write in flight frozen by a signal, in the engine process
+                     that holds the mooncake session
+
+Witnesses: exactly the sigkill entry's, plus the hang bound on when the incarnation went away
+```
+
+- **Why three entries and not a product**: each answers a different boundary — a hang inside the trainer's own collective, a hang in the sender's write path, and a hang in the receiver. Every other combination repeats one of those three shapes at 8 GPU-hours each, and the soak draws them anyway.
+- **Why the sigkill entries stay**: dying and hanging leave the control plane different work to do, and the entries that already cover the first are not replaced by the ones covering the second.
+- **Why a delegating scenario module per entry**: the entry naming scheme reads the scenario out of the file name, so a second entry of one scenario needs a name of its own. Each delegate is a `run_ci` that pins `failure_mode` and nothing else; `compute_targeted_test_name` derives the same name the delegate declares, and a fast test fails if the two ever drift.
+- **Why a remote hang cannot be a deadlock or an exit**: those are things a process does to itself from inside its own code, and the receiver's fault endpoint only raises signals. Arming a remote request for one of them is refused where it is armed, not silently downgraded, so the soak never draws a combination the receiver would reject.
 
 - **Why these two of the four hooks**: one local and one remote case, each at the moment its kind is hardest — the sender dies with a transfer half-issued, and the target dies while a write to it is in flight. A cross product of hooks and actions would buy repeats of the same two shapes at 8 GPU-hours each.
 - **Why the remote case does not assert healing of the victim's cell index**: engines are not trainer cells and produce no `CellReconfigureEvent`; the incarnation the api server reports is the evidence, exactly as in the rollout soak.
@@ -560,7 +603,10 @@ Targeted fault hooks, whenever the mode has real disaggregated engines:
   point   -> uniformly among the hooks that source can be shown to reach: the two p2p write
              hooks and after_base_weights always, before_all_gather only at TP/ETP > 1, and for
              a remote request only the two the site names a single peer at
-  action  -> sigkill, delivered immediately (op29 adds the delay, op30 the hang)
+  action  -> drawn from the same seeded rng: sigkill, deadlock or sigstop for a local request, and
+             for a remote one only what the receiver implements on itself (sigkill, sigstop). The
+             mode goes into the arm request and the arm record, and the fire collector rejects a
+             fire whose mode is not the one that was armed
   state   -> armed (recorded before the request leaves) -> that request id fired and was
              judged against the arm -> the victim it names back in service under another
              generation. Every state but the last holds the run-wide harm slot

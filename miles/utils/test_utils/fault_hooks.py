@@ -20,7 +20,7 @@ from miles.utils.audit_utils.event_logger.logger import get_event_logger, is_eve
 from miles.utils.audit_utils.event_logger.models import FaultHookFireEvent
 from miles.utils.pydantic_utils import FrozenStrictBaseModel
 from miles.utils.test_utils.fault_injector import FailureMode, inject_fault
-from miles.utils.test_utils.receiver_fault import ReceiverFaultRefusedError, ReceiverIdentity
+from miles.utils.test_utils.receiver_fault import RECEIVER_SUPPORTED_MODES, ReceiverFaultRefusedError, ReceiverIdentity
 from miles.utils.tracking_utils.structured_log import log_structured
 
 logger = logging.getLogger(__name__)
@@ -308,6 +308,12 @@ def _assert_target_is_reachable(action: FaultHookAction) -> None:
             f"{action.hook.value} runs where no single inference target is being written to, so a remote request "
             f"there could only guess which cell to harm; the remote-capable hooks are "
             f"{sorted(hook.value for hook in REMOTE_CAPABLE_HOOKS)}"
+        )
+    if action.mode not in RECEIVER_SUPPORTED_MODES:
+        raise FaultHookTargetUnsupportedError(
+            f"an inference receiver can only signal itself with "
+            f"{sorted(mode.value for mode in RECEIVER_SUPPORTED_MODES)}, so the remote request "
+            f"{action.request_id!r} for {action.mode.value} names a fault only the process's own code could commit"
         )
     if _REMOTE_EXECUTOR is None:
         raise FaultHookTargetUnsupportedError(

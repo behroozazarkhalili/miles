@@ -37,9 +37,14 @@ class _Capability:
         return self._operations
 
 
-def _execute(operations: _RecordingCellOperations, *, request_id: str = "req-1") -> FaultHookOutcome:
+def _execute(
+    operations: _RecordingCellOperations,
+    *,
+    request_id: str = "req-1",
+    mode: FailureMode = FailureMode.SIGKILL,
+) -> FaultHookOutcome:
     return CellOperationsRemoteFaultExecutor(capability=_Capability(operations))(
-        target=_TARGET, mode=FailureMode.SIGKILL, request_id=request_id
+        target=_TARGET, mode=mode, request_id=request_id
     )
 
 
@@ -55,6 +60,23 @@ class TestDeliveringARemoteFault:
             dict(
                 cell_id="engine-0",
                 mode=FailureMode.SIGKILL,
+                expected_workers_hash="hash-1",
+                receiver=_RECEIVER,
+                request_id="req-7",
+            )
+        ]
+
+    def test_a_sigstop_is_aimed_at_the_same_frozen_receiver_as_a_kill(self):
+        """A hang has to reach the engine rank holding the session, never a supervisor that only knows its name."""
+        operations = _RecordingCellOperations(outcome=FaultInjectionOutcome.ACCEPTED)
+
+        outcome = _execute(operations, request_id="req-7", mode=FailureMode.SIGSTOP)
+
+        assert outcome is FaultHookOutcome.ACCEPTED
+        assert operations.calls == [
+            dict(
+                cell_id="engine-0",
+                mode=FailureMode.SIGSTOP,
                 expected_workers_hash="hash-1",
                 receiver=_RECEIVER,
                 request_id="req-7",

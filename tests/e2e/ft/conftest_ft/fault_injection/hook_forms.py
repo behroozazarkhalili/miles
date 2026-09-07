@@ -33,6 +33,7 @@ from miles.utils.test_utils.fault_hooks import (
     FaultHookTarget,
 )
 from miles.utils.test_utils.fault_injector import FailureMode
+from miles.utils.test_utils.receiver_fault import RECEIVER_SUPPORTED_MODES
 
 logger = logging.getLogger(__name__)
 
@@ -40,7 +41,8 @@ LOCAL_HOOK_FORM_NAME: str = "fault_hook:local"
 REMOTE_HOOK_FORM_NAME: str = "fault_hook:remote_inference_cell"
 
 HOOK_SOURCE_SUB_INDEX: int = 0
-HOOK_FAILURE_MODE: FailureMode = FailureMode.SIGKILL
+LOCAL_HOOK_FAILURE_MODES: list[FailureMode] = [FailureMode.SIGKILL, FailureMode.DEADLOCK, FailureMode.SIGSTOP]
+REMOTE_HOOK_FAILURE_MODES: list[FailureMode] = sorted(RECEIVER_SUPPORTED_MODES, key=lambda mode: mode.value)
 ARM_REQUEST_TIMEOUT_SECONDS: float = 60.0
 ARM_REFUSAL_STATUS_CODES: frozenset[int] = frozenset({400, 404, 422})
 _ARM_REFUSAL_REASON_OF_STATUS_CODE: dict[int, str] = {400: "BadRequest", 404: "NotFound"}
@@ -162,6 +164,9 @@ class _BaseHookFaultForm(BaseFaultForm):
     def candidate_hooks(self) -> list[FaultHookName]: ...
 
     @abc.abstractmethod
+    def candidate_modes(self) -> list[FailureMode]: ...
+
+    @abc.abstractmethod
     def eligible_sources(self, cell: dict) -> list[HookSource]: ...
 
     def is_available(self, cell: dict) -> bool:
@@ -177,16 +182,19 @@ class _BaseHookFaultForm(BaseFaultForm):
         )
         source = rng.choice(sources)
         hook = rng.choice(self.candidate_hooks())
+        mode = rng.choice(self.candidate_modes())
         delay_ms = draw_fault_hook_delay_ms(rng)
         request_id = f"soak-{self.name}-{rng.getrandbits(64):016x}"
 
-        self._note_arm(request_id=request_id, source=source, hook=hook, delay_ms=delay_ms, acknowledged=False)
+        self._note_arm(
+            request_id=request_id, source=source, hook=hook, mode=mode, delay_ms=delay_ms, acknowledged=False
+        )
         response = requests.post(
             f"{self._context.base_url}/api/v1/cells/{source.cell_name}/arm-fault-hook",
             json={
                 "expected_workers_hash": source.workers_hash,
                 "hook": hook.value,
-                "mode": HOOK_FAILURE_MODE.value,
+                "mode": mode.value,
                 "target": self.target.value,
                 "sub_index": HOOK_SOURCE_SUB_INDEX,
                 "request_id": request_id,
@@ -200,10 +208,19 @@ class _BaseHookFaultForm(BaseFaultForm):
             return
 
         response.raise_for_status()
-        self._note_arm(request_id=request_id, source=source, hook=hook, delay_ms=delay_ms, acknowledged=True)
+        self._note_arm(
+            request_id=request_id, source=source, hook=hook, mode=mode, delay_ms=delay_ms, acknowledged=True
+        )
 
     def _note_arm(
-        self, *, request_id: str, source: HookSource, hook: FaultHookName, delay_ms: int, acknowledged: bool
+        self,
+        *,
+        request_id: str,
+        source: HookSource,
+        hook: FaultHookName,
+        mode: FailureMode,
+        delay_ms: int,
+        acknowledged: bool,
     ) -> None:
         self._context.event_log.note_hook_arm(
             request_id=request_id,
@@ -214,7 +231,7 @@ class _BaseHookFaultForm(BaseFaultForm):
             source_cell_index=source.cell_index,
             source_rank_within_cell=HOOK_SOURCE_SUB_INDEX,
             hook=hook.value,
-            mode=HOOK_FAILURE_MODE.value,
+            mode=mode.value,
             target=self.target.value,
             delay_ms=delay_ms,
             acknowledged=acknowledged,
@@ -239,6 +256,9 @@ class LocalHookFaultForm(_BaseHookFaultForm):
 
     def candidate_hooks(self) -> list[FaultHookName]:
         return compute_local_hook_candidates(tensor_parallel_size=self._context.tensor_parallel_size)
+
+    def candidate_modes(self) -> list[FailureMode]:
+        return list(LOCAL_HOOK_FAILURE_MODES)
 
     def eligible_sources(self, cell: dict) -> list[HookSource]:
         cell_name = cell["metadata"]["name"]
@@ -265,6 +285,9 @@ class RemoteHookFaultForm(_BaseHookFaultForm):
 
     def candidate_hooks(self) -> list[FaultHookName]:
         return compute_remote_hook_candidates()
+
+    def candidate_modes(self) -> list[FailureMode]:
+        return list(REMOTE_HOOK_FAILURE_MODES)
 
     def eligible_sources(self, cell: dict) -> list[HookSource]:
         return self._sources()

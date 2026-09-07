@@ -59,6 +59,7 @@ from miles.utils.audit_utils.process_identity import TrainerControllerProcessIde
 from miles.utils.ft_utils.api_server.models import K8sStatus
 from miles.utils.test_utils.fault_hooks import FaultHookName, FaultHookOutcome, FaultHookTarget
 from miles.utils.test_utils.fault_injector import FailureMode
+from miles.utils.test_utils.receiver_fault import RECEIVER_SUPPORTED_MODES
 
 _TRAINER = "actor-cell-00001"
 _TRAINER_HASH = "trainer-generation-0"
@@ -174,6 +175,7 @@ def _arm(
     target: FaultHookTarget = FaultHookTarget.LOCAL,
     acknowledged: bool = True,
     delay_ms: int = 0,
+    mode: FailureMode = FailureMode.SIGKILL,
 ) -> None:
     for state in [False, True] if acknowledged else [False]:
         log.note_hook_arm(
@@ -189,7 +191,7 @@ def _arm(
             source_cell_index=_TRAINER_CELL_INDEX,
             source_rank_within_cell=0,
             hook=FaultHookName.WEIGHT_UPDATE_AFTER_P2P_SUBMIT.value,
-            mode=FailureMode.SIGKILL.value,
+            mode=mode.value,
             target=target.value,
             delay_ms=delay_ms,
             acknowledged=state,
@@ -593,6 +595,7 @@ class TestTheSoakArmsADrawnDelay:
         replay = random.Random(20260929)
         replay.choice([_TRAINER])
         replay.choice(form.candidate_hooks())
+        replay.choice(form.candidate_modes())
 
         with _api_server_listing() as mock_requests:
             mock_requests.post.side_effect = lambda url, json, timeout: mock_response({})
@@ -626,6 +629,81 @@ class TestTheSoakArmsADrawnDelay:
 
         (harm,) = compute_hook_harms(log.events)
         assert not harm.delivered and "not the 500ms it was armed for" in harm.fire.rejected_because
+        assert compute_unresolved_hook_harms(log.events)
+
+
+# ================================ failure modes ===============================
+
+
+class TestDrawingASoakFailureMode:
+    def test_a_local_hook_may_crash_or_hang_the_trainer_that_reached_it(self, tmp_path: Path) -> None:
+        """The three are what a trainer process can inflict on itself, and each fails the run differently."""
+        form = LocalHookFaultForm(_context(tmp_path, log=EventLog()))
+
+        assert form.candidate_modes() == [FailureMode.SIGKILL, FailureMode.DEADLOCK, FailureMode.SIGSTOP]
+
+    def test_a_remote_hook_draws_only_what_the_receiver_can_raise_on_itself(self, tmp_path: Path) -> None:
+        """Drawing anything else would arm a request the worker refuses, breaking the run instead of an engine."""
+        form = RemoteHookFaultForm(_context(tmp_path, log=EventLog()))
+
+        assert set(form.candidate_modes()) == RECEIVER_SUPPORTED_MODES
+
+    def test_the_drawn_mode_is_both_sent_and_recorded(self, tmp_path: Path) -> None:
+        """A run that armed a hang and recorded a kill could not tell which fault its witnesses judged."""
+        log = EventLog()
+        _write_events(tmp_path / "events", file_name="controller.jsonl", events=[_assignment()])
+        form = LocalHookFaultForm(_context(tmp_path, log=log))
+
+        with _api_server_listing() as mock_requests:
+            mock_requests.post.side_effect = lambda url, json, timeout: mock_response({})
+            form.inject(_drawn_trainer_cell(), random.Random(20260929))
+
+        (harm,) = compute_hook_harms(log.events)
+        (post,) = mock_requests.post.call_args_list
+        assert post.kwargs["json"]["mode"] == harm.mode
+        assert harm.mode in {mode.value for mode in form.candidate_modes()}
+
+    def test_the_mode_comes_from_the_generator_the_form_was_drawn_with(self, tmp_path: Path) -> None:
+        """A soak that hung on one draw has to replay that same draw from its seed alone."""
+        log = EventLog()
+        _write_events(tmp_path / "events", file_name="controller.jsonl", events=[_assignment()])
+        form = LocalHookFaultForm(_context(tmp_path, log=log))
+        replay = random.Random(20260929)
+        replay.choice([_TRAINER])
+        replay.choice(form.candidate_hooks())
+
+        with _api_server_listing() as mock_requests:
+            mock_requests.post.side_effect = lambda url, json, timeout: mock_response({})
+            form.inject(_drawn_trainer_cell(), random.Random(20260929))
+
+        (harm,) = compute_hook_harms(log.events)
+        assert harm.mode == replay.choice(form.candidate_modes()).value
+
+    def test_a_hang_that_fired_as_the_mode_it_was_armed_for_is_delivered(self, tmp_path: Path) -> None:
+        """The fire record is what proves which fault production ran, so it has to carry the armed mode."""
+        log = EventLog()
+        _observe_cluster(log)
+        _arm(log, mode=FailureMode.SIGSTOP)
+        _write_events(tmp_path / "events", file_name="controller.jsonl", events=[_assignment()])
+        _write_events(tmp_path / "events", file_name="actor.jsonl", events=[_fire(mode=FailureMode.SIGSTOP.value)])
+
+        _collect(log, tmp_path)
+
+        (harm,) = compute_hook_harms(log.events)
+        assert harm.delivered and harm.fire.mode == FailureMode.SIGSTOP.value
+
+    def test_a_fire_in_another_mode_leaves_the_request_outstanding(self, tmp_path: Path) -> None:
+        """A kill recorded for a request that armed a hang tested a boundary nobody asked about."""
+        log = EventLog()
+        _observe_cluster(log)
+        _arm(log, mode=FailureMode.SIGSTOP)
+        _write_events(tmp_path / "events", file_name="controller.jsonl", events=[_assignment()])
+        _write_events(tmp_path / "events", file_name="actor.jsonl", events=[_fire()])
+
+        _collect(log, tmp_path)
+
+        (harm,) = compute_hook_harms(log.events)
+        assert not harm.delivered and "not the armed" in harm.fire.rejected_because
         assert compute_unresolved_hook_harms(log.events)
 
 

@@ -16,7 +16,13 @@ from miles.utils.external_utils.command_utils.helm_backend.naming import Release
 from miles.utils.test_utils.fault_injector import FailureMode
 from miles.utils.workers.types import ClusterBackend, DeployComponent
 
-FAILURE_MODES: list[FailureMode] = [FailureMode.SIGKILL, FailureMode.EXIT, FailureMode.SEGFAULT]
+FAILURE_MODES: list[FailureMode] = [
+    FailureMode.SIGKILL,
+    FailureMode.EXIT,
+    FailureMode.SEGFAULT,
+    FailureMode.DEADLOCK,
+    FailureMode.SIGSTOP,
+]
 RAY_ROLLOUT_ENGINE_FAILURE_MODES: list[FailureMode] = [FailureMode.SIGKILL]
 
 DELETE_POD_FORM_NAME: str = "delete_pod"

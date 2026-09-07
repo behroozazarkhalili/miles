@@ -286,6 +286,35 @@ class TestArmingARemoteFault:
 
         assert registry.armed_hooks() == {}
 
+    @pytest.mark.parametrize("mode", ["exit", "segfault", "deadlock"])
+    def test_a_mode_no_receiver_can_perform_is_refused_at_arming_time(
+        self, registry: fault_hooks._FaultHookRegistry, remote_executor: list, mode: str
+    ) -> None:
+        """Accepting it would hold the hook until the write, then answer refused with nothing harmed."""
+        with pytest.raises(fault_hooks.FaultHookTargetUnsupportedError):
+            arm_fault_hook(
+                hook=_OTHER_HOOK.value,
+                mode=mode,
+                request_id="req-1",
+                target=FaultHookTarget.REMOTE_INFERENCE_CELL.value,
+            )
+
+        assert registry.armed_hooks() == {}
+
+    @pytest.mark.parametrize("mode", ["sigkill", "sigstop"])
+    def test_the_signals_the_receiver_implements_are_armed(
+        self, registry: fault_hooks._FaultHookRegistry, remote_executor: list, mode: str
+    ) -> None:
+        """These two are what the receiver process can raise on itself once it has checked its own identity."""
+        arm_fault_hook(
+            hook=_OTHER_HOOK.value,
+            mode=mode,
+            request_id="req-1",
+            target=FaultHookTarget.REMOTE_INFERENCE_CELL.value,
+        )
+
+        assert [action.mode.value for action in registry.armed_hooks().values()] == [mode]
+
 
 class TestReachingARemoteFault:
     def test_the_fault_is_delivered_to_the_target_the_site_names(
@@ -305,6 +334,27 @@ class TestReachingARemoteFault:
         fault_hooks.reach_fault_hook(_OTHER_HOOK, remote_target=_REMOTE_TARGET)
 
         assert remote_executor == [(_REMOTE_TARGET, "sigkill", "req-1")]
+        assert injected == []
+
+    def test_a_remote_sigstop_freezes_the_receiver_this_write_reached(
+        self,
+        registry: fault_hooks._FaultHookRegistry,
+        injected: list[str],
+        remote_executor: list,
+    ) -> None:
+        """The hang has to reach the process holding the session, not the trainer and not a supervisor."""
+        arm_fault_hook(
+            hook=_OTHER_HOOK.value,
+            mode="sigstop",
+            request_id="req-1",
+            target=FaultHookTarget.REMOTE_INFERENCE_CELL.value,
+        )
+
+        fault_hooks.reach_fault_hook(_OTHER_HOOK, remote_target=_REMOTE_TARGET)
+
+        (target, mode, request_id) = remote_executor[0]
+        assert (mode, request_id) == ("sigstop", "req-1")
+        assert target.receiver == _RECEIVER and target.cell_id == _REMOTE_TARGET.cell_id
         assert injected == []
 
     def test_a_site_that_names_no_target_refuses_to_guess(

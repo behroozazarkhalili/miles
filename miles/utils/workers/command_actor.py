@@ -37,8 +37,9 @@ class CommandActor(NodeProbeMixin):
     def inject_fault(self, mode: str) -> None:
         assert self._process is not None, "CommandActor has no subprocess to inject a fault into"
         assert (failure_mode := fault_injector.FailureMode(mode)) is fault_injector.FailureMode.SIGKILL, (
-            f"{failure_mode.value} is a fault a process inflicts on itself from the inside, and no signal reproduces "
-            f"it from the outside, so only sigkill can be injected into a subprocess"
+            f"{failure_mode.value} cannot be asked of an engine through its supervisor: exit and segfault are faults "
+            f"a process inflicts on itself from the inside, and stopping this subprocess group would freeze the "
+            f"launch shell rather than the engine rank that holds a weight transfer, so only sigkill is offered here"
         )
 
         logger.warning(f"CommandActor kills its subprocess group pid={self._process.pid}")

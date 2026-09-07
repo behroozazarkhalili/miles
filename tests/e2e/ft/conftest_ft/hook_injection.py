@@ -5,7 +5,7 @@ from __future__ import annotations
 import dataclasses
 import logging
 import threading
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 import requests
@@ -57,13 +57,25 @@ from miles.utils.audit_utils.event_logger.models import (
 from miles.utils.audit_utils.process_identity import TrainProcessIdentity
 from miles.utils.external_utils import command_utils
 from miles.utils.test_utils.fault_hooks import FaultHookName, FaultHookTarget
-from miles.utils.test_utils.fault_injector import FailureMode
+from miles.utils.test_utils.fault_injector import DEADLOCK_SLEEP_SECONDS, FailureMode
 from miles.utils.test_utils.polling_worker import PollingWorker
 from miles.utils.workers.naming import compute_cell_id, parse_cell_id
 
 logger = logging.getLogger(__name__)
 
 P2P_WEIGHT_TRANSFER_ARGS: str = f"{BASE_P2P_WEIGHT_TRANSFER_ARGS}{P2P_FAULT_INJECTION_ARGS}"
+
+UPDATE_WEIGHTS_TIMEOUT_SECONDS: float = 120.0
+UPDATE_WEIGHT_ENGINE_REQUEST_TIMEOUT_SECONDS: float = 30.0
+P2P_TRANSFER_TIMEOUT_SECONDS: float = 10.0
+TARGETED_DEADLINE_ARGS: str = (
+    f"--update-weights-timeout {UPDATE_WEIGHTS_TIMEOUT_SECONDS} "
+    f"--update-weight-engine-request-timeout {UPDATE_WEIGHT_ENGINE_REQUEST_TIMEOUT_SECONDS} "
+    f"--p2p-transfer-timeout {P2P_TRANSFER_TIMEOUT_SECONDS} "
+)
+
+DEFAULT_TARGETED_FAILURE_MODE: FailureMode = FailureMode.SIGKILL
+HANG_EVICTION_DEADLINE_SECONDS: int = DEADLOCK_SLEEP_SECONDS
 
 POLL_INTERVAL_SECONDS: float = 2.0
 STOP_AND_JOIN_TIMEOUT_SECONDS: float = 120.0
@@ -88,26 +100,41 @@ class TargetedHookRun:
         return self.armer.event_log.events
 
 
+def compute_targeted_test_name(*, test_name: str, failure_mode: FailureMode) -> str:
+    if failure_mode is DEFAULT_TARGETED_FAILURE_MODE:
+        return test_name
+    return f"{test_name}_{failure_mode.value}"
+
+
+def compute_targeted_request_id(*, request_id: str, failure_mode: FailureMode) -> str:
+    if failure_mode is DEFAULT_TARGETED_FAILURE_MODE:
+        return request_id
+    return f"{request_id}-{failure_mode.value}"
+
+
 def run_targeted_hook_scenario(
     *,
     test_name: str,
     mode: str,
     num_steps: int,
     hook: FaultHookName,
-    failure_mode: FailureMode,
     target: FaultHookTarget,
     request_id: str,
     sub_index: int,
+    failure_mode: FailureMode = DEFAULT_TARGETED_FAILURE_MODE,
     delay_ms: int = 0,
 ) -> TargetedHookRun:
     ft_mode = resolve_mode(mode)
     assert_mode_reaches_the_hooks(ft_mode, mode=mode)
 
+    scenario_name = compute_targeted_test_name(test_name=test_name, failure_mode=failure_mode)
+    scenario_request_id = compute_targeted_request_id(request_id=request_id, failure_mode=failure_mode)
+
     config = command_utils.default_config()
-    dump_dir: str = resolve_dump_dir(f"{test_name}_{mode}", run_id=config.run_id)
+    dump_dir: str = resolve_dump_dir(f"{scenario_name}_{mode}", run_id=config.run_id)
     print(f"Dump directory: {dump_dir}")
     print(f"Steps: {num_steps}, cluster backend: {config.cluster_backend.value}")
-    print(f"Arming {hook.value} ({failure_mode.value}, {target.value}, delay {delay_ms}ms) as {request_id!r}")
+    print(f"Arming {hook.value} ({failure_mode.value}, {target.value}, delay {delay_ms}ms) as {scenario_request_id!r}")
 
     prepare(ft_mode, config=config)
 
@@ -117,6 +144,7 @@ def run_targeted_hook_scenario(
         + get_ft_args(ft_mode)
         + get_api_server_args(config)
         + P2P_WEIGHT_TRANSFER_ARGS
+        + TARGETED_DEADLINE_ARGS
         + f"--save {dump_dir}/{CHECKPOINT_DIRNAME} --save-interval 1 "
         + "--mini-ft-controller-enable "
     )
@@ -131,7 +159,7 @@ def run_targeted_hook_scenario(
         hook=hook,
         mode=failure_mode,
         target=target,
-        request_id=request_id,
+        request_id=scenario_request_id,
         delay_ms=delay_ms,
     )
     armer.start()
@@ -450,9 +478,9 @@ def compute_incarnations_of_cell(events: list[Event], *, cell_type: str) -> dict
     return incarnations
 
 
-def compute_harm_observed_at(events: list[Event], *, armed: ArmedFaultHook) -> datetime:
+def compute_harm_observed_at(events: list[Event], *, armed: ArmedFaultHook, since: datetime) -> datetime:
     for event in events:
-        if not isinstance(event, ObservationsEvent) or event.timestamp < armed.snapshot_at:
+        if not isinstance(event, ObservationsEvent) or event.timestamp < since:
             continue
         info = event.cell_infos.get(armed.cell_name)
         if info is not None and info.workers_hash != armed.trainer_workers_hash:
@@ -460,13 +488,37 @@ def compute_harm_observed_at(events: list[Event], *, armed: ArmedFaultHook) -> d
 
     raise AssertionError(
         f"Eviction witness failed: {armed.cell_name} was never observed under an incarnation other than the armed "
-        f"{armed.trainer_workers_hash}, so the fault the run reports as fired cost it nothing "
-        f"(observed: {compute_incarnations_of_cell(events, cell_type=ACTOR_CELL_TYPE)})"
+        f"{armed.trainer_workers_hash} after {since.isoformat()}, so the fault the run reports as fired cost it "
+        f"nothing (observed: {compute_incarnations_of_cell(events, cell_type=ACTOR_CELL_TYPE)})"
     )
 
 
-def assert_armed_trainer_was_replaced(events: list[Event], *, armed: ArmedFaultHook) -> datetime:
-    harm_observed_at = compute_harm_observed_at(events, armed=armed)
+def assert_eviction_beat_the_hang(
+    *, fire: FaultHookFireEvent, cell_name: str, workers_hash: str, observed_at: datetime
+) -> None:
+    elapsed = observed_at - fire.timestamp
+    assert timedelta(0) <= elapsed < timedelta(seconds=HANG_EVICTION_DEADLINE_SECONDS), (
+        f"Hang witness failed: {cell_name} was observed off {workers_hash} {elapsed} after request "
+        f"{fire.request_id!r} fired at {fire.timestamp.isoformat()}; a replacement that appeared before the fault or "
+        f"only after the {HANG_EVICTION_DEADLINE_SECONDS}s a deadlocked process needs to return by itself proves "
+        f"nothing about the control plane ending the hang"
+    )
+    print(
+        f"Hang witness passed: {cell_name} left {workers_hash} {elapsed} after request {fire.request_id!r} fired, "
+        f"well inside the {HANG_EVICTION_DEADLINE_SECONDS}s a hang would have outlived on its own"
+    )
+
+
+def assert_armed_trainer_was_replaced(
+    events: list[Event], *, armed: ArmedFaultHook, fire: FaultHookFireEvent
+) -> datetime:
+    harm_observed_at = compute_harm_observed_at(events, armed=armed, since=fire.timestamp)
+    assert_eviction_beat_the_hang(
+        fire=fire,
+        cell_name=armed.cell_name,
+        workers_hash=armed.trainer_workers_hash,
+        observed_at=harm_observed_at,
+    )
 
     assert _was_alive_after(
         events, cell_name=armed.cell_name, other_than=armed.trainer_workers_hash, since=harm_observed_at
@@ -683,17 +735,23 @@ def assert_remote_victim_recovered(events: list[Event], *, fire: FaultHookFireEv
     print(f"Remote recovery witness passed: {victim} served again under a replacement of {fire.victim_workers_hash}")
 
 
-def compute_victim_harm_observed_at(
-    events: list[Event], *, fire: FaultHookFireEvent, armed: ArmedFaultHook
-) -> datetime:
+def compute_victim_harm_observed_at(events: list[Event], *, fire: FaultHookFireEvent) -> datetime:
     for event in events:
-        if not isinstance(event, ObservationsEvent) or event.timestamp < armed.snapshot_at:
+        if not isinstance(event, ObservationsEvent) or event.timestamp < fire.timestamp:
             continue
         info = event.cell_infos.get(fire.victim_cell_id)
         if info is not None and info.workers_hash != fire.victim_workers_hash:
-            return event.timestamp
+            harm_observed_at = event.timestamp
+            assert_eviction_beat_the_hang(
+                fire=fire,
+                cell_name=fire.victim_cell_id,
+                workers_hash=fire.victim_workers_hash,
+                observed_at=harm_observed_at,
+            )
+            return harm_observed_at
 
     raise AssertionError(
         f"Remote fault witness failed: {fire.victim_cell_id} was never observed under an incarnation other than the "
-        f"{fire.victim_workers_hash} the write reached, so the fault the run reports as delivered cost it nothing"
+        f"{fire.victim_workers_hash} the write reached after that write's fault was accepted at "
+        f"{fire.timestamp.isoformat()}, so the fault the run reports as delivered cost it nothing"
     )

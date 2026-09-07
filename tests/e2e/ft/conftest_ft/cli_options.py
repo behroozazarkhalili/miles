@@ -4,7 +4,10 @@ from typing import Annotated
 
 import typer
 
+from miles.utils.test_utils.fault_injector import FailureMode
+
 ModeOption = Annotated[str, typer.Option(help="Test mode variant")]
+FailureModeOption = Annotated[FailureMode, typer.Option(help="Fault the armed hook inflicts when it is reached")]
 OptionalModeOption = Annotated[
     str | None, typer.Option(help="Test mode variant; a suite whose scenario fixes its topology takes none")
 ]

@@ -83,14 +83,30 @@ class TestTheRequest:
             "mode": "sigkill",
         }
 
-    def test_a_mode_the_receiver_cannot_perform_is_refused_before_it_is_sent(self):
-        """Exiting or segfaulting is what a process does to itself from the inside; no signal reproduces it."""
+    @pytest.mark.parametrize("mode", [FailureMode.SEGFAULT, FailureMode.EXIT, FailureMode.DEADLOCK])
+    def test_a_mode_the_receiver_cannot_perform_is_refused_before_it_is_sent(self, mode: FailureMode):
+        """Exiting, segfaulting and deadlocking are what a process does to itself; no signal reproduces them."""
         transport = _RecordingTransport()
 
         with pytest.raises(ReceiverFaultRefusedError):
-            _run(transport, mode=FailureMode.SEGFAULT)
+            _run(transport, mode=mode)
 
         assert transport.requests == []
+
+    def test_a_sigstop_is_sent_as_the_mode_the_receiver_implements(self):
+        """A frozen receiver is a fault only the process holding the session can inflict on itself."""
+        transport = _RecordingTransport()
+
+        assert _run(transport, mode=FailureMode.SIGSTOP) is ReceiverFaultOutcome.ACCEPTED
+
+        (request,) = transport.requests
+        assert json.loads(request.content) == {
+            "request_id": _REQUEST_ID,
+            "expected_receiver_boot_uuid": "boot-1",
+            "expected_session_id": "session-1",
+            "expected_rank": 2,
+            "mode": "sigstop",
+        }
 
 
 class TestAccepting:
@@ -215,5 +231,5 @@ class TestUnknownAnswers:
 
 class TestSupportedModes:
     def test_only_the_signals_the_receiver_implements_are_offered(self):
-        """Exit and segfault cannot be produced from outside, and pretending otherwise would fake a fault form."""
-        assert receiver_fault.RECEIVER_SUPPORTED_MODES == frozenset({FailureMode.SIGKILL})
+        """Exit, segfault and deadlock cannot be produced from outside, and offering them would fake a fault form."""
+        assert receiver_fault.RECEIVER_SUPPORTED_MODES == frozenset({FailureMode.SIGKILL, FailureMode.SIGSTOP})

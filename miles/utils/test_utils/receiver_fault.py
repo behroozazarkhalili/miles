@@ -25,7 +25,7 @@ REQUEST_TIMEOUT_SECONDS = 10.0
 STALE_STATUS_CODE = 409
 ACCEPTED_STATUS = "accepted"
 
-RECEIVER_SUPPORTED_MODES: frozenset[FailureMode] = frozenset({FailureMode.SIGKILL})
+RECEIVER_SUPPORTED_MODES: frozenset[FailureMode] = frozenset({FailureMode.SIGKILL, FailureMode.SIGSTOP})
 
 STALE_REFUSAL_REASONS: frozenset[str] = frozenset(
     {"receiver_inactive", "receiver_boot_uuid_mismatch", "session_id_mismatch", "rank_mismatch"}

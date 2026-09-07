@@ -17,8 +17,19 @@ def test_ray_draws_the_in_process_kills_for_a_trainer_cell() -> None:
     assert [form.name for form in forms] == [f"inject_fault:{one.value}" for one in fault_forms.FAILURE_MODES]
 
 
+def test_a_trainer_cell_is_also_drawn_the_two_hangs() -> None:
+    """A worker that stops answering without dying is the failure the update deadline exists to end."""
+    assert fault_forms.FAILURE_MODES == [
+        FailureMode.SIGKILL,
+        FailureMode.EXIT,
+        FailureMode.SEGFAULT,
+        FailureMode.DEADLOCK,
+        FailureMode.SIGSTOP,
+    ]
+
+
 def test_ray_draws_a_sigkill_only_for_a_rollout_cell() -> None:
-    """The engine is a subprocess, and exit, segfault and deadlock are faults only its own code can commit."""
+    """A supervisor can only kill the engine; a hang of the rank holding a transfer goes through the hook form."""
     forms = api_server_fault_forms()["rollout"]
 
     assert [form.name for form in forms] == [f"inject_fault:{FailureMode.SIGKILL.value}"]

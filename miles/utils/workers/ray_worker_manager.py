@@ -5,7 +5,7 @@ import functools
 import logging
 import time
 from collections.abc import Callable, Coroutine
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from functools import partial
 from typing import TYPE_CHECKING, Any, Generic, TypeVar
 
@@ -23,6 +23,7 @@ from miles.utils.workers.backend_capability.base import BackendCapability, Defer
 from miles.utils.workers.backend_capability.ray import RayBackendCapability
 from miles.utils.workers.cell_operations.base import (
     CELL_TERMINATION_NOT_CONFIRMED,
+    CellTerminationNotConfirmedError,
     CellTerminationOutcome,
     FaultInjectionOutcome,
 )
@@ -61,6 +62,7 @@ _LIVENESS_SCAN_INTERVAL_SECONDS = 10.0
 _STOP_CONFIRM_TIMEOUT_SECONDS = 60.0
 _STOP_CONFIRM_PROBE_INTERVAL_SECONDS = 1.0
 _STOP_CONFIRM_PROBE_TIMEOUT_SECONDS = 10.0
+_RETIREMENT_CONFIRM_TIMEOUT_SECONDS = 10.0
 
 
 class RayWorkerManager:
@@ -95,6 +97,7 @@ class RayWorkerManager:
     async def start_cells(self, cell_ids: list[str]) -> None:
         async with self._membership_lock:
             cells = [cell for cell_id in cell_ids if (cell := self._find_cell(cell_id)).actors is None]
+            await _assert_every_cell_is_retired(cells)
             try:
                 await _gather_or_raise([c.launch_actors() for c in cells])
                 await _gather_or_raise([c.alloc_ports() for c in cells])
@@ -117,13 +120,12 @@ class RayWorkerManager:
                     f"the request was issued against"
                 )
                 return CellTerminationOutcome.STALE.value
-            if not cell.alive:
+            if not cell.alive and not cell.retiring_actors:
                 return CellTerminationOutcome.ALREADY_GONE.value
 
-            stopped_actors = list(cell.actors)
             await cell.stop(require_kill=True)
 
-            if not await _confirm_actors_dead(stopped_actors, timeout=_STOP_CONFIRM_TIMEOUT_SECONDS):
+            if not await cell.confirm_retired(timeout=_STOP_CONFIRM_TIMEOUT_SECONDS):
                 return CELL_TERMINATION_NOT_CONFIRMED
             return CellTerminationOutcome.TERMINATED.value
 
@@ -271,6 +273,7 @@ class _CellManager(Generic[SpecT]):
     cell_index: int
     spec: SpecT
     actors: list[_BaseActorManager] | None
+    retiring_actors: list[_BaseActorManager] = field(default_factory=list)
     generation: int = 0
     liveness_scan_task: asyncio.Task | None = None
 
@@ -306,9 +309,23 @@ class _CellManager(Generic[SpecT]):
         await self._for_all_actors(lambda a: a.post_setup())
 
     async def stop(self, *, require_kill: bool = False) -> None:
-        if self.actors is None:
+        if self.retiring_actors:
+            await self.confirm_retired(timeout=_RETIREMENT_CONFIRM_TIMEOUT_SECONDS)
+        self._retire_actors()
+        if not (retiring := list(self.retiring_actors)):
             return
-        await self._for_all_actors(lambda a: a.stop(require_kill=require_kill))
+        await asyncio.gather(*[a.stop(require_kill=require_kill) for a in retiring])
+
+    async def confirm_retired(self, *, timeout: float) -> bool:
+        if not self.retiring_actors:
+            return True
+        self.retiring_actors = await _actors_not_confirmed_dead(self.retiring_actors, timeout=timeout)
+        return not self.retiring_actors
+
+    def _retire_actors(self) -> None:
+        if (actors := self.actors) is None:
+            return
+        self.retiring_actors = [*self.retiring_actors, *[a for a in actors if a.actor_handle is not None]]
         self.actors = None
 
     async def _scan_liveness_forever(self, generation: int) -> None:
@@ -624,7 +641,21 @@ def _create_ray_backend_capability() -> BackendCapability:
     return RayBackendCapability(worker_manager_handle=RayWorkerManager.get_handle())
 
 
-async def _confirm_actors_dead(actors: list[_BaseActorManager], *, timeout: float) -> bool:
+async def _assert_every_cell_is_retired(cells: list[_CellManager]) -> None:
+    confirmations = await asyncio.gather(
+        *[cell.confirm_retired(timeout=_RETIREMENT_CONFIRM_TIMEOUT_SECONDS) for cell in cells]
+    )
+    blocked = [cell for cell, retired in zip(cells, confirmations, strict=True) if not retired]
+    if not blocked:
+        return
+    raise CellTerminationNotConfirmedError(
+        f"cells {[cell.cell_id for cell in blocked]} still have the actors "
+        f"{[actor.name for cell in blocked for actor in cell.retiring_actors]} answering after being stopped, so a "
+        f"new generation started now would run beside processes that never released their gpus"
+    )
+
+
+async def _actors_not_confirmed_dead(actors: list[_BaseActorManager], *, timeout: float) -> list[_BaseActorManager]:
     deadline = time.monotonic() + timeout
     pending = list(actors)
     while pending:
@@ -637,9 +668,9 @@ async def _confirm_actors_dead(actors: list[_BaseActorManager], *, timeout: floa
                 f"Actors {[actor.name for actor in pending]} still answer {timeout}s after being killed, "
                 f"so their death cannot be confirmed"
             )
-            return False
+            return pending
         await asyncio.sleep(_STOP_CONFIRM_PROBE_INTERVAL_SECONDS)
-    return True
+    return []
 
 
 async def _probe_actor_is_dead(actor: _BaseActorManager) -> bool:
