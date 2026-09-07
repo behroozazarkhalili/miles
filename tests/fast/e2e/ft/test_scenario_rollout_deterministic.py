@@ -1,3 +1,4 @@
+import dataclasses
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
@@ -29,6 +30,40 @@ def test_rollout_deterministic_uses_the_shared_deterministic_recipe_without_true
     assert "--true-on-policy-contract" not in args
     assert "--sglang-attention-backend fa3" not in args
     assert "--recompute-logprobs-via-prefill" not in args
+
+
+class TestTheWeightUpdateContract:
+    def test_the_run_under_test_updates_weights_every_rollout(self, tmp_path: Path) -> None:
+        """A wider interval leaves most rollouts pushing nothing, so the crashes land where no update is running."""
+        args = _build_args(MODES["kill_rollout__dp4"], dump_dir=str(tmp_path))
+
+        assert "--update-weights-interval 1 " in args
+
+    def test_both_sides_move_weights_over_the_protocol_whose_failures_are_under_test(self, tmp_path: Path) -> None:
+        """An engine crash is only a weight-update fault if the update it interrupts is the p2p one."""
+        args = _build_args(MODES["kill_rollout__dp4"], dump_dir=str(tmp_path))
+
+        assert "--update-weight-transfer-mode p2p " in args
+
+    def test_trainer_fault_tolerance_stays_off(self, tmp_path: Path) -> None:
+        """Healing a trainer cell would change the reduce group, and the comparison is bitwise."""
+        args = _build_args(MODES["kill_rollout__dp4"], dump_dir=str(tmp_path))
+
+        assert "--ft-components rollout " in args
+
+    def test_a_mode_that_also_crashes_trainers_is_refused(self, tmp_path: Path) -> None:
+        """One healed trainer cell rebrackets the reduce, and every tensor here is compared at rel <= 0."""
+        mode = dataclasses.replace(MODES["kill_rollout__dp4"], ft_components=("train", "rollout"))
+
+        with pytest.raises(AssertionError, match="ft on rollout alone"):
+            _build_args(mode, dump_dir=str(tmp_path))
+
+    def test_a_colocated_mode_is_refused(self, tmp_path: Path) -> None:
+        """Colocated engines take weights through a CUDA IPC handle, which is not the path this scenario crashes."""
+        mode = dataclasses.replace(MODES["kill_rollout__dp4"], colocate=True)
+
+        with pytest.raises(AssertionError, match="p2p refuses a colocated mode"):
+            _build_args(mode, dump_dir=str(tmp_path))
 
 
 class TestComputeCrashedRollouts:

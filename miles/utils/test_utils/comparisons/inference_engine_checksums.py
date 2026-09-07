@@ -57,6 +57,38 @@ def assert_engine_count(*, side: str, dump_dir: str, expected: int) -> None:
     print(f"{side}: every weight update covered {expected} engine(s)")
 
 
+def assert_engines_rejoined_weight_updates(*, side: str, dump_dir: str, expected: int) -> None:
+    events = _read_inference_engine_checksum_events(Path(dump_dir))
+    assert events, f"{side}: no InferenceEngineWeightChecksumEvents in {dump_dir}, so no engine ever took weights"
+
+    oversized: dict[tuple[str | None, int], int] = {
+        (event.trainer_model_id, event.rollout_id): len(event.engine_checksums)
+        for event in events
+        if len(event.engine_checksums) > expected
+    }
+    assert not oversized, (
+        f"{side}: weight updates reached more than the {expected} engine(s) this run owns: {oversized}; a replaced "
+        f"engine whose predecessor stayed in the fan-out would keep serving weights nobody audits"
+    )
+
+    last_of_model: dict[str | None, InferenceEngineWeightChecksumEvent] = {}
+    for event in sorted(events, key=lambda one: one.rollout_id):
+        last_of_model[event.trainer_model_id] = event
+
+    missing: dict[tuple[str | None, int], int] = {
+        (model_id, event.rollout_id): len(event.engine_checksums)
+        for model_id, event in last_of_model.items()
+        if len(event.engine_checksums) != expected
+    }
+    assert not missing, (
+        f"{side}: the run's last weight update covered {missing} instead of all {expected} engine(s), so an engine "
+        f"that crashed was never brought back into the fan-out; partial-target weight update is how a run survives "
+        f"a crash mid-update, not how it is allowed to end"
+    )
+
+    print(f"{side}: the last weight update of every policy covered all {expected} engine(s)")
+
+
 def assert_engine_weights_moved(*, side: str, dump_dir: str) -> None:
     by_model_and_rollout = _checksums_by_model_and_rollout_id(_read_inference_engine_checksum_events(Path(dump_dir)))
     assert len(by_model_and_rollout) > 1, (

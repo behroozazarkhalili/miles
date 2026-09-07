@@ -29,6 +29,7 @@ from tests.e2e.ft.conftest_ft.scenario_random_crash import assert_rollout_cells_
 
 from miles.utils.external_utils import command_utils
 from miles.utils.misc import MutableBox
+from miles.utils.test_utils.comparisons.inference_engine_checksums import assert_engines_rejoined_weight_updates
 from miles.utils.test_utils.comparisons.metrics import read_rollout_completion_times
 from miles.utils.test_utils.reconfigure_assertions import assert_min_soak_injections
 
@@ -43,6 +44,7 @@ FIRST_ROLLOUT_TIMEOUT_SECONDS: float = 3600.0
 FIRST_ROLLOUT_POLL_SECONDS: float = 5.0
 MIN_CRASHED_ROLLOUTS: int = 2
 TERMINAL_FAULT_FREE_ROLLOUTS: int = 2
+UPDATE_WEIGHTS_INTERVAL: int = 1
 
 
 DETERMINISTIC_INFERENCE_ENV_VARS: dict[str, str] = {"SGLANG_BATCH_INVARIANT_OPS_ENABLE_MM_FALLBACK_VARIANT": "false"}
@@ -54,6 +56,10 @@ def _build_args(mode: FTTestMode, dump_dir: str, enable_dumper: bool = True) -> 
         f"{TEST_NAME} injects into rollout cells only, so the mode must enable ft on rollout alone, "
         f"got ft_components={mode.ft_components}"
     )
+    assert not mode.colocate, (
+        f"{TEST_NAME} asserts that a crashed engine costs the weight update nothing, which is a claim about the "
+        f"p2p protocol, and p2p refuses a colocated mode"
+    )
 
     args = get_common_train_args(mode, dump_dir=dump_dir, num_steps=NUM_ROLLOUTS, enable_dumper=enable_dumper)
     args += get_ft_args(mode)
@@ -62,6 +68,7 @@ def _build_args(mode: FTTestMode, dump_dir: str, enable_dumper: bool = True) -> 
     args += "--mini-ft-controller-enable "
     args += "--debug-deterministic-collective "
     args += "--sglang-disable-radix-cache "
+    args += f"--update-weights-interval {UPDATE_WEIGHTS_INTERVAL} "
     args += f"--rollout-health-check-interval {HEALTH_CHECK_INTERVAL_SECONDS} "
     args += "--weight-decay 0 "
     args += get_train_env_vars_arg(
@@ -161,6 +168,11 @@ def _compare(dump_dir: str, mode: FTTestMode) -> None:
         target_dir=f"{dump_dir}/{TARGET_SIDE}",
         min_trained_rollouts=MIN_TRAINED_ROLLOUTS,
     )
+
+    for side in (BASELINE_SIDE, TARGET_SIDE):
+        assert_engines_rejoined_weight_updates(
+            side=side, dump_dir=f"{dump_dir}/{side}", expected=mode.rollout_num_engines
+        )
 
     print("Rollout ft deterministic comparison test PASSED")
 

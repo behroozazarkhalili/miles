@@ -353,7 +353,7 @@ Type: comparison; both sides run the identical command, only the target is wrapp
       fault injector, through the pipeline's target_side_context hook
 Entry: test_rollout_deterministic__kill_rollout__dp4.py, ft-long
 Steps: 8 rollouts (NUM_ROLLOUTS)
-Requires: mode.has_real_rollout, and ft_components == ("rollout",) exactly
+Requires: mode.has_real_rollout, ft_components == ("rollout",) exactly, and not mode.colocate
 Compare: dumps rel <= 0 (bitwise); metrics rtol=0 / atol=0 over train/* and rollout/*,
          train/grad_norm included
 
@@ -363,6 +363,8 @@ Regime (both sides):
   - --debug-deterministic-collective and scenario_trainer_deterministic's deterministic env vars
   - --sglang-disable-radix-cache
   - --rollout-health-check-interval 1
+  - the p2p weight transfer recipe, so the update a crash interrupts is the p2p one
+  - --update-weights-interval 1: every one of the 8 rollouts publishes weights
 
 Injection (target side only):
   1. Rollout cells, seed 42, exponential mean CRASH_INTERVAL_SECONDS (30s)
@@ -378,9 +380,16 @@ Assertions:
   3. Dumps: rel <= 0
   4. Engine checksums: baseline and target pushed identical weights per (rollout, engine)
   5. Weights moved, per side: the engine weight checksum is not identical across all rollouts
+  6. Engines rejoined, per side: no update reached more than the mode's 4 engines, and the last
+     update of every policy reached all 4
 ```
 
 - **Why it exists**: an engine dying and being replaced mid-generation is supposed to be invisible to training, and "invisible" is a claim about bits; the rollout soak only ever asserted survival.
+- **What "rollout + weight update ft" means here**: the only fault tolerance under test is the engine side of a weight update. Trainer ft stays off, so one trainer topology reduces on both sides and every tensor can be compared at `rel <= 0`; a healed trainer cell would rebracket the reduce and force the tolerances this scenario refuses to have. Both sides therefore run the same trainer layout, the same command, and differ only in that the target is wrapped in the injector.
+- **Why `--update-weights-interval 1` is pinned rather than inherited**: at a wider interval most rollouts publish nothing, so the injector's crashes land in rollouts where no update is running, the per-rollout engine checksum coverage thins out, and the audit that a wider interval is expected to disable would take the scenario's own witnesses with it. Pinning it makes the claim a property of the test rather than of a production default.
+- **Why the rejoin witness (assertion 6)**: publishing to the engines still alive is exactly what partial-target weight update is for, so an update that reached three of four engines is correct in the middle of a run and a bug at the end of one. The witness allows the first and rejects the second, which the bitwise comparison cannot: an engine that never rejoined the fan-out serves stale weights that no assertion here reads. The upper bound catches the other half — a dead engine left in the fan-out beside its replacement.
+- **Why not `assert_engine_count`**: the deploy suite's version demands every update cover every engine, which under injection fails on the very partial-target behaviour this scenario exists to permit.
+- **Deliberately uncovered**: landing a fault at a chosen point inside a weight update. The injector fires on a wall clock, so which phase of an update a crash interrupts is luck; the typed fault hooks are what make that deterministic.
 - **Why the shared deterministic recipe**: the assertion is deterministic replay across fresh inference engines, not true-on-policy training. Reusing the same FlashInfer recipe as the main deterministic trainer-FT test avoids a second, incompatible attention-backend contract.
 - **Why `--sglang-disable-radix-cache`**: a replacement engine serves with a cold prefix cache where the baseline's was warm, and deterministic inference is nowhere documented as prefix-cache-length invariant.
 - **Why this recipe disables batch-variant MM fallback**: a rollout worker loss changes co-batching while the pool is healing; permitting an `einsum` fallback would make the same seeded request depend on that temporary batch shape. The scenario injects the environment override without changing the production default.
