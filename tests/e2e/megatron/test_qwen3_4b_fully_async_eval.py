@@ -77,6 +77,7 @@ def execute(eval_mode: str):
         "--global-batch-size 32 "
         "--balance-data "
         "--pause-generation-mode in_place "
+        "--namespaced-radix-cache "
     )
 
     eval_args = (
@@ -138,6 +139,7 @@ def execute(eval_mode: str):
     ci_args = (
         "--ci-test --ci-metric-checker-key eval/gsm8k --ci-metric-checker-threshold 0.4 "
         "--ci-metric-checker-expect-num 3 "
+        "--sglang-enable-prefill-weight-versions --ci-assert-prefill-lag-max 1 "
     )
 
     misc_args = (
