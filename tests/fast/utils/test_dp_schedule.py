@@ -16,7 +16,7 @@ from types import SimpleNamespace
 
 import pytest
 
-from miles.utils.dp_schedule import build_dp_schedule, has_full_schedule_config
+from miles.utils.dp_schedule import TrainParallelConfig, build_dp_schedule
 
 
 def make_args(
@@ -50,13 +50,21 @@ def make_args(
     )
 
 
-def make_tp(dp_size=1, cp_size=1, vpp_size=1, microbatch_group_size_per_vp_stage=None):
-    return {
-        "dp_size": dp_size,
-        "cp_size": cp_size,
-        "vpp_size": vpp_size,
-        "microbatch_group_size_per_vp_stage": microbatch_group_size_per_vp_stage,
-    }
+def make_tp(
+    dp_size: int = 1,
+    cp_size: int = 1,
+    vpp_size: int | None = 1,
+    microbatch_group_size_per_vp_stage: int | None = None,
+    independent_dp: bool = False,
+) -> TrainParallelConfig:
+    return TrainParallelConfig(
+        dp_size=dp_size,
+        cp_size=cp_size,
+        vpp_size=vpp_size,
+        microbatch_group_size_per_vp_stage=microbatch_group_size_per_vp_stage,
+        independent_dp=independent_dp,
+        supports_precomputed_schedule=True,
+    )
 
 
 def assert_invariants(
@@ -81,7 +89,7 @@ def assert_invariants(
         mbi = micro_batch_indices[r]
 
         # Same micro-batch count per rank (PP sync).
-        assert len(mbi) == sum(num_microbatches), f"rank {r}: micro-batch count mismatch"
+        assert len(mbi) == sum(num_microbatches[r]), f"rank {r}: micro-batch count mismatch"
 
         # Flattened micro_batch_indices == range(len(partition)).
         flat = [i for micro_batch in mbi for i in micro_batch]
@@ -117,7 +125,7 @@ def test_static_stride_single_step():
         args, tp, total_lengths, global_batch_size=16, rollout_indices=rollout_indices
     )
 
-    assert nmb == [2]
+    assert nmb == [[2]] * 4
     assert num_rollouts_per_step == [16]
     assert_invariants(
         partitions,
@@ -140,7 +148,7 @@ def test_static_balance_multi_step():
         args, tp, total_lengths, global_batch_size=8, rollout_indices=rollout_indices
     )
 
-    assert nmb == [2, 2]
+    assert nmb == [[2, 2]] * 2
     assert num_rollouts_per_step == [8, 8]
     assert_invariants(
         partitions,
@@ -219,8 +227,9 @@ def test_dynamic_with_vpp_rounds_to_mb_group():
         args, tp, total_lengths, global_batch_size=16, rollout_indices=rollout_indices
     )
 
-    for n in nmb:
+    for n in nmb[0]:
         assert n % 2 == 0, f"num_microbatches {n} is not a multiple of mb_group=2"
+    assert nmb == [nmb[0]] * 2
     assert_invariants(
         partitions,
         mbi,
@@ -251,7 +260,7 @@ def test_rollout_grouping_keeps_samples_together():
     expected_per_step = [[0, 1, 2], [3, 4], [5, 6, 7, 8]]
     rank0_partition = partitions[0]
     micro_batch_cursor = 0
-    for step_i, n_micro_batches in enumerate(nmb):
+    for step_i, n_micro_batches in enumerate(nmb[0]):
         step_locals = sorted(
             j for micro_batch in mbi[0][micro_batch_cursor : micro_batch_cursor + n_micro_batches] for j in micro_batch
         )
@@ -310,7 +319,7 @@ def test_partial_final_step_opt_in():
     )
 
     assert num_rollouts_per_step == [2, 2, 1]
-    assert len(nmb) == 3
+    assert len(nmb[0]) == 3
     assert_invariants(
         partitions,
         mbi,
@@ -335,7 +344,7 @@ def test_partial_final_step_skipped_when_below_dp_size():
     )
 
     assert num_rollouts_per_step == [2]
-    assert len(nmb) == 1
+    assert len(nmb[0]) == 1
 
 
 def test_rejects_when_fewer_rollouts_than_gbs():
@@ -390,6 +399,95 @@ def test_randomized_invariants_dynamic():
         )
 
 
+@pytest.mark.parametrize("dp_size", [3, 5, 7])
+@pytest.mark.parametrize("balance", [False, True])
+def test_a_cell_count_that_does_not_divide_gbs_still_covers_every_sample(dp_size, balance):
+    """A trainer cell count left over after a fault keeps the invariants and gives every rank work."""
+    rng = random.Random(dp_size)
+    total_lengths = [rng.randint(1, 40) for _ in range(256)]
+    args = make_args(use_dynamic_batch_size=True, max_tokens_per_gpu=64, balance_data=balance)
+    tp = make_tp(dp_size=dp_size)
+
+    partitions, mbi, nmb, num_rollouts_per_step = build_dp_schedule(
+        args, tp, total_lengths, global_batch_size=256, rollout_indices=list(range(256))
+    )
+
+    assert num_rollouts_per_step == [256]
+    assert_invariants(
+        partitions,
+        mbi,
+        nmb,
+        dp_size=dp_size,
+        expected_global_sample_indices=range(256),
+        total_lengths=total_lengths,
+        max_per_bin=64,
+    )
+    assert all(len(partition) >= 1 for partition in partitions)
+    assert len({len(partition) for partition in partitions}) > 1
+
+
+def _singleton_schedule(*, independent_dp: bool, balance_data: bool = False) -> tuple[list[list[int]], list[int]]:
+    max_per_bin = 64 * 2
+    total_lengths = [max_per_bin // 2 + 1] * 256
+    args = make_args(use_dynamic_batch_size=True, max_tokens_per_gpu=64, balance_data=balance_data)
+    tp = make_tp(dp_size=3, cp_size=2, independent_dp=independent_dp)
+
+    partitions, mbi, nmb, num_rollouts_per_step = build_dp_schedule(
+        args, tp, total_lengths, global_batch_size=256, rollout_indices=list(range(256))
+    )
+
+    assert_invariants(
+        partitions,
+        mbi,
+        nmb,
+        dp_size=3,
+        expected_global_sample_indices=range(256),
+        total_lengths=total_lengths,
+        max_per_bin=max_per_bin,
+    )
+    return nmb, num_rollouts_per_step
+
+
+class TestIndependentDpSchedule:
+    @pytest.mark.parametrize("balance_data", [False, True])
+    def test_all_singleton_batch_splits_85_85_86_over_three_cells(self, balance_data: bool):
+        """Independent cells need no shared micro-batch count, so an unsplittable batch spreads 85/85/86."""
+        nmb, num_rollouts_per_step = _singleton_schedule(independent_dp=True, balance_data=balance_data)
+
+        assert num_rollouts_per_step == [256]
+        assert sorted(sum(counts) for counts in nmb) == [85, 85, 86]
+
+    def test_all_singleton_batch_still_asserts_when_cells_must_agree(self):
+        """Without independent_dp the count must be a multiple of dp_size, which singletons cannot reach."""
+        with pytest.raises(AssertionError, match="maximal splitting"):
+            _singleton_schedule(independent_dp=False)
+
+    def test_vpp_keeps_each_cell_count_a_multiple_of_the_group(self):
+        """Each independent cell aligns to its own VPP group while the cells together cover every sample."""
+        rng = random.Random(3)
+        total_lengths = [rng.randint(1, 40) for _ in range(64)]
+        args = make_args(use_dynamic_batch_size=True, max_tokens_per_gpu=64)
+        tp = make_tp(dp_size=3, vpp_size=2, microbatch_group_size_per_vp_stage=2, independent_dp=True)
+
+        partitions, mbi, nmb, num_rollouts_per_step = build_dp_schedule(
+            args, tp, total_lengths, global_batch_size=64, rollout_indices=list(range(64))
+        )
+
+        assert num_rollouts_per_step == [64]
+        for rank_counts in nmb:
+            for n in rank_counts:
+                assert n > 0 and n % 2 == 0, f"num_microbatches {n} is not a positive multiple of mb_group=2"
+        assert_invariants(
+            partitions,
+            mbi,
+            nmb,
+            dp_size=3,
+            expected_global_sample_indices=range(64),
+            total_lengths=total_lengths,
+            max_per_bin=64,
+        )
+
+
 def test_balance_by_flops_packs_and_distributes():
     """balance_by_flops: KK-on-FLOPs packing, invariants preserved (the token cap
     is intentionally NOT enforced in this mode)."""
@@ -423,17 +521,20 @@ def test_balance_by_flops_singleton_fallback():
     partitions, mbi, nmb, _ = build_dp_schedule(
         args, tp, total_lengths, global_batch_size=4, rollout_indices=list(range(4))
     )
-    assert sum(nmb) * 2 == 4  # 4 singleton micro_batch over 2 ranks
+    assert nmb == [[2], [2]]  # 4 singleton micro_batch over 2 ranks
     for r in range(2):
         for micro_batch in mbi[r]:
             assert len(micro_batch) == 1
 
 
-def test_has_full_schedule_config():
-    assert has_full_schedule_config(make_tp())
-    assert not has_full_schedule_config({})
-    assert not has_full_schedule_config(None)
-    assert not has_full_schedule_config({"dp_size": 4})  # fsdp/torchtitan shape
+def test_train_parallel_config_declares_schedule_support() -> None:
+    """The model carries an explicit backend scheduling capability."""
+    assert make_tp().supports_precomputed_schedule
+    assert (
+        not make_tp(dp_size=4)
+        .model_copy(update={"supports_precomputed_schedule": False})
+        .supports_precomputed_schedule
+    )  # fsdp/torchtitan shape
 
 
 if __name__ == "__main__":

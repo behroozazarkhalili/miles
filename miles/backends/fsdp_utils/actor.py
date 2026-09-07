@@ -85,9 +85,7 @@ class FSDPTrainRayActor(TrainRayActor):
 
         torch.manual_seed(args.seed)
 
-        self.train_parallel_config = {
-            "dp_size": get_parallel_state().intra_dp.size,
-        }
+        self.train_parallel_config = get_parallel_state().train_parallel_config(supports_precomputed_schedule=False)
 
         if self.args.debug_rollout_only:
             return 0
@@ -454,7 +452,12 @@ class FSDPTrainRayActor(TrainRayActor):
             self.wake_up()
 
         with inverse_timer("train_wait"), timer("train"), ExitStack() as stack:
-            rollout_data, store_get_result = get_rollout_data(self.args, rollout_data_ref, witness_info=None)
+            rollout_data, store_get_result = get_rollout_data(
+                args=self.args,
+                rollout_data_ref=rollout_data_ref,
+                witness_info=None,
+                train_parallel_config=self.train_parallel_config,
+            )
             stack.enter_context(store_get_result)
             if self.args.debug_rollout_only:
                 return TrainStepOutput(outcome=TrainStepOutcome.NORMAL)

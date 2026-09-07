@@ -6,6 +6,7 @@ import logging
 from typing import Any
 
 from miles.utils.flops_utils import calculate_fwd_flops
+from miles.utils.pydantic_utils import FrozenStrictBaseModel
 from miles.utils.seqlen_balancing import (
     expand_bins_by_splitting,
     first_fit_decreasing_pack,
@@ -14,14 +15,14 @@ from miles.utils.seqlen_balancing import (
 
 logger = logging.getLogger(__name__)
 
-SCHEDULE_CONFIG_KEYS = ("dp_size", "cp_size", "vpp_size", "microbatch_group_size_per_vp_stage")
 
-
-def has_full_schedule_config(train_parallel_config: dict | None) -> bool:
-    """True when the backend advertised every field build_dp_schedule needs."""
-    if not train_parallel_config:
-        return False
-    return all(key in train_parallel_config for key in SCHEDULE_CONFIG_KEYS)
+class TrainParallelConfig(FrozenStrictBaseModel):
+    dp_size: int
+    cp_size: int
+    vpp_size: int | None
+    microbatch_group_size_per_vp_stage: int | None
+    independent_dp: bool
+    supports_precomputed_schedule: bool
 
 
 def _calculate_workloads(step_lengths, args):
@@ -30,21 +31,24 @@ def _calculate_workloads(step_lengths, args):
 
 def build_dp_schedule(
     args: Any,
-    train_parallel_config: dict,
+    train_parallel_config: TrainParallelConfig,
     total_lengths: list[int],
     *,
     global_batch_size: int,
     rollout_indices: list[int],
-) -> tuple[list[list[int]], list[list[list[int]]], list[int], list[int]]:
-    """Compute per-rank ``(partitions, micro_batch_indices, num_microbatches, num_rollouts)``;
+) -> tuple[list[list[int]], list[list[list[int]]], list[list[int]], list[int]]:
+    """Compute per-rank ``(partitions, micro_batch_indices, num_microbatches[rank][step], num_rollouts)``;
     ``global_batch_size`` counts rollouts, not training samples."""
-    dp_size = train_parallel_config["dp_size"]
-    cp_size = train_parallel_config["cp_size"]
-    vpp_size = train_parallel_config["vpp_size"] or 1
-    mb_group = train_parallel_config["microbatch_group_size_per_vp_stage"]
+    dp_size = train_parallel_config.dp_size
+    cp_size = train_parallel_config.cp_size
+    vpp_size = train_parallel_config.vpp_size or 1
+    mb_group = train_parallel_config.microbatch_group_size_per_vp_stage
+    independent_dp = train_parallel_config.independent_dp
 
     # micro-batch size per step must divide evenly across dp and vpp
-    align_to = dp_size * (mb_group if vpp_size > 1 else 1)
+    rank_align_to = mb_group if vpp_size > 1 else 1
+    align_to = rank_align_to if independent_dp else dp_size * rank_align_to
+    min_micro_batches = dp_size * rank_align_to
 
     max_per_bin = None
     if args.use_dynamic_batch_size:
@@ -77,7 +81,7 @@ def build_dp_schedule(
 
     partitions: list[list[int]] = [[] for _ in range(dp_size)]
     micro_batch_indices: list[list[list[int]]] = [[] for _ in range(dp_size)]
-    num_microbatches: list[int] = []
+    num_microbatches: list[list[int]] = [[] for _ in range(dp_size)]
 
     step_start = 0
     for step_i, step_num_rollouts in enumerate(num_rollouts):
@@ -106,7 +110,7 @@ def build_dp_schedule(
             else:
                 step_micro_batches = first_fit_decreasing_pack(step_lengths, max_per_bin)
             # Grow the micro-batch count to a multiple of align_to by splitting multi-sample micro-batches.
-            target = max((len(step_micro_batches) + align_to - 1) // align_to * align_to, align_to)
+            target = max((len(step_micro_batches) + align_to - 1) // align_to * align_to, min_micro_batches)
             if target != len(step_micro_batches):
                 expand_bins_by_splitting(step_micro_batches, target, step_lengths)
                 assert len(step_micro_batches) == target, (
@@ -126,26 +130,30 @@ def build_dp_schedule(
                     f"static path: micro-batch count ({len(step_micro_batches)}) is not a multiple of "
                     f"dp_size * mb_group ({align_to}); got "
                     f"step_size={len(sample_indices)}, micro_batch_size={args.micro_batch_size}, "
-                    f"dp_size={dp_size}, mb_group={mb_group if vpp_size > 1 else 1}. "
+                    f"dp_size={dp_size}, mb_group={rank_align_to}. "
                     f"Splitting static micro-batches would break the fixed-size invariant; adjust the config "
                     f"so step_size % (dp_size * micro_batch_size * mb_group) == 0."
                 )
-
-        num_microbatches.append(len(step_micro_batches) // dp_size)
 
         # Distribute the micro-batches across DP ranks, len(step_micro_batches) / dp_size each: strided
         # round-robin, or Karmarkar-Karp on micro-batch weights (tokens under --balance-data,
         # FLOPs under --balance-by-flops).
         if args.balance_data or balance_by_flops:
-            if balance_by_flops:
-                weights = [sum(workloads[i] for i in micro_batch) for micro_batch in step_micro_batches]
-            else:
-                weights = [sum(step_lengths[i] for i in micro_batch) for micro_batch in step_micro_batches]
-            rank_micro_batch_ids = get_seqlen_balanced_partitions(weights, dp_size, equal_size=True)
+            per_sample = workloads if balance_by_flops else step_lengths
+            weights = [sum(per_sample[i] for i in micro_batch) for micro_batch in step_micro_batches]
         else:
-            rank_micro_batch_ids = [list(range(rank, len(step_micro_batches), dp_size)) for rank in range(dp_size)]
+            weights = None
+
+        rank_micro_batch_ids = _distribute_micro_batches(
+            len(step_micro_batches),
+            weights,
+            dp_size=dp_size,
+            group=rank_align_to if independent_dp else 1,
+            equal_size=not independent_dp,
+        )
 
         for rank, micro_batch_ids in enumerate(rank_micro_batch_ids):
+            num_microbatches[rank].append(len(micro_batch_ids))
             for k in micro_batch_ids:
                 micro_batch = step_micro_batches[k]
                 local_start = len(partitions[rank])
@@ -153,3 +161,20 @@ def build_dp_schedule(
                 micro_batch_indices[rank].append(list(range(local_start, local_start + len(micro_batch))))
 
     return partitions, micro_batch_indices, num_microbatches, num_rollouts
+
+
+def _distribute_micro_batches(
+    num_micro_batches: int, weights: list[int] | None, *, dp_size: int, group: int, equal_size: bool
+) -> list[list[int]]:
+    chunks = [list(range(start, start + group)) for start in range(0, num_micro_batches, group)]
+
+    if weights is None:
+        rank_chunk_ids = [list(range(rank, len(chunks), dp_size)) for rank in range(dp_size)]
+        assert all(
+            rank_chunk_ids
+        ), f"{num_micro_batches} micro-batches in groups of {group} leave a cell of {dp_size} empty"
+    else:
+        chunk_weights = [sum(weights[k] for k in chunk) for chunk in chunks]
+        rank_chunk_ids = get_seqlen_balanced_partitions(chunk_weights, dp_size, equal_size=equal_size)
+
+    return [[k for chunk_id in chunk_ids for k in chunks[chunk_id]] for chunk_ids in rank_chunk_ids]
