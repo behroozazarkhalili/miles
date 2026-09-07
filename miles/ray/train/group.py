@@ -32,7 +32,7 @@ from miles.utils.audit_utils.event_logger.models import (
 from miles.utils.audit_utils.process_identity import TrainerControllerProcessIdentity
 from miles.utils.audit_utils.witness.allocator import WitnessIdAllocator, read_persisted_witness_counter
 from miles.utils.data import RolloutDataPack, remove_train_output_refs
-from miles.utils.ft_utils.api_server.models import CellStatus
+from miles.utils.ft_utils.api_server.models import CellStatus, FaultHookArmingReport
 from miles.utils.ft_utils.health_checker import ActivenessTracker, NoopHealthChecker, SimpleHealthCheckerConfig
 from miles.utils.ft_utils.indep_dp import IndepDPInfo, create_tcp_store
 from miles.utils.init_once import InitOnce, init_once
@@ -43,6 +43,7 @@ from miles.utils.tracking_utils.structured_log import log_structured
 from miles.utils.workers.cell_operations.base import BaseCellOperations
 from miles.utils.workers.rpc.common.wire_types import Pickled
 from miles.utils.workers.types import DeploymentIdentity
+from miles.utils.workers.worker_handle import BaseWorkerHandle
 from miles.utils.workers.worker_provider.base import BaseWorkerProvider, CellInfo, StopWatchFn
 from miles.utils.workers.worker_provider.utils import apply_cell_observation
 
@@ -52,6 +53,11 @@ logger = logging.getLogger(__name__)
 _RETRY_MAX_ATTEMPTS = 30
 _SOURCE_FAILURE_MIN_TARGETS = 2
 _CELLS_READY_TIMEOUT_SECONDS = 3600.0
+_ARM_FAULT_HOOK_TIMEOUT_SECONDS = 30.0
+
+
+class _FaultHookSourceRefusedError(Exception):
+    pass
 
 
 def compute_trainer_health_checker_config(args, *, expected_num_cells: int) -> SimpleHealthCheckerConfig | None:
@@ -541,6 +547,57 @@ class TrainerController:
 
     async def get_cell_statuses(self) -> dict[str, CellStatus]:
         return {cell_id: cell.cell_status() for cell_id, cell in list(self._cells_by_id.items())}
+
+    async def arm_fault_hook(
+        self,
+        cell_id: str,
+        *,
+        expected_workers_hash: str,
+        hook: str,
+        mode: str,
+        sub_index: int,
+        request_id: str,
+    ) -> FaultHookArmingReport:
+        try:
+            handle = self._resolve_fault_hook_source(
+                cell_id=cell_id, expected_workers_hash=expected_workers_hash, sub_index=sub_index
+            )
+        except _FaultHookSourceRefusedError as refusal:
+            logger.warning("Refusing to arm the fault hook of %s in %s: %s", request_id, cell_id, refusal)
+            return FaultHookArmingReport(refused_because=str(refusal))
+
+        await asyncio.wait_for(
+            handle.arm_fault_hook(hook=hook, mode=mode, request_id=request_id),
+            timeout=_ARM_FAULT_HOOK_TIMEOUT_SECONDS,
+        )
+        return FaultHookArmingReport()
+
+    def _resolve_fault_hook_source(
+        self, *, cell_id: str, expected_workers_hash: str, sub_index: int
+    ) -> BaseWorkerHandle:
+        cell = self._cells_by_id.get(cell_id)
+        if cell is None:
+            raise _FaultHookSourceRefusedError(
+                f"{cell_id} is no cell of {self._pool_id}, so nothing here holds a worker the hook could live in"
+            )
+        if cell.workers_hash != expected_workers_hash:
+            raise _FaultHookSourceRefusedError(
+                f"{cell_id} now runs {cell.workers_hash}, not the {expected_workers_hash} the request was issued "
+                f"against, so arming it would harm an incarnation the caller never chose"
+            )
+        if not cell.is_alive:
+            raise _FaultHookSourceRefusedError(
+                f"{cell_id} ({expected_workers_hash}) is {cell.state_name}, so it runs no initialized worker that "
+                f"would ever reach the hook"
+            )
+
+        handles = cell.worker_handles
+        if not 0 <= sub_index < len(handles):
+            raise _FaultHookSourceRefusedError(
+                f"sub_index {sub_index} names no worker of {cell_id} ({expected_workers_hash}), which has "
+                f"{len(handles)} of them"
+            )
+        return handles[sub_index]
 
     # ------------------------ utils to forward calls to cells ------------------------
 

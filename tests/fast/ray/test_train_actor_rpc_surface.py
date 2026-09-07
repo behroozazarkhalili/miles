@@ -25,6 +25,7 @@ DRIVEN_METHODS = (
     "get_train_parallel_config",
     "get_heartbeat_status",
     "inject_fault",
+    "arm_fault_hook",
     "kill_self",
     "configure_master_addr_and_port",
     "propose_master_addr_and_port",
@@ -52,6 +53,12 @@ class TestTheTrainerSurfaceIsCallableOverRpc:
         specs = collect_rpc_method_specs(TrainRayActor)
 
         assert specs["get_heartbeat_status"].concurrency_group != specs["train"].concurrency_group
+
+    def test_arming_a_fault_hook_never_queues_behind_a_train_step(self):
+        """The hook it arms fires inside the very step in flight, so a queued arm would arrive after the moment."""
+        specs = collect_rpc_method_specs(TrainRayActor)
+
+        assert specs["arm_fault_hook"].concurrency_group != specs["train"].concurrency_group
 
     def test_every_group_a_method_names_is_a_group_the_spec_declares(self):
         """Ray refuses to build an actor whose method names a group its class never declared, at launch time."""

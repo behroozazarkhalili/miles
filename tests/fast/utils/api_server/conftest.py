@@ -6,12 +6,23 @@ from collections.abc import Callable
 import httpx
 import pytest
 
+from miles.utils.ft_utils.api_server.fault_hook_sources import _FaultHookSourceRegistry
 from miles.utils.ft_utils.api_server.handles import _CellHandler
-from miles.utils.ft_utils.api_server.models import Cell, CellCondition, CellSpec, CellStatus
+from miles.utils.ft_utils.api_server.models import (
+    Cell,
+    CellCondition,
+    CellSpec,
+    CellStatus,
+    FaultHookArmingReport,
+    TriState,
+)
 from miles.utils.ft_utils.api_server.registry import _CellRegistry
 from miles.utils.ft_utils.api_server.server import _create_api_app
 from miles.utils.test_utils.fault_injector import FailureMode
 from miles.utils.workers.worker_provider.base import CellInfo
+
+SOURCE_CELL_ID = "trainer-engine-actor-0"
+SOURCE_WORKERS_HASH = "pseudo-hash-0"
 
 
 class MockCellState:
@@ -160,6 +171,51 @@ class MockInferenceController:
         self._statuses[cell_id] = status
 
 
+class MockSourceController:
+    def __init__(self, statuses: dict[str, CellStatus] | None = None) -> None:
+        self._statuses = dict(statuses or {})
+        self.armed: list[dict[str, object]] = []
+        self.refused_because: str | None = None
+        self.arm_fault_hook_error: Exception | None = None
+        self.status_calls: int = 0
+
+    async def get_cell_statuses(self) -> dict[str, CellStatus]:
+        self.status_calls += 1
+        return dict(self._statuses)
+
+    async def arm_fault_hook(
+        self,
+        cell_id: str,
+        *,
+        expected_workers_hash: str,
+        hook: str,
+        mode: str,
+        sub_index: int,
+        request_id: str,
+    ) -> FaultHookArmingReport:
+        if self.arm_fault_hook_error is not None:
+            raise self.arm_fault_hook_error
+        self.armed.append(
+            dict(
+                cell_id=cell_id,
+                expected_workers_hash=expected_workers_hash,
+                hook=hook,
+                mode=mode,
+                sub_index=sub_index,
+                request_id=request_id,
+            )
+        )
+        return FaultHookArmingReport(refused_because=self.refused_because)
+
+
+def make_source_status(*, workers_hash: str = SOURCE_WORKERS_HASH) -> CellStatus:
+    return CellStatus(
+        phase="Running",
+        conditions=[CellCondition.allocated(TriState.TRUE), CellCondition.healthy(TriState.TRUE)],
+        workers_hash=workers_hash,
+    )
+
+
 class MockWorkerManager:
     def __init__(self, summaries: dict[str, CellInfo] | None = None) -> None:
         self._summaries = dict(summaries or {})
@@ -212,6 +268,14 @@ def make_cell_summaries(
     }
 
 
+class MockTrainerWorkerHandle:
+    def __init__(self, armed: list[dict[str, object]]) -> None:
+        self._armed = armed
+
+    async def arm_fault_hook(self, *, hook: str, mode: str, request_id: str) -> None:
+        self._armed.append(dict(hook=hook, mode=mode, request_id=request_id))
+
+
 class MockTrainerCell:
     def __init__(
         self,
@@ -219,6 +283,8 @@ class MockTrainerCell:
         phase: str = "Running",
         conditions: list[dict[str, str | None]] | None = None,
         workers_hash: str = "pseudo-hash-0",
+        alive: bool = True,
+        num_workers: int = 1,
     ) -> None:
         self._phase = phase
         self._conditions = conditions or [
@@ -226,6 +292,21 @@ class MockTrainerCell:
             {"type": "Healthy", "status": "True"},
         ]
         self.workers_hash = workers_hash
+        self.armed: list[dict[str, object]] = []
+        self._alive = alive
+        self._handles = [MockTrainerWorkerHandle(self.armed) for _ in range(num_workers)]
+
+    @property
+    def is_alive(self) -> bool:
+        return self._alive
+
+    @property
+    def state_name(self) -> str:
+        return "StateAllocatedAlive" if self._alive else "StateAllocatedUninitialized"
+
+    @property
+    def worker_handles(self) -> list[MockTrainerWorkerHandle]:
+        return list(self._handles)
 
     @property
     def phase(self) -> str:
@@ -274,7 +355,24 @@ def registry(actor_handler: MockHandler, rollout_handler: MockHandler) -> _CellR
 
 
 @pytest.fixture
-def async_client(registry: _CellRegistry) -> httpx.AsyncClient:
-    app = _create_api_app(registry)
+def source_handler() -> MockHandler:
+    handler = MockHandler("actor")
+    handler.add(SOURCE_CELL_ID, workers_hash=SOURCE_WORKERS_HASH)
+    return handler
+
+
+@pytest.fixture
+def source_controller() -> MockSourceController:
+    return MockSourceController({SOURCE_CELL_ID: make_source_status()})
+
+
+@pytest.fixture
+def sources(source_handler: MockHandler, source_controller: MockSourceController) -> _FaultHookSourceRegistry:
+    return _FaultHookSourceRegistry(handler=source_handler, controllers=[source_controller])
+
+
+@pytest.fixture
+def async_client(registry: _CellRegistry, sources: _FaultHookSourceRegistry) -> httpx.AsyncClient:
+    app = _create_api_app(registry, sources)
     transport = httpx.ASGITransport(app=app)
     return httpx.AsyncClient(transport=transport, base_url="http://test")

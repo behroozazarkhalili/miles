@@ -113,6 +113,10 @@ class KubernetesCellOperations(BaseCellOperations):
     async def inject_fault(self, *, cell_id: str, mode: FailureMode, sub_index: int) -> None:
         await self._ensure_watching()
 
+        worker_name, handle = self._resolve_handle(cell_id=cell_id, sub_index=sub_index, purpose="crash it")
+        await _inject_fault_over_rpc(handle=handle, mode=mode, worker_name=worker_name)
+
+    def _resolve_handle(self, *, cell_id: str, sub_index: int, purpose: str) -> tuple[str, BaseWorkerHandle]:
         (infos,) = self._provider.get_worker_infos(cell_ids=[cell_id])
         assert (
             0 <= sub_index < len(infos)
@@ -122,9 +126,8 @@ class KubernetesCellOperations(BaseCellOperations):
         handles = self._provider.get_handles_of_worker_infos(infos)
         assert (
             worker_name in handles
-        ), f"{worker_name} is not served over rpc, so no call can reach the process to crash it"
-
-        await _inject_fault_over_rpc(handle=handles[worker_name], mode=mode, worker_name=worker_name)
+        ), f"{worker_name} is not served over rpc, so no call can reach the process to {purpose}"
+        return worker_name, handles[worker_name]
 
     async def _delete_pod_of_incarnation(
         self, *, core_v1_api: Any, cell_id: str, pod: PodIdentity, deadline: float

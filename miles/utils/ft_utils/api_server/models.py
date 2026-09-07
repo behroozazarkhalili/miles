@@ -6,7 +6,10 @@ except ImportError:
     from backports.strenum import StrEnum
 from typing import Literal
 
+from pydantic import Field
+
 from miles.utils.pydantic_utils import StrictBaseModel
+from miles.utils.test_utils.fault_hooks import FaultHookName
 from miles.utils.test_utils.fault_injector import FailureMode
 
 
@@ -92,6 +95,18 @@ class CellPatch(StrictBaseModel):
 class FaultInjection(StrictBaseModel):
     mode: FailureMode
     sub_index: int = 0
+
+
+class FaultHookArming(StrictBaseModel):
+    expected_workers_hash: str = Field(min_length=1)
+    hook: FaultHookName
+    mode: FailureMode
+    sub_index: int = 0
+    request_id: str
+
+
+class FaultHookArmingReport(StrictBaseModel):
+    refused_because: str | None = None
 
 
 class K8sStatus(StrictBaseModel):

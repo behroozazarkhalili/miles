@@ -4,6 +4,7 @@ import socket
 import threading
 from pathlib import Path
 from types import SimpleNamespace
+from typing import NamedTuple
 
 import httpx
 import pytest
@@ -13,6 +14,7 @@ from tests.fast.ray.rollout.conftest import make_args as make_rollout_args
 
 from miles.ray.rollout.server_cell import compute_pending_rollout_cell_status
 from miles.utils.ft_utils.api_server import server
+from miles.utils.ft_utils.api_server.fault_hook_sources import _FaultHookSourceRegistry
 from miles.utils.ft_utils.api_server.handles import _CellHandler
 from miles.utils.ft_utils.api_server.registry import _CellRegistry
 from miles.utils.http_utils import find_available_port
@@ -20,13 +22,18 @@ from miles.utils.test_utils.fault_injector import FailureMode
 from miles.utils.workers.cell_operations.ray import RayCellOperations
 
 from .conftest import (
+    SOURCE_CELL_ID,
+    SOURCE_WORKERS_HASH,
     MockHandler,
     MockInferenceController,
+    MockSourceController,
     MockTrainerCell,
     MockWorkerManager,
     make_cell_summaries,
     make_mock_controller,
 )
+
+_EMPTY_SOURCES = _FaultHookSourceRegistry(handler=None, controllers=[])
 
 
 class TestGetHealth:
@@ -281,6 +288,11 @@ class TestPatchCell:
         }
 
 
+class _StartedApiServer(NamedTuple):
+    registry: _CellRegistry
+    sources: _FaultHookSourceRegistry
+
+
 class TestStartApiServerRegistration:
     def _start(
         self,
@@ -290,12 +302,26 @@ class TestStartApiServerRegistration:
         cell_ids: list[str],
         actor_cells: list[MockTrainerCell] | None = None,
     ) -> _CellRegistry:
+        return self._start_server(
+            monkeypatch, ft_components=ft_components, cell_ids=cell_ids, actor_cells=actor_cells
+        ).registry
+
+    def _start_server(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+        *,
+        ft_components: list[str],
+        cell_ids: list[str],
+        actor_cells: list[MockTrainerCell] | None = None,
+    ) -> _StartedApiServer:
         manager = MockWorkerManager(make_cell_summaries(*cell_ids))
-        registries: list[_CellRegistry] = []
+        started: list[_StartedApiServer] = []
 
         monkeypatch.setattr(server, "compute_engine_pool_ids", lambda args: ["inference-engine-0-0"])
         monkeypatch.setattr(
-            server, "_start_api_server_raw", lambda *, registry, port, host: registries.append(registry)
+            server,
+            "_start_api_server_raw",
+            lambda *, registry, sources, port, host: started.append(_StartedApiServer(registry, sources)),
         )
 
         server.start_api_server(
@@ -311,8 +337,8 @@ class TestStartApiServerRegistration:
             ),
         )
 
-        (registry,) = registries
-        return registry
+        (one,) = started
+        return one
 
     @pytest.mark.asyncio
     async def test_the_rollout_handler_enumerates_every_engine_cell(self, monkeypatch: pytest.MonkeyPatch) -> None:
@@ -387,11 +413,60 @@ class TestStartApiServerRegistration:
         assert await registry.list_cells() == []
 
     @pytest.mark.asyncio
+    async def test_a_rollout_only_run_still_offers_its_trainer_as_a_hook_source(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """A hook is armed in a trainer, so a rollout-only run that cannot see one can never arm anything."""
+        started = self._start_server(
+            monkeypatch,
+            ft_components=["rollout"],
+            cell_ids=["trainer-engine-actor-0", "inference-engine-0-0-0"],
+            actor_cells=[MockTrainerCell(phase="Running")],
+        )
+
+        assert [cell.metadata.name for cell in await started.registry.list_cells()] == ["inference-engine-0-0-0"]
+        assert [cell.metadata.name for cell in await started.sources.list_cells()] == ["trainer-engine-actor-0"]
+
+    @pytest.mark.asyncio
+    async def test_a_rollout_only_run_arms_the_trainer_that_holds_the_hook(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Every layer between the request and the worker has to be wired, not just the source list."""
+        cell = MockTrainerCell(phase="Running")
+        started = self._start_server(
+            monkeypatch,
+            ft_components=["rollout"],
+            cell_ids=["trainer-engine-actor-0", "inference-engine-0-0-0"],
+            actor_cells=[cell],
+        )
+        app = server._create_api_app(started.registry, started.sources)
+
+        async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://test") as client:
+            listed = await client.get("/api/v1/cells")
+            armed = await client.post(
+                "/api/v1/cells/trainer-engine-actor-0/arm-fault-hook",
+                json={
+                    "expected_workers_hash": cell.workers_hash,
+                    "hook": "weight_update.before_p2p_write",
+                    "mode": "sigkill",
+                    "request_id": "req-1",
+                },
+            )
+            suspended = await client.patch("/api/v1/cells/trainer-engine-actor-0", json={"spec": {"suspend": True}})
+
+        assert [item["metadata"]["name"] for item in listed.json()["items"]] == ["inference-engine-0-0-0"]
+        assert armed.status_code == 200
+        assert cell.armed == [dict(hook="weight_update.before_p2p_write", mode="sigkill", request_id="req-1")]
+        assert suspended.status_code == 404
+
+    @pytest.mark.asyncio
     async def test_the_requested_port_reaches_the_server_that_binds_it(self, monkeypatch: pytest.MonkeyPatch) -> None:
         """The FT controller is told this port out of band, so binding any other one makes the api unreachable."""
         ports: list[int] = []
         manager = MockWorkerManager(make_cell_summaries("trainer-engine-actor-0"))
-        monkeypatch.setattr(server, "_start_api_server_raw", lambda *, registry, port, host: ports.append(port))
+        monkeypatch.setattr(
+            server, "_start_api_server_raw", lambda *, registry, sources, port, host: ports.append(port)
+        )
 
         server.start_api_server(
             args=make_rollout_args(),
@@ -421,7 +496,9 @@ class TestStartApiServerRaw:
         monkeypatch.setattr(server, "_start_and_wait_thread", _record_thread)
         port = find_available_port(21200)
 
-        running = server._start_api_server_raw(registry=_CellRegistry([]), port=port, host="127.0.0.1")
+        running = server._start_api_server_raw(
+            registry=_CellRegistry([]), sources=_EMPTY_SOURCES, port=port, host="127.0.0.1"
+        )
 
         try:
             [thread] = serving_threads
@@ -444,7 +521,9 @@ class TestStartApiServerRaw:
         monkeypatch.setattr(server, "_start_and_wait_thread", _record_thread)
         port = find_available_port(21300)
 
-        running = server._start_api_server_raw(registry=_CellRegistry([]), port=port, host="0.0.0.0")
+        running = server._start_api_server_raw(
+            registry=_CellRegistry([]), sources=_EMPTY_SOURCES, port=port, host="0.0.0.0"
+        )
 
         try:
             assert (running.config.host, running.config.port) == ("0.0.0.0", port)
@@ -455,7 +534,9 @@ class TestStartApiServerRaw:
         """The happy path must still return once uvicorn is actually accepting connections."""
         port = find_available_port(21000)
 
-        running = server._start_api_server_raw(registry=_CellRegistry([]), port=port, host="127.0.0.1")
+        running = server._start_api_server_raw(
+            registry=_CellRegistry([]), sources=_EMPTY_SOURCES, port=port, host="127.0.0.1"
+        )
         try:
             resp = httpx.get(f"http://127.0.0.1:{port}/api/v1/health", timeout=10.0)
             assert resp.status_code == 200
@@ -471,7 +552,9 @@ class TestStartApiServerRaw:
             occupied.listen()
 
             with pytest.raises(RuntimeError, match=f"port {port} failed during startup"):
-                server._start_api_server_raw(registry=_CellRegistry([]), port=port, host="127.0.0.1")
+                server._start_api_server_raw(
+                    registry=_CellRegistry([]), sources=_EMPTY_SOURCES, port=port, host="127.0.0.1"
+                )
 
 
 class TestDynamicCells:
@@ -578,6 +661,204 @@ class TestInjectFault:
         }
 
 
+class TestGetFaultHookSources:
+    @pytest.mark.asyncio
+    async def test_the_trainer_cells_are_listed(self, async_client: httpx.AsyncClient) -> None:
+        """A harness that cannot see a live trainer generation has nothing to arm a hook against."""
+        resp = await async_client.get("/api/v1/fault-hook-sources")
+
+        assert resp.status_code == 200
+        assert [item["metadata"]["name"] for item in resp.json()["items"]] == [SOURCE_CELL_ID]
+
+    @pytest.mark.asyncio
+    async def test_a_deployment_without_a_trainer_answers_an_empty_list(
+        self, registry: _CellRegistry, actor_handler: MockHandler
+    ) -> None:
+        """A run that drives no trainer has no source, and the poll must read that rather than fail."""
+        actor_handler.add("actor-0")
+        app = server._create_api_app(registry, _FaultHookSourceRegistry(handler=None, controllers=[]))
+
+        async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://test") as client:
+            resp = await client.get("/api/v1/fault-hook-sources")
+
+        assert resp.status_code == 200
+        assert resp.json()["items"] == []
+
+
+class TestArmFaultHook:
+    @pytest.mark.asyncio
+    async def test_the_request_reaches_the_trainer_that_owns_the_cell(
+        self, source_controller: MockSourceController, async_client: httpx.AsyncClient
+    ) -> None:
+        """Arming names one incarnation, one hook, one worker and one request, and every part must survive."""
+        resp = await async_client.post(
+            f"/api/v1/cells/{SOURCE_CELL_ID}/arm-fault-hook",
+            json={
+                "expected_workers_hash": SOURCE_WORKERS_HASH,
+                "hook": "weight_update.before_p2p_write",
+                "mode": "sigkill",
+                "sub_index": 2,
+                "request_id": "req-1",
+            },
+        )
+
+        assert resp.status_code == 200
+        assert resp.json() == {"status": "ok"}
+        assert source_controller.armed == [
+            dict(
+                cell_id=SOURCE_CELL_ID,
+                expected_workers_hash=SOURCE_WORKERS_HASH,
+                hook="weight_update.before_p2p_write",
+                mode="sigkill",
+                sub_index=2,
+                request_id="req-1",
+            )
+        ]
+
+    @pytest.mark.asyncio
+    async def test_arming_uses_zero_sub_index_by_default(
+        self, source_controller: MockSourceController, async_client: httpx.AsyncClient
+    ) -> None:
+        """A single-worker cell is named without a sub_index, and the documented default targets worker zero."""
+        resp = await async_client.post(
+            f"/api/v1/cells/{SOURCE_CELL_ID}/arm-fault-hook",
+            json={
+                "expected_workers_hash": SOURCE_WORKERS_HASH,
+                "hook": "weight_update.before_all_gather",
+                "mode": "exit",
+                "request_id": "req-1",
+            },
+        )
+
+        assert resp.status_code == 200
+        assert source_controller.armed[0]["sub_index"] == 0
+
+    @pytest.mark.asyncio
+    async def test_an_unknown_hook_mode_or_field_is_refused_by_the_schema(
+        self, source_controller: MockSourceController, async_client: httpx.AsyncClient
+    ) -> None:
+        """A request the trainer cannot honour must be refused here rather than reported as armed."""
+        url = f"/api/v1/cells/{SOURCE_CELL_ID}/arm-fault-hook"
+        armed = {
+            "expected_workers_hash": SOURCE_WORKERS_HASH,
+            "hook": "weight_update.before_all_gather",
+            "mode": "sigkill",
+            "request_id": "req-1",
+        }
+
+        unknown_hook = await async_client.post(url, json={**armed, "hook": "weight_update.before_typo"})
+        unknown_mode = await async_client.post(url, json={**armed, "mode": "nuke"})
+        no_request_id = await async_client.post(url, json={k: v for k, v in armed.items() if k != "request_id"})
+        extra_field = await async_client.post(url, json={**armed, "hold_ms": 100})
+
+        assert [resp.status_code for resp in (unknown_hook, unknown_mode, no_request_id, extra_field)] == [422] * 4
+        assert source_controller.armed == []
+
+    @pytest.mark.asyncio
+    async def test_an_arm_that_names_no_incarnation_is_refused_by_the_schema(
+        self, source_controller: MockSourceController, async_client: httpx.AsyncClient
+    ) -> None:
+        """Without the hash the caller chose, the server would arm whatever generation happens to be current."""
+        url = f"/api/v1/cells/{SOURCE_CELL_ID}/arm-fault-hook"
+        armed = {"hook": "weight_update.before_all_gather", "mode": "sigkill", "request_id": "req-1"}
+
+        missing = await async_client.post(url, json=armed)
+        empty = await async_client.post(url, json={**armed, "expected_workers_hash": ""})
+        null = await async_client.post(url, json={**armed, "expected_workers_hash": None})
+
+        assert [resp.status_code for resp in (missing, empty, null)] == [422] * 3
+        assert source_controller.armed == []
+
+    @pytest.mark.asyncio
+    async def test_an_engine_cell_is_no_fault_hook_source(
+        self, rollout_handler: MockHandler, source_controller: MockSourceController, async_client: httpx.AsyncClient
+    ) -> None:
+        """Hooks live in trainer processes, and a managed engine cell must not be answered as if it held one."""
+        rollout_handler.add("rollout-engine-0")
+
+        resp = await async_client.post(
+            "/api/v1/cells/rollout-engine-0/arm-fault-hook",
+            json={
+                "expected_workers_hash": SOURCE_WORKERS_HASH,
+                "hook": "weight_update.before_all_gather",
+                "mode": "sigkill",
+                "request_id": "req-1",
+            },
+        )
+
+        assert resp.status_code == 404
+        assert source_controller.armed == []
+
+    @pytest.mark.asyncio
+    async def test_a_trainer_that_refuses_answers_bad_request_with_its_reason(
+        self, source_controller: MockSourceController, async_client: httpx.AsyncClient
+    ) -> None:
+        """A snapshot that went stale must be told so, not answered as if the fault had been armed."""
+        source_controller.refused_because = "trainer-engine-actor-0 now runs pseudo-hash-9"
+
+        resp = await async_client.post(
+            f"/api/v1/cells/{SOURCE_CELL_ID}/arm-fault-hook",
+            json={
+                "expected_workers_hash": SOURCE_WORKERS_HASH,
+                "hook": "weight_update.before_all_gather",
+                "mode": "sigkill",
+                "request_id": "req-1",
+            },
+        )
+
+        assert resp.status_code == 400
+        assert resp.json() == {
+            "apiVersion": "v1",
+            "kind": "Status",
+            "status": "Failure",
+            "message": "trainer-engine-actor-0 now runs pseudo-hash-9",
+            "reason": "BadRequest",
+            "code": 400,
+        }
+
+    @pytest.mark.asyncio
+    async def test_an_arm_that_blows_up_returns_500_k8s_status(
+        self, source_controller: MockSourceController, async_client: httpx.AsyncClient
+    ) -> None:
+        """A failed arm leaves nothing armed, and the harness needs a failure to stop waiting for the fault."""
+        source_controller.arm_fault_hook_error = RuntimeError("the trainer controller is unreachable")
+
+        resp = await async_client.post(
+            f"/api/v1/cells/{SOURCE_CELL_ID}/arm-fault-hook",
+            json={
+                "expected_workers_hash": SOURCE_WORKERS_HASH,
+                "hook": "weight_update.before_all_gather",
+                "mode": "sigkill",
+                "request_id": "req-1",
+            },
+        )
+
+        assert resp.status_code == 500
+        assert resp.json() == {
+            "apiVersion": "v1",
+            "kind": "Status",
+            "status": "Failure",
+            "message": "Failed to arm a fault hook in cell 'trainer-engine-actor-0'",
+            "reason": "InternalError",
+            "code": 500,
+        }
+
+    @pytest.mark.asyncio
+    async def test_an_unknown_cell_is_not_found(self, async_client: httpx.AsyncClient) -> None:
+        """A typo in the cell name must not be answered by arming some other cell."""
+        resp = await async_client.post(
+            "/api/v1/cells/trainer-engine-actor-9/arm-fault-hook",
+            json={
+                "expected_workers_hash": SOURCE_WORKERS_HASH,
+                "hook": "weight_update.before_all_gather",
+                "mode": "sigkill",
+                "request_id": "req-1",
+            },
+        )
+
+        assert resp.status_code == 404
+
+
 class TestStartAndWaitThread:
     def test_it_returns_once_the_thread_reports_ready(self):
         """The caller may only proceed after the thing it started is actually usable."""
@@ -664,7 +945,7 @@ class TestSeveralTrainers:
         monkeypatch.setattr(server, "compute_trainer_pool_id", lambda trainer_id: f"trainer-engine-{trainer_id}")
         monkeypatch.setattr(server, "compute_engine_pool_ids", lambda args: ["engine"])
         monkeypatch.setattr(
-            server, "_start_api_server_raw", lambda *, registry, port, host: registries.append(registry)
+            server, "_start_api_server_raw", lambda *, registry, sources, port, host: registries.append(registry)
         )
 
         server.start_api_server(
@@ -703,7 +984,7 @@ class TestOperationsSelection:
         monkeypatch.setattr(server, "compute_trainer_pool_id", lambda role: f"trainer-{role}")
         monkeypatch.setattr(server, "compute_engine_pool_ids", lambda args: ["engine"])
         monkeypatch.setattr(
-            server, "_start_api_server_raw", lambda *, registry, port, host: registries.append(registry)
+            server, "_start_api_server_raw", lambda *, registry, sources, port, host: registries.append(registry)
         )
 
         server.start_api_server(

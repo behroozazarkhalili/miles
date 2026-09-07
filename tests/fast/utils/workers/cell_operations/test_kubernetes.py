@@ -126,9 +126,18 @@ def deleted(monkeypatch: pytest.MonkeyPatch) -> list[tuple[str, list[str]]]:
     return recorded
 
 
-def _operations(infos, *, start_delay: float = 0.0, handle_effect: str | Exception = "return", unserved_workers=()):
+def _operations(
+    infos,
+    *,
+    start_delay: float = 0.0,
+    handle_effect: str | Exception = "return",
+    unserved_workers=(),
+):
     provider = FakeProvider(
-        infos, start_delay=start_delay, handle_effect=handle_effect, unserved_workers=unserved_workers
+        infos,
+        start_delay=start_delay,
+        handle_effect=handle_effect,
+        unserved_workers=unserved_workers,
     )
     return KubernetesCellOperations(provider=provider, namespace="rl")
 

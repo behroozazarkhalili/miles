@@ -26,6 +26,7 @@ from miles.utils.memory_utils import clear_memory, print_memory
 from miles.utils.misc import NodeProbeMixin, get_current_node_ip, get_free_port
 from miles.utils.object_store import StoreObjectRef
 from miles.utils.test_utils.det_process_group import DET_NCCL_BACKEND_NAME, register_det_nccl_backend
+from miles.utils.test_utils.fault_hooks import arm_fault_hook as _arm_fault_hook
 from miles.utils.test_utils.fault_injector import inject_fault as _inject_fault
 from miles.utils.workers.env_vars import CELL_INDEX_ENV_VAR
 from miles.utils.workers.rpc.common.metadata import rpc
@@ -175,6 +176,10 @@ class TrainRayActor(NodeProbeMixin):
     @rpc(concurrency_group="fault_injector")
     def inject_fault(self, mode: str) -> None:
         _inject_fault(mode=mode)
+
+    @rpc(concurrency_group="fault_injector")
+    def arm_fault_hook(self, *, hook: str, mode: str, request_id: str) -> None:
+        _arm_fault_hook(hook=hook, mode=mode, request_id=request_id)
 
     @rpc(concurrency_group="kill_self")
     def kill_self(self) -> None:

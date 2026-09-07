@@ -349,6 +349,10 @@ class TrainerCell:
         return compute_cell_status(self._state, self.health_checker.status, workers_hash=self.workers_hash)
 
     @property
+    def worker_handles(self) -> list[BaseWorkerHandle]:
+        return self._get_worker_handles()
+
+    @property
     def indep_dp_info(self) -> IndepDPInfo | None:
         assert isinstance(self._state, (StateAllocatedAlive, StateAllocatedErrored))
         return self._state.indep_dp_info

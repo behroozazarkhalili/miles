@@ -1,5 +1,6 @@
 import os
 import socket
+import threading
 from types import SimpleNamespace
 
 import pytest
@@ -7,6 +8,8 @@ import pytest
 from miles.ray import placement_group, train_actor
 from miles.ray.train_actor import TrainRayActor
 from miles.utils.init_once import InitOnce
+from miles.utils.test_utils import fault_hooks
+from miles.utils.test_utils.fault_hooks import FaultHookAlreadyArmedError, FaultHookName
 from miles.utils.workers.env_vars import CELL_INDEX_ENV_VAR, SUBPROCESS_INDEX_ENV_VAR
 
 
@@ -239,3 +242,45 @@ class TestTheLocalGpuIsFoundWithoutRay:
         monkeypatch.setattr(train_actor.ray, "get_gpu_ids", lambda: [5])
 
         assert train_actor.get_local_gpu_id() == 5
+
+
+class TestArmFaultHook:
+    def test_an_acknowledged_arm_fires_on_the_thread_that_reaches_the_hook(self, monkeypatch: pytest.MonkeyPatch):
+        """The rpc is answered by the trainer process itself, so the hook a worker thread walks is the armed one."""
+        monkeypatch.setattr(fault_hooks, "_REGISTRY", fault_hooks._FaultHookRegistry())
+        injected: list[str] = []
+        monkeypatch.setattr(fault_hooks, "inject_fault", lambda mode: injected.append(mode))
+        actor = _actor_with(InitOnce("TrainRayActor"))
+
+        actor.arm_fault_hook(
+            hook=FaultHookName.WEIGHT_UPDATE_BEFORE_P2P_WRITE.value, mode="sigkill", request_id="req-1"
+        )
+        assert injected == []
+
+        reached = threading.Thread(
+            target=lambda: fault_hooks.reach_fault_hook(FaultHookName.WEIGHT_UPDATE_BEFORE_P2P_WRITE)
+        )
+        reached.start()
+        reached.join(timeout=5.0)
+
+        assert not reached.is_alive()
+        assert injected == ["sigkill"]
+
+    def test_a_second_arm_at_the_same_hook_is_reported_to_the_caller(self, monkeypatch: pytest.MonkeyPatch):
+        """The caller must learn its request was refused instead of waiting for a fault that replaced nothing."""
+        monkeypatch.setattr(fault_hooks, "_REGISTRY", fault_hooks._FaultHookRegistry())
+        actor = _actor_with(InitOnce("TrainRayActor"))
+        hook = FaultHookName.WEIGHT_UPDATE_AFTER_P2P_SUBMIT.value
+
+        actor.arm_fault_hook(hook=hook, mode="sigkill", request_id="req-1")
+
+        with pytest.raises(FaultHookAlreadyArmedError):
+            actor.arm_fault_hook(hook=hook, mode="exit", request_id="req-2")
+
+    def test_an_unknown_hook_name_is_refused_by_the_trainer(self, monkeypatch: pytest.MonkeyPatch):
+        """A name no production site carries would sit armed forever and silently pass the test it was meant for."""
+        monkeypatch.setattr(fault_hooks, "_REGISTRY", fault_hooks._FaultHookRegistry())
+        actor = _actor_with(InitOnce("TrainRayActor"))
+
+        with pytest.raises(ValueError):
+            actor.arm_fault_hook(hook="weight_update.before_typo", mode="sigkill", request_id="req-1")

@@ -11,8 +11,17 @@ from starlette.responses import JSONResponse
 
 from miles.ray.specs.inference import compute_engine_pool_ids
 from miles.ray.specs.train import compute_trainer_pool_id
+from miles.utils.ft_utils.api_server.fault_hook_sources import FaultHookSourceNotFoundError, _FaultHookSourceRegistry
 from miles.utils.ft_utils.api_server.handles import _CellHandler
-from miles.utils.ft_utils.api_server.models import Cell, CellList, CellPatch, FaultInjection, K8sStatus, _OkResponse
+from miles.utils.ft_utils.api_server.models import (
+    Cell,
+    CellList,
+    CellPatch,
+    FaultHookArming,
+    FaultInjection,
+    K8sStatus,
+    _OkResponse,
+)
 from miles.utils.ft_utils.api_server.registry import _CellRegistry
 from miles.utils.workers.cell_operations.base import BaseCellOperations
 from miles.utils.workers.worker_handle import BaseWorkerHandle
@@ -38,15 +47,15 @@ def start_api_server(
 ) -> None:
     handlers: list[_CellHandler] = []
 
+    actor_handler = _CellHandler(
+        cell_type="actor",
+        operations=cell_operations,
+        controllers=list(trainer_models.values()),
+        pool_ids=[compute_trainer_pool_id(trainer_id) for trainer_id in trainer_models],
+    )
+
     if "train" in ft_components:
-        handlers.append(
-            _CellHandler(
-                cell_type="actor",
-                operations=cell_operations,
-                controllers=list(trainer_models.values()),
-                pool_ids=[compute_trainer_pool_id(trainer_id) for trainer_id in trainer_models],
-            )
-        )
+        handlers.append(actor_handler)
 
     if "rollout" in ft_components:
         assert inference_controller is not None, (
@@ -62,11 +71,18 @@ def start_api_server(
             )
         )
 
-    _start_api_server_raw(registry=_CellRegistry(handlers), host=host, port=port)
+    _start_api_server_raw(
+        registry=_CellRegistry(handlers),
+        sources=_FaultHookSourceRegistry(handler=actor_handler, controllers=list(trainer_models.values())),
+        host=host,
+        port=port,
+    )
 
 
-def _start_api_server_raw(*, registry: _CellRegistry, port: int, host: str) -> uvicorn.Server:
-    app = _create_api_app(registry)
+def _start_api_server_raw(
+    *, registry: _CellRegistry, sources: _FaultHookSourceRegistry, port: int, host: str
+) -> uvicorn.Server:
+    app = _create_api_app(registry, sources)
 
     server = uvicorn.Server(uvicorn.Config(app, host=host, port=port))
     _start_and_wait_thread(
@@ -81,7 +97,7 @@ def _start_api_server_raw(*, registry: _CellRegistry, port: int, host: str) -> u
 # -------------------------- main app ------------------------------
 
 
-def _create_api_app(registry: _CellRegistry) -> FastAPI:
+def _create_api_app(registry: _CellRegistry, sources: _FaultHookSourceRegistry) -> FastAPI:
     app = FastAPI()
 
     # -------------------------- exceptions ------------------------------
@@ -102,6 +118,10 @@ def _create_api_app(registry: _CellRegistry) -> FastAPI:
     @app.get("/api/v1/cells")
     async def get_cells() -> CellList:
         return CellList(items=await registry.list_cells())
+
+    @app.get("/api/v1/fault-hook-sources")
+    async def get_fault_hook_sources() -> CellList:
+        return CellList(items=await sources.list_cells())
 
     @app.get("/api/v1/cells/{name}")
     async def get_cell(name: str) -> Cell:
@@ -144,6 +164,35 @@ def _create_api_app(registry: _CellRegistry) -> FastAPI:
                 reason="InternalError",
                 message=f"Failed to inject fault into cell '{name}'",
             ) from err
+        return _OkResponse()
+
+    @app.post("/api/v1/cells/{name}/arm-fault-hook")
+    async def arm_fault_hook(name: str, body: FaultHookArming) -> _OkResponse:
+        try:
+            report = await sources.arm_fault_hook(
+                name,
+                expected_workers_hash=body.expected_workers_hash,
+                hook=body.hook,
+                mode=body.mode,
+                sub_index=body.sub_index,
+                request_id=body.request_id,
+            )
+        except FaultHookSourceNotFoundError as err:
+            raise _K8sError(
+                status_code=404,
+                reason="NotFound",
+                message=f"Cell '{name}' is not a fault hook source",
+            ) from err
+        except Exception as err:
+            logger.error("Failed to arm a fault hook in cell %s", name, exc_info=True)
+            raise _K8sError(
+                status_code=500,
+                reason="InternalError",
+                message=f"Failed to arm a fault hook in cell '{name}'",
+            ) from err
+
+        if (refused_because := report.refused_because) is not None:
+            raise _K8sError(status_code=400, reason="BadRequest", message=refused_because)
         return _OkResponse()
 
     # -------------------------- utils ------------------------------
