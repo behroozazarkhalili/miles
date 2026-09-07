@@ -4,6 +4,7 @@ from argparse import Namespace
 from collections import defaultdict
 from collections.abc import Callable, Sequence
 from concurrent.futures import Future, ThreadPoolExecutor
+from concurrent.futures import TimeoutError as FutureTimeoutError
 from typing import NamedTuple
 
 import ray
@@ -175,13 +176,25 @@ class P2PTransferManager:
 
     def wait_transfers(self) -> None:
         """Wait for all submitted tasks to complete."""
-        for future in self.transfer_futures:
+        awaited_futures = self.transfer_futures
+        self.transfer_futures = []
+
+        errors: list[Exception] = []
+        for future in awaited_futures:
             try:
                 future.result(timeout=self.transfer_timeout)
+            except FutureTimeoutError as e:
+                logger.exception(f"[P2P] Transfer future failed: {e}")
+                errors.append(e)
+                self.transfer_futures.append(future)
             except Exception as e:
-                logger.error(f"[P2P] Transfer future failed: {e}")
+                logger.exception(f"[P2P] Transfer future failed: {e}")
+                errors.append(e)
 
-        self.transfer_futures.clear()
+        if errors:
+            raise RuntimeError(
+                f"[P2P] {len(errors)} of {len(awaited_futures)} transfers failed: {errors}"
+            ) from errors[0]
 
 
 def create_server_args_from_dict(data_dict: dict) -> ServerArgs:
