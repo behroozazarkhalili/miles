@@ -230,3 +230,37 @@ class TestRunAnalysisFromArgs:
 
         args = Namespace(enable_event_analyzer=True, save_debug_event_data=str(tmp_path))
         run_analysis_from_args(args)
+
+
+class TestInferenceEngineWeightProgressRuleWiredIn:
+    def test_a_stalled_weight_update_is_reported(self, tmp_path: Path) -> None:
+        """run_analysis surfaces an update that republished the very same weights via the registered rule."""
+        event_logger = EventLogger(
+            log_dir=tmp_path, file_name="e.jsonl", source=SimpleProcessIdentity(component="main")
+        )
+        for weight_version in (1, 2):
+            _log_inference_engine_checksum_event(
+                event_logger,
+                rollout_id=weight_version,
+                weight_version=weight_version,
+                engine_checksums={"cell-a": {"rank0/w": "aaa"}},
+            )
+        event_logger.close()
+
+        assert len(run_analysis(event_dir=tmp_path)) == 1
+
+    def test_moving_weights_produce_no_issue(self, tmp_path: Path) -> None:
+        """A run whose engines took new weights each step must stay silent."""
+        event_logger = EventLogger(
+            log_dir=tmp_path, file_name="e.jsonl", source=SimpleProcessIdentity(component="main")
+        )
+        for weight_version, checksum in ((1, "aaa"), (2, "bbb")):
+            _log_inference_engine_checksum_event(
+                event_logger,
+                rollout_id=weight_version,
+                weight_version=weight_version,
+                engine_checksums={"cell-a": {"rank0/w": checksum}},
+            )
+        event_logger.close()
+
+        assert run_analysis(event_dir=tmp_path) == []
