@@ -90,7 +90,7 @@ class UpdateWeightP2P(WeightTransferProtocol):
         self, weight_version: int, iter_buckets: Callable[..., Iterator[list[tuple[str, torch.Tensor]]]]
     ) -> bool:
         """Register shared CPU pinned memory with P2P on the first sync."""
-        if self.is_sender and not self._model_registered:
+        if self.is_sender and not self._model_registered and self._shared_params_dict:
             self._weight_memory_registry = register_cpu_memory(self._shared_params_dict, self._transfer_engine)
             self._model_registered = True
         return True
@@ -166,10 +166,9 @@ class UpdateWeightP2P(WeightTransferProtocol):
         self.rollout_engines = rollout_engines
         self.inference_cell_health = InferenceCellHealth(engine_cell_ids)
 
-        targets = self.transfer_plan.plan_p2p(engine_gpu_counts)
-        self.is_sender = bool(targets)
+        planned_targets = self.transfer_plan.plan_p2p(engine_gpu_counts)
 
-        if self.is_sender and self._transfer_engine is None:
+        if planned_targets and self._transfer_engine is None:
             # Create ONE transfer engine for all engine ranks
             self._transfer_engine = create_transfer_engine()
 
@@ -183,16 +182,19 @@ class UpdateWeightP2P(WeightTransferProtocol):
             for cell_id in engine_cell_ids
         }
 
-        if self.is_sender:
+        if planned_targets:
             self.group_name = f"miles-p2p_{self.transfer_plan._gathered_dp_rank}"
-            (
-                self.remote_weight_infos_by_session_id,
-                targets_to_session_id,
-                self.session_id_to_server_args,
-            ) = query_remote_weight_infos(rollout_engines, targets)
+            query = query_remote_weight_infos(rollout_engines, planned_targets)
+            self.remote_weight_infos_by_session_id = query.remote_weight_infos_by_session_id
+            self.session_id_to_server_args = query.session_id_to_server_args
+            targets_to_session_id = query.targets_to_session_id
+            for engine_ind, error in query.failures_by_engine_ind.items():
+                self.inference_cell_health.mark_errored(engine_cell_ids[engine_ind], error)
 
             targets_grouped_by_engine_rank: dict[int, list] = {}
-            for target in targets:
+            for target in planned_targets:
+                if self.inference_cell_health.is_errored(engine_cell_ids[target.engine_ind]):
+                    continue
                 targets_grouped_by_engine_rank.setdefault(target.engine_rank, []).append(target)
 
             for engine_rank, rank_targets in targets_grouped_by_engine_rank.items():
@@ -221,6 +223,8 @@ class UpdateWeightP2P(WeightTransferProtocol):
                         engine_rank=engine_rank, model_replica=model_replica, cell_updaters=rank_cell_updaters
                     )
                 )
+
+        self.is_sender = bool(self._transfer_engine_meta_list)
 
     def disconnect(self) -> None:
         self.transfer_manager.wait_transfers()
