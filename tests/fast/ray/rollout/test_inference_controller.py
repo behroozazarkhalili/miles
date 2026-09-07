@@ -190,12 +190,18 @@ class _FakeUpdatableCell:
         )
         self.api_client = api_client
         self.marked_ready = 0
+        self.marked_errored = 0
         self.is_pending_weights = True
         self.is_pending_weights_or_serving = True
         self.is_errored = False
 
     async def mark_weights_ready(self) -> None:
         self.marked_ready += 1
+
+    async def mark_errored(self) -> None:
+        self.marked_errored += 1
+        self.is_errored = True
+        self.is_pending_weights = False
 
 
 class _TickingCell:
@@ -332,7 +338,11 @@ class TestHealthCheckerActiveness:
         controller = _make_controller({"default": srv})
 
         info = await controller.start_update_weights()
-        await controller.end_update_weights(snapshot_cell_id_to_hashes=info.snapshot_cell_id_to_hashes)
+        await controller.end_update_weights(
+            snapshot_cell_id_to_hashes=info.snapshot_cell_id_to_hashes,
+            updated_cell_ids=list(info.snapshot_cell_id_to_hashes),
+            failed_cell_ids=[],
+        )
 
         assert not srv.health_checker_activeness.get().active
 
@@ -641,7 +651,7 @@ class TestPerModelHealthCheckerActiveness:
         controller, servers = self._controller("solver", "verifier")
         servers["solver"].update_weights = True
         await controller.start_update_weights(model_id="solver")
-        await controller.end_update_weights({})
+        await controller.end_update_weights({}, updated_cell_ids=[], failed_cell_ids=[])
 
         await controller.prepare_eval(model_id="solver")
 
@@ -800,7 +810,11 @@ class TestUpdateWeightsLockWindow:
         info = await controller.start_update_weights()
         assert controller.context_lock.locked
 
-        await controller.end_update_weights(snapshot_cell_id_to_hashes=info.snapshot_cell_id_to_hashes)
+        await controller.end_update_weights(
+            snapshot_cell_id_to_hashes=info.snapshot_cell_id_to_hashes,
+            updated_cell_ids=list(info.snapshot_cell_id_to_hashes),
+            failed_cell_ids=[],
+        )
         assert not controller.context_lock.locked
 
     @pytest.mark.asyncio
@@ -814,7 +828,11 @@ class TestUpdateWeightsLockWindow:
             await asyncio.sleep(0)
         assert not reconcile_task.done()
 
-        await controller.end_update_weights(snapshot_cell_id_to_hashes=info.snapshot_cell_id_to_hashes)
+        await controller.end_update_weights(
+            snapshot_cell_id_to_hashes=info.snapshot_cell_id_to_hashes,
+            updated_cell_ids=list(info.snapshot_cell_id_to_hashes),
+            failed_cell_ids=[],
+        )
         await reconcile_task
 
     @pytest.mark.asyncio
@@ -1059,7 +1077,11 @@ class TestUpdatableEnginesPayload:
         controller = _make_controller({"actor": srv, "ref": _RecordingServer(model_name="ref")})
 
         updatable = await controller.start_update_weights()
-        await controller.end_update_weights(snapshot_cell_id_to_hashes=updatable.snapshot_cell_id_to_hashes)
+        await controller.end_update_weights(
+            snapshot_cell_id_to_hashes=updatable.snapshot_cell_id_to_hashes,
+            updated_cell_ids=list(updatable.snapshot_cell_id_to_hashes),
+            failed_cell_ids=[],
+        )
 
         assert updatable == UpdatableEngines(
             rollout_engines=["client-0", "client-1"],
@@ -1160,9 +1182,80 @@ class TestUpdatableEnginesPayload:
         controller = _make_controller({"actor": srv})
 
         await controller.start_update_weights()
-        await controller.end_update_weights(snapshot_cell_id_to_hashes={"engine-0": "hash-old", "engine-1": "hash-b"})
+        await controller.end_update_weights(
+            snapshot_cell_id_to_hashes={"engine-0": "hash-old", "engine-1": "hash-b"},
+            updated_cell_ids=["engine-0", "engine-1"],
+            failed_cell_ids=[],
+        )
 
         assert (relaunched.marked_ready, untouched.marked_ready) == (0, 1)
+
+
+class TestUpdateWindowOutcome:
+    """The trainer's per-cell verdict decides which engines serve these weights and which are retired."""
+
+    @staticmethod
+    def _controller_with(cells: dict) -> tuple[InferenceController, _RecordingServer]:
+        srv = _RecordingServer(cells, model_name="actor", update_weights=True)
+        return _make_controller({"actor": srv}), srv
+
+    @pytest.mark.asyncio
+    async def test_a_failed_cell_is_retired_instead_of_being_marked_ready(self):
+        """Marking it ready would put an engine that missed part of the weights back into the router."""
+        lost = _FakeUpdatableCell("hash-a", cell_id="engine-0", gpu_offset=0)
+        reached = _FakeUpdatableCell("hash-b", cell_id="engine-1", gpu_offset=1)
+        controller, _srv = self._controller_with({"engine-0": lost, "engine-1": reached})
+
+        info = await controller.start_update_weights()
+        await controller.end_update_weights(
+            snapshot_cell_id_to_hashes=info.snapshot_cell_id_to_hashes,
+            updated_cell_ids=["engine-1"],
+            failed_cell_ids=["engine-0"],
+        )
+
+        assert (lost.marked_errored, lost.marked_ready) == (1, 0)
+        assert (reached.marked_errored, reached.marked_ready) == (0, 1)
+
+    @pytest.mark.asyncio
+    async def test_a_replaced_incarnation_is_neither_retired_nor_marked_ready(self):
+        """The relaunched cell runs new processes, so the previous window's verdict says nothing about it."""
+        relaunched = _FakeUpdatableCell("hash-new", cell_id="engine-0", gpu_offset=0)
+        controller, _srv = self._controller_with({"engine-0": relaunched})
+
+        await controller.start_update_weights()
+        await controller.end_update_weights(
+            snapshot_cell_id_to_hashes={"engine-0": "hash-old"},
+            updated_cell_ids=[],
+            failed_cell_ids=["engine-0"],
+        )
+
+        assert (relaunched.marked_errored, relaunched.marked_ready) == (0, 0)
+
+    @pytest.mark.asyncio
+    async def test_a_cell_outside_the_window_is_rejected(self):
+        """A stale cell id from an earlier window would retire an engine this update never touched."""
+        cell = _FakeUpdatableCell("hash-a", cell_id="engine-0", gpu_offset=0)
+        controller, _srv = self._controller_with({"engine-0": cell})
+
+        info = await controller.start_update_weights()
+        with pytest.raises(AssertionError, match="never part of this update window"):
+            await controller.end_update_weights(
+                snapshot_cell_id_to_hashes=info.snapshot_cell_id_to_hashes,
+                updated_cell_ids=[],
+                failed_cell_ids=["engine-9"],
+            )
+
+    @pytest.mark.asyncio
+    async def test_the_window_closes_even_when_the_verdict_never_arrives(self):
+        """A trainer that raised leaves the lock held forever, and every later rollout call wedges behind it."""
+        cell = _FakeUpdatableCell("hash-a", cell_id="engine-0", gpu_offset=0)
+        controller, _srv = self._controller_with({"engine-0": cell})
+
+        info = await controller.start_update_weights()
+        await controller.abort_update_weights(snapshot_cell_id_to_hashes=info.snapshot_cell_id_to_hashes)
+
+        assert not controller.context_lock.locked
+        assert (cell.marked_errored, cell.marked_ready) == (0, 0)
 
 
 class TestInitLifecycle:
