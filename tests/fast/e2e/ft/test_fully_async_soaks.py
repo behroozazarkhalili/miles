@@ -1,3 +1,5 @@
+import dataclasses
+
 import pytest
 from tests.e2e.ft import test_random_crash_fully_async__kill_train_rollout__dp2_cp2 as fully_async_random_entry
 from tests.e2e.ft.conftest_ft.execution import get_fully_async_args, get_train_script
@@ -43,5 +45,7 @@ def test_a_debug_rollout_mode_cannot_be_run_fully_async() -> None:
 
 def test_a_colocated_mode_cannot_be_run_fully_async() -> None:
     """train_async.py rejects colocation, so the soak must fail before it burns a cluster."""
+    mode = dataclasses.replace(MODES["kill_rollout__dp4"], colocate=True)
+
     with pytest.raises(AssertionError, match="colocated"):
-        assert_mode_supports_fully_async(MODES["kill_rollout__dp4__colocate"], mode="kill_rollout__dp4__colocate")
+        assert_mode_supports_fully_async(mode, mode="kill_rollout__dp4__colocate")

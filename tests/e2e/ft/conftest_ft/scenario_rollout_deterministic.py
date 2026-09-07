@@ -15,6 +15,7 @@ from tests.e2e.ft.conftest_ft.execution import (
     get_common_train_args,
     get_ft_args,
     get_train_env_vars_arg,
+    get_weight_transfer_args,
 )
 from tests.e2e.ft.conftest_ft.fault_injection.entrypoint import (
     API_SERVER_PORT,
@@ -44,7 +45,6 @@ MIN_CRASHED_ROLLOUTS: int = 2
 TERMINAL_FAULT_FREE_ROLLOUTS: int = 2
 
 
-COLOCATED_MEM_FRACTION_STATIC: float = 0.4
 DETERMINISTIC_INFERENCE_ENV_VARS: dict[str, str] = {"SGLANG_BATCH_INVARIANT_OPS_ENABLE_MM_FALLBACK_VARIANT": "false"}
 
 
@@ -57,12 +57,11 @@ def _build_args(mode: FTTestMode, dump_dir: str, enable_dumper: bool = True) -> 
 
     args = get_common_train_args(mode, dump_dir=dump_dir, num_steps=NUM_ROLLOUTS, enable_dumper=enable_dumper)
     args += get_ft_args(mode)
+    args += get_weight_transfer_args(mode)
     args += get_api_server_args()
     args += "--mini-ft-controller-enable "
     args += "--debug-deterministic-collective "
     args += "--sglang-disable-radix-cache "
-    if mode.colocate:
-        args += f"--sglang-mem-fraction-static {COLOCATED_MEM_FRACTION_STATIC} "
     args += f"--rollout-health-check-interval {HEALTH_CHECK_INTERVAL_SECONDS} "
     args += "--weight-decay 0 "
     args += get_train_env_vars_arg(

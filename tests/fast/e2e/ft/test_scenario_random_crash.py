@@ -1,6 +1,7 @@
 from pathlib import Path
 
 import pytest
+from tests.e2e.ft.conftest_ft import scenario_random_crash
 from tests.e2e.ft.conftest_ft.fault_injection import entrypoint, fault_forms, state
 from tests.e2e.ft.conftest_ft.scenario_random_crash import _assert_drawn_fault_forms_worked, assert_healing
 
@@ -308,3 +309,62 @@ class TestTrainerHealingPairing:
         _note_actor_injections(injector, 1, name="actor-1")
 
         assert_healing(("train",), injector=injector, event_dir=tmp_path / "events", context="soak")
+
+
+class _StubBackend:
+    def api_server_host(self, config: command_utils.ExecuteTrainConfig) -> str:
+        return "orchestrator"
+
+
+def _capture_soak_train_args(monkeypatch: pytest.MonkeyPatch, tmp_path: Path, *, mode: str) -> str:
+    launched: list[str] = []
+    monkeypatch.setattr(
+        command_utils,
+        "default_config",
+        lambda: command_utils.ExecuteTrainConfig(run_id="260101-000000-000", namespace="miles-e2e"),
+    )
+    monkeypatch.setattr(command_utils.ExecuteTrainConfig, "create_backend", lambda self: _StubBackend())
+    monkeypatch.setattr(scenario_random_crash, "prepare", lambda mode, *, config: None)
+    monkeypatch.setattr(scenario_random_crash, "resolve_dump_dir", lambda test_name, *, run_id: str(tmp_path))
+    monkeypatch.setattr(
+        scenario_random_crash, "materialize_cyclic_debug_rollout_data", lambda count: str(tmp_path / "rollout")
+    )
+    monkeypatch.setattr(scenario_random_crash, "spawn_fault_injector", lambda **kwargs: _StubInjector())
+    monkeypatch.setattr(scenario_random_crash, "assert_healing", lambda ft_components, **kwargs: None)
+    monkeypatch.setattr(
+        scenario_random_crash, "run_training", lambda *, train_args, **kwargs: launched.append(train_args)
+    )
+
+    scenario_random_crash.run_ci(mode, num_steps=1)
+
+    (train_args,) = launched
+    return train_args
+
+
+class _StubInjector:
+    def __init__(self) -> None:
+        self.event_log = state.EventLog()
+
+    def stop_and_join(self) -> None:
+        pass
+
+
+class TestTheSoakLaunchCommand:
+    def test_a_real_rollout_soak_transfers_weights_with_the_p2p_protocol(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        """Crashing an engine proves nothing about p2p sessions if the soak ran the broadcast default."""
+        train_args = _capture_soak_train_args(monkeypatch, tmp_path, mode="kill_rollout__dp4")
+
+        assert "--update-weight-transfer-mode p2p " in train_args
+        assert "--sglang-remote-instance-weight-loader-start-seed-via-transfer-engine " in train_args
+
+    def test_a_debug_rollout_soak_names_no_transfer_protocol(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        """A trainer-only soak transfers weights to nobody, so claiming p2p there would be coverage on paper only."""
+        train_args = _capture_soak_train_args(
+            monkeypatch, tmp_path, mode="kill_train__dp2_cp2_tp2_ep2__fake_rollout__moe_5layer"
+        )
+
+        assert "--update-weight-transfer-mode" not in train_args

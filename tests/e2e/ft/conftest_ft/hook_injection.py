@@ -10,6 +10,7 @@ from pathlib import Path
 
 import requests
 from tests.e2e.ft.conftest_ft.app import resolve_dump_dir
+from tests.e2e.ft.conftest_ft.execution import P2P_WEIGHT_TRANSFER_ARGS as BASE_P2P_WEIGHT_TRANSFER_ARGS
 from tests.e2e.ft.conftest_ft.execution import (
     get_api_server_args,
     get_common_train_args,
@@ -56,10 +57,7 @@ logger = logging.getLogger(__name__)
 CHECKPOINT_TRACKER_FILENAME: str = "latest_checkpointed_iteration.txt"
 CHECKPOINT_DIRNAME: str = "ckpt"
 
-P2P_WEIGHT_TRANSFER_ARGS: str = (
-    "--update-weight-transfer-mode p2p --sglang-remote-instance-weight-loader-start-seed-via-transfer-engine "
-    "--sglang-enable-p2p-fault-injection "
-)
+P2P_WEIGHT_TRANSFER_ARGS: str = f"{BASE_P2P_WEIGHT_TRANSFER_ARGS}--sglang-enable-p2p-fault-injection "
 
 ARMED_TRAINER_MODEL_ID: str | None = None
 

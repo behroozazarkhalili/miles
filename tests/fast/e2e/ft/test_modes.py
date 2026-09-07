@@ -24,20 +24,21 @@ def _mode(
 
 
 class TestTotalNodeGpus:
-    def test_rollout_only_colocated_mode_uses_plain_four_way_data_parallelism(self) -> None:
+    def test_rollout_only_mode_uses_plain_four_way_data_parallelism(self) -> None:
         """Rollout-only FT must not add context parallelism to the four-GPU trainer."""
-        mode = MODES["kill_rollout__dp4__colocate"]
+        mode = MODES["kill_rollout__dp4"]
 
         assert mode.num_cells == 4
         assert mode.parallel_args == ""
 
-    def test_colocated_mode_counts_shared_gpus_once(self) -> None:
-        """The registered colocated mode reserves only the trainer's gpus, not trainer plus rollout."""
-        mode = MODES["kill_rollout__dp4__colocate"]
+    def test_rollout_only_mode_gives_its_engines_gpus_of_their_own(self) -> None:
+        """P2P weight transfer refuses colocation, so the rollout-only mode has to reserve a full eight-gpu node."""
+        mode = MODES["kill_rollout__dp4"]
 
-        assert mode.colocate
+        assert not mode.colocate
+        assert mode.train_gpus_per_node == 4
         assert mode.total_rollout_gpus == 4
-        assert mode.total_node_gpus == 4
+        assert mode.total_node_gpus == 8
 
     def test_disaggregated_mode_adds_rollout_gpus_to_train_gpus(self) -> None:
         """Without colocation the rollout engines need their own gpus on top of the trainer's."""

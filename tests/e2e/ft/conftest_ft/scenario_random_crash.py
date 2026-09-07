@@ -21,6 +21,7 @@ from tests.e2e.ft.conftest_ft.execution import (
     get_ft_args,
     get_fully_async_args,
     get_train_script,
+    get_weight_transfer_args,
     materialize_cyclic_debug_rollout_data,
     prepare,
     run_training,
@@ -109,6 +110,7 @@ def run_ci(
             ft_mode, dump_dir=dump_dir, num_steps=num_steps, debug_rollout_data_dir=debug_rollout_data_dir
         )
         + get_ft_args(ft_mode)
+        + get_weight_transfer_args(ft_mode)
         + get_fully_async_args(fully_async=fully_async)
         + get_api_server_args(config)
         + "--mini-ft-controller-enable "

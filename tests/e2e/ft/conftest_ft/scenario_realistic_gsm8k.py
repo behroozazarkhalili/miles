@@ -21,6 +21,7 @@ from tests.e2e.ft.conftest_ft.cli_options import (
 from tests.e2e.ft.conftest_ft.execution import (
     DATA_DIR,
     MODEL_DIR,
+    P2P_WEIGHT_TRANSFER_ARGS,
     get_api_server_args,
     get_fully_async_args,
     get_train_script,
@@ -108,7 +109,7 @@ def run_ci(
             rollout_crash_interval_seconds=rollout_crash_interval_seconds,
         ),
         create_forms=lambda run: create_cell_fault_forms(base_url=run.base_url, config=run.config),
-        build_extra_train_args=lambda _dump_dir: "",
+        build_extra_train_args=lambda _dump_dir: P2P_WEIGHT_TRANSFER_ARGS,
     )
 
     assert_healing(FT_COMPONENTS, injector=outcome.injector, event_dir=outcome.run.events_dir, context=test_name)

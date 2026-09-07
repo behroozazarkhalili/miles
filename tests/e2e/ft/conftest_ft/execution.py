@@ -9,7 +9,7 @@ from pathlib import Path
 from tests.e2e.common_dirs import get_test_data_dir, get_test_model_dir
 from tests.e2e.conftest_dumper import MEGATRON_PATCHER_YAMLS
 from tests.e2e.ft.conftest_ft.fault_injection.entrypoint import API_SERVER_PORT
-from tests.e2e.ft.conftest_ft.modes import DEBUG_ROLLOUT_DATA_HF_REPO, FTTestMode
+from tests.e2e.ft.conftest_ft.modes import DEBUG_ROLLOUT_DATA_HF_REPO, FTTestMode, compute_mode_name
 from tests.fast.cluster_backends import create_backend_for_run
 
 from miles.utils.audit_utils.event_logger.logger import EVENTS_DIRNAME
@@ -162,6 +162,22 @@ def get_debug_dump_args(*, dump_dir: str, enable_dumper: bool) -> str:
         )
 
     return f"--save-debug-event-data {dump_dir}/{EVENTS_DIRNAME} {dumper_args}"
+
+
+P2P_WEIGHT_TRANSFER_ARGS: str = (
+    "--update-weight-transfer-mode p2p --sglang-remote-instance-weight-loader-start-seed-via-transfer-engine "
+)
+
+
+def get_weight_transfer_args(mode: FTTestMode) -> str:
+    if not mode.has_real_rollout:
+        return ""
+    assert not mode.colocate, (
+        f"P2P weight transfer refuses a colocated mode (see validate_args in miles/utils/arguments.py), so a "
+        f"fault-injection scenario cannot exercise the p2p protocol on one; mode {compute_mode_name(mode)!r} "
+        f"colocates its {mode.rollout_num_engines} engine(s) on the trainer's gpus"
+    )
+    return P2P_WEIGHT_TRANSFER_ARGS
 
 
 def get_ft_args(mode: FTTestMode) -> str:

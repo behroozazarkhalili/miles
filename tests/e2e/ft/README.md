@@ -14,8 +14,8 @@
 | `scenario_trainer_no_failure` | `kill_train__dp2_cp2_tp2_ep2__fake_rollout__moe_5layer`, `kill_train__dp2_cp2_pp2__fake_rollout__moe_5layer`, `kill_train__dp4_cp2__fake_rollout__moe_5layer`, `kill_train__dp2_cp2__moe_5layer` |
 | `scenario_trainer_deterministic` | `kill_train__dp2_cp2_tp2_ep2__fake_rollout__moe_5layer`, `kill_train__dp2_cp2_pp2__fake_rollout__moe_5layer`, `kill_train__dp4_cp2__fake_rollout__moe_5layer`, `kill_train__dp2_cp2__moe_5layer` |
 | `scenario_trainer_with_failure` | `kill_train__dp2_cp2_tp2_ep2__fake_rollout__moe_5layer`, `kill_train__dp2_cp2_pp2__fake_rollout__moe_5layer`, `kill_train__dp2_cp2` |
-| `scenario_rollout_deterministic` | `kill_rollout__dp4__colocate` |
-| `scenario_random_crash` | `kill_train__dp2_cp2_tp2_ep2__fake_rollout__moe_5layer`, `kill_train__dp2_cp2__moe_5layer`, `kill_train_rollout__dp2_cp2`, `kill_rollout__dp4__colocate` |
+| `scenario_rollout_deterministic` | `kill_rollout__dp4` |
+| `scenario_random_crash` | `kill_train__dp2_cp2_tp2_ep2__fake_rollout__moe_5layer`, `kill_train__dp2_cp2__moe_5layer`, `kill_train_rollout__dp2_cp2`, `kill_rollout__dp4` |
 | `scenario_realistic_gsm8k` | `test_realistic_gsm8k__kill_train_rollout.py`, no modes |
 | `scenario_random_crash_fully_async` | `kill_train_rollout__dp2_cp2` |
 | `scenario_realistic_gsm8k_fully_async` | `test_realistic_gsm8k_fully_async__kill_train_rollout.py`, no modes |
@@ -25,7 +25,7 @@
 
 - **Forced absences**, one reason each:
     - `kill_train__dp4_cp2_tp2_pp2_ep2_etp2__moe_full` is multi-node, and no multi-node CI lane exists.
-    - `kill_rollout__dp4__colocate` fits only the scenarios that crash engines.
+    - `kill_rollout__dp4` fits only the scenarios that crash engines.
     - `scenario_rollout_deterministic` needs real engines and `ft_components == ("rollout",)` exactly.
     - The fully-async soaks reject modes without real engines or with colocation.
     - `kill_train__dp2_cp2` supersedes `kill_train__dp2_cp2__moe_5layer` in `scenario_trainer_with_failure`.
@@ -59,6 +59,7 @@
 - **The scheme is enforced, not remembered**: `compute_mode_name` derives a mode's name from its fields against an explicit naming-default table, and `tests/fast/e2e/ft/test_naming_scheme.py` fails when a name drifts from it.
 - **Declared per mode**: cell count, parallelism, model, train/rollout GPU split, `colocate` (default disaggregated, i.e. training and rollout on separate nodes), `ft_components` (default `("train",)`).
 - **No rollout engines**: modes with `rollout_num_engines == 0` train on pre-recorded debug rollout data.
+- **No registered mode colocates**: `FTTestMode` still takes `colocate`, and the `__colocate` name segment still exists, but the last colocated mode became `kill_rollout__dp4` when the injection scenarios moved to p2p, which `validate_args` refuses under `--colocate`. A colocated mode is therefore reachable only from a scenario that transfers weights by broadcast.
 
 | Mode | Nodes | GPUs (train + rollout) | DP cells | Parallelism | Rollout | Model | `ft_components` | Why it exists |
 | --- | --- | --- | --- | --- | --- | --- | --- | --- |
@@ -67,13 +68,22 @@
 | `kill_train__dp4_cp2__fake_rollout__moe_5layer` | 1 | 8 + 0 | 4 | CP2 | debug data | 5-layer MoE | `("train",)` | multi-replica coverage (>= 4 cells) |
 | `kill_train__dp2_cp2__moe_5layer` | 1 | 4 + 4 | 2 | CP2 | 4 engines × 1 GPU | 5-layer MoE | `("train",)` | real engines + the weight-update path |
 | `kill_train__dp2_cp2` | 1 | 4 + 4 | 2 | CP2 | 4 engines × 1 GPU | dense Qwen3-0.6B | `("train",)` | `scenario_trainer_with_failure` under real generation; needs the dense model (see below) |
-| `kill_rollout__dp4__colocate` | 1 | 4 shared | 4 | — | 4 engines × 1 GPU, colocated | dense Qwen3-0.6B | `("rollout",)` | the only rollout-only mode: crashes engines, not trainer cells |
 | `kill_train_rollout__dp2_cp2` | 1 | 4 + 4 | 2 | CP2 | 4 engines × 1 GPU | dense Qwen3-0.6B | `("train", "rollout")` | both kinds crash in the same run, sync and fully-async; disaggregated, since colocation makes the two crashes contend for the same gpus |
 | `kill_train_rollout__dp2_tp2` | 1 | 4 + 4 | 2 | TP2 | 4 engines × 1 GPU | dense Qwen3-0.6B | `("train", "rollout")` | the only mode whose trainer runs a real TP all-gather in the weight update, which the targeted hook scenarios crash inside; the killed sender takes its engines with it, so both kinds must be recoverable |
+| `kill_rollout__dp4` | 1 | 4 + 4 | 4 | — | 4 engines × 1 GPU | dense Qwen3-0.6B | `("rollout",)` | the only rollout-only mode: crashes engines, not trainer cells |
 | `kill_train__dp4_cp2_tp2_pp2_ep2_etp2__moe_full` | 4 train + 2 rollout | 32 + 16 | 4 | CP2 TP2 PP2 EP2 ETP2 | 2 engines × 8 GPU | full MoE | `("train",)` | full model, all parallelism; multi-node, so no CI entry |
 
 - **Batch shape**: `--rollout-batch-size 32 --n-samples-per-prompt 8 --global-batch-size 256` everywhere — 256 samples per rollout, divisible by both 2 and 4 cells. Uneven distribution across replicas is **not** exercised.
 - **Model**: 1-node modes use the 5-layer MoE `Qwen3-30B-A3B-5layer`, except the dense modes.
+
+### Weight Transfer Protocol
+
+- **The injection scenarios launch p2p**: `scenario_random_crash`, `scenario_realistic_gsm8k`, their fully-async shells and `scenario_rollout_deterministic` add `get_weight_transfer_args(mode)`, which is `--update-weight-transfer-mode p2p --sglang-remote-instance-weight-loader-start-seed-via-transfer-engine`.
+- **Why p2p is the protocol under test**: what these scenarios crash is an engine that a weight update is talking to, and the update path that has per-cell sessions, RDMA writes and partial-target failure handling is the p2p one. Under the `broadcast` default a crashed engine tests a collective the production p2p deployments do not run.
+- **Why the sglang seed flag**: p2p reads each engine's registration through `/get_remote_instance_transfer_engine_info`, which an engine that never started its remote-instance transfer engine does not serve. Every in-repo p2p launcher passes the same flag.
+- **Why colocation is refused**: `validate_args` rejects `--update-weight-transfer-mode p2p` together with `--colocate` (colocated transfers move a CUDA IPC handle, not bytes), so `get_weight_transfer_args` asserts on a colocated mode rather than letting the run fail on the cluster.
+- **A mode without engines names no protocol**: `rollout_num_engines == 0` pushes weights to nobody, so those modes get no transfer flag at all instead of a p2p claim nothing exercises.
+- **The comparison scenarios keep the broadcast default**: `scenario_trainer_no_failure`, `scenario_trainer_with_failure` and `scenario_trainer_deterministic` do not call `get_weight_transfer_args`, so `kill_train__dp2_cp2__moe_5layer` and `kill_train__dp2_cp2` still transfer by broadcast there and by p2p under `scenario_random_crash`. The transfer protocol is a property of the scenario, not of the topology.
 
 ## Running the code
 
@@ -341,7 +351,7 @@ Healing witness: one heal per target phase, at P+2 (healed = last cell, ckpt src
 ```
 Type: comparison; both sides run the identical command, only the target is wrapped in the
       fault injector, through the pipeline's target_side_context hook
-Entry: test_rollout_deterministic__kill_rollout__dp4__colocate.py, ft-long
+Entry: test_rollout_deterministic__kill_rollout__dp4.py, ft-long
 Steps: 8 rollouts (NUM_ROLLOUTS)
 Requires: mode.has_real_rollout, and ft_components == ("rollout",) exactly
 Compare: dumps rel <= 0 (bitwise); metrics rtol=0 / atol=0 over train/* and rollout/*,
@@ -375,9 +385,8 @@ Assertions:
 - **Why `--sglang-disable-radix-cache`**: a replacement engine serves with a cold prefix cache where the baseline's was warm, and deterministic inference is nowhere documented as prefix-cache-length invariant.
 - **Why this recipe disables batch-variant MM fallback**: a rollout worker loss changes co-batching while the pool is healing; permitting an `einsum` fallback would make the same seeded request depend on that temporary batch shape. The scenario injects the environment override without changing the production default.
 - **Why `--rollout-health-check-interval 1`**: healthy generation can finish between two five-second polls; the short scenario needs at least one fresh Serving observation before it may pick a target.
-- **Why this scenario polls the fault window every 0.2 seconds**: colocated generation windows are only a few seconds long, so the generic two-second scheduler cadence can miss every Serving observation in an eight-rollout run.
+- **Why this scenario polls the fault window every 0.2 seconds**: an eight-rollout run offers few chances to inject, and the generic two-second scheduler cadence spends them waiting. The interval predates disaggregation, where engines serve continuously; it is now a latency bound on noticing a fresh Serving reading rather than the only way to catch one.
 - **Why the final two rollouts accept no new fault**: the scheduler keeps observing recovery but closes admission after rollout 5, so teardown cannot race a newly accepted replacement.
-- **Why an offloaded engine is never a target**: colocate hands the shared GPUs to the trainer, and the controller reports that pause as `EnginesOffloaded`, which the injector rejects. There is no longer a lock in the injection path to reject it instead.
 - **Why every namespace, not just `train/`**: an engine crash shows up first in `rollout/raw_reward` or `rollout/log_probs`. `perf/` is left out by name, being wall-clock and throughput that a relaunch moves by definition, and a metric in neither namespace fails the run rather than being dropped quietly.
 - **Why the weights-moved gate**: bitwise equality is also satisfied by two runs that trained on nothing.
 - **Why not a loss or reward curve**: neither is a progress signal here — the reward is `deterministic_random`, a hash of the response, and GRPO's surrogate loss is not monotone even while a run learns. Over eight rollouts neither moves for a reason worth asserting, and the weights either changed or they did not.

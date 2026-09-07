@@ -184,8 +184,7 @@ MODES: dict[str, FTTestMode] = {
         ft_components=("train", "rollout"),
         parallel_args="--tensor-model-parallel-size 2 --sequence-parallel",
     ),
-    # --- 1-node (8 GPUs) colocated: engines share the trainer's gpus ---
-    "kill_rollout__dp4__colocate": FTTestMode(
+    "kill_rollout__dp4": FTTestMode(
         model_name=DENSE_MODEL_NAME,
         model_hf_repo=DENSE_MODEL_HF_REPO,
         megatron_model_type=DENSE_MODEL_TYPE,
@@ -193,7 +192,6 @@ MODES: dict[str, FTTestMode] = {
         train_gpus_per_node=4,
         rollout_num_engines=4,
         rollout_gpus_per_engine=1,
-        colocate=True,
         ft_components=("rollout",),
         parallel_args="",
     ),
