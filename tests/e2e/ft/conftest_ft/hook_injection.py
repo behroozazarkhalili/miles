@@ -10,6 +10,7 @@ from pathlib import Path
 
 import requests
 from tests.e2e.ft.conftest_ft.app import resolve_dump_dir
+from tests.e2e.ft.conftest_ft.execution import P2P_FAULT_INJECTION_ARGS
 from tests.e2e.ft.conftest_ft.execution import P2P_WEIGHT_TRANSFER_ARGS as BASE_P2P_WEIGHT_TRANSFER_ARGS
 from tests.e2e.ft.conftest_ft.execution import (
     get_api_server_args,
@@ -22,6 +23,16 @@ from tests.e2e.ft.conftest_ft.execution import (
 from tests.e2e.ft.conftest_ft.fault_injection.core import list_cells
 from tests.e2e.ft.conftest_ft.fault_injection.entrypoint import API_SERVER_PORT
 from tests.e2e.ft.conftest_ft.fault_injection.fault_forms import ACTOR_CELL_TYPE, ROLLOUT_CELL_TYPE
+from tests.e2e.ft.conftest_ft.fault_injection.hook_forms import (
+    ARM_REQUEST_TIMEOUT_SECONDS,
+    ARMED_TRAINER_MODEL_ID,
+    EXPECTED_OUTCOME_OF_TARGET,
+)
+from tests.e2e.ft.conftest_ft.fault_injection.recovery_source import (
+    CHECKPOINT_DIRNAME,
+    carries_checksums,
+    recovery_source_exists,
+)
 from tests.e2e.ft.conftest_ft.fault_injection.state import (
     CellInfo,
     Event,
@@ -34,7 +45,6 @@ from tests.e2e.ft.conftest_ft.fault_injection.state import (
 )
 from tests.e2e.ft.conftest_ft.modes import FTTestMode, resolve_mode
 
-from miles.backends.megatron_utils.ft.types import TrainStepOutcome
 from miles.backends.megatron_utils.megatron_config import ACTOR_ROLE
 from miles.ray.specs.train import compute_trainer_pool_id
 from miles.utils.audit_utils.event_logger.logger import EVENTS_DIRNAME, read_events
@@ -42,32 +52,20 @@ from miles.utils.audit_utils.event_logger.models import (
     CellReconfigureEvent,
     FaultHookFireEvent,
     InferenceEngineWeightChecksumEvent,
-    TrainGroupStepEndEvent,
     WeightUpdateAssignmentEvent,
 )
 from miles.utils.audit_utils.process_identity import TrainProcessIdentity
 from miles.utils.external_utils import command_utils
-from miles.utils.test_utils.fault_hooks import FaultHookName, FaultHookOutcome, FaultHookTarget
+from miles.utils.test_utils.fault_hooks import FaultHookName, FaultHookTarget
 from miles.utils.test_utils.fault_injector import FailureMode
 from miles.utils.test_utils.polling_worker import PollingWorker
 from miles.utils.workers.naming import compute_cell_id, parse_cell_id
 
 logger = logging.getLogger(__name__)
 
-CHECKPOINT_TRACKER_FILENAME: str = "latest_checkpointed_iteration.txt"
-CHECKPOINT_DIRNAME: str = "ckpt"
-
-P2P_WEIGHT_TRANSFER_ARGS: str = f"{BASE_P2P_WEIGHT_TRANSFER_ARGS}--sglang-enable-p2p-fault-injection "
-
-ARMED_TRAINER_MODEL_ID: str | None = None
-
-_EXPECTED_OUTCOME_OF_TARGET: dict[FaultHookTarget, FaultHookOutcome] = {
-    FaultHookTarget.LOCAL: FaultHookOutcome.FIRED,
-    FaultHookTarget.REMOTE_INFERENCE_CELL: FaultHookOutcome.ACCEPTED,
-}
+P2P_WEIGHT_TRANSFER_ARGS: str = f"{BASE_P2P_WEIGHT_TRANSFER_ARGS}{P2P_FAULT_INJECTION_ARGS}"
 
 POLL_INTERVAL_SECONDS: float = 2.0
-ARM_REQUEST_TIMEOUT_SECONDS: float = 60.0
 STOP_AND_JOIN_TIMEOUT_SECONDS: float = 120.0
 
 
@@ -333,39 +331,6 @@ class HookArmer:
         return cells
 
 
-def recovery_source_exists(*, event_dir: Path, checkpoint_dir: Path) -> bool:
-    if read_checkpoint_iteration(checkpoint_dir) is None:
-        return False
-    if not event_dir.is_dir():
-        return False
-
-    events = read_events(event_dir)
-    if not any(isinstance(event, TrainGroupStepEndEvent) and _completed_a_step(event) for event in events):
-        return False
-    return any(
-        isinstance(event, InferenceEngineWeightChecksumEvent) and event.rollout_id >= 0 and _carries_checksums(event)
-        for event in events
-    )
-
-
-def read_checkpoint_iteration(checkpoint_dir: Path) -> int | None:
-    tracker = checkpoint_dir / CHECKPOINT_TRACKER_FILENAME
-    if not tracker.is_file():
-        return None
-    content = tracker.read_text().strip()
-    if not content.isdigit() or int(content) < 1:
-        return None
-    return int(content)
-
-
-def _completed_a_step(event: TrainGroupStepEndEvent) -> bool:
-    return any(outcome != "error" and TrainStepOutcome.NORMAL in outcome for outcome in event.cell_outcomes.values())
-
-
-def _carries_checksums(event: InferenceEngineWeightChecksumEvent) -> bool:
-    return any(checksums for checksums in event.engine_checksums)
-
-
 # ============================== fire witnesses ==============================
 
 
@@ -412,7 +377,7 @@ def assert_hook_fired(armed: ArmedFaultHook, *, event_dir: Path) -> FaultHookFir
         f"Fault hook witness failed: request {armed.request_id!r} fired against {fire.target}, not the "
         f"{armed.target.value} it was armed for"
     )
-    expected_outcome = _EXPECTED_OUTCOME_OF_TARGET[armed.target]
+    expected_outcome = EXPECTED_OUTCOME_OF_TARGET[armed.target]
     assert fire.outcome == expected_outcome.value, (
         f"Fault hook witness failed: request {armed.request_id!r} reached its point and answered {fire.outcome}, not "
         f"the {expected_outcome.value} a delivered {armed.target.value} fault records; a refusal, an unknown answer "
@@ -598,7 +563,7 @@ def assert_weights_published_after(event_dir: Path, *, after: datetime) -> None:
         for event in read_events(event_dir)
         if isinstance(event, InferenceEngineWeightChecksumEvent)
         and event.timestamp > after
-        and _carries_checksums(event)
+        and carries_checksums(event)
     ]
     assert published, (
         f"Progress witness failed: no non-empty weight publication reached an engine after {after.isoformat()}, so "

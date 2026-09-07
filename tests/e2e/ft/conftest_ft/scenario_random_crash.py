@@ -2,6 +2,7 @@
 # WARNING: Do NOT relax any assert logic in this file. All assertions must remain strict.
 
 
+import shlex
 from collections import Counter
 from pathlib import Path
 
@@ -16,6 +17,7 @@ from tests.e2e.ft.conftest_ft.cli_options import (
     TrainerCrashIntervalSecondsOption,
 )
 from tests.e2e.ft.conftest_ft.execution import (
+    P2P_FAULT_INJECTION_ARGS,
     get_api_server_args,
     get_common_train_args,
     get_ft_args,
@@ -38,6 +40,13 @@ from tests.e2e.ft.conftest_ft.fault_injection.fault_forms import (
     compute_mean_interval_seconds_of_cell_type,
     create_cell_fault_forms,
 )
+from tests.e2e.ft.conftest_ft.fault_injection.hook_forms import (
+    HookFaultContext,
+    HookFireCollector,
+    merge_hook_fault_forms,
+)
+from tests.e2e.ft.conftest_ft.fault_injection.recovery_source import CHECKPOINT_DIRNAME
+from tests.e2e.ft.conftest_ft.fault_injection.state import EventLog
 from tests.e2e.ft.conftest_ft.fault_injection.views import (
     compute_cells_not_serving_after_injection,
     compute_forms_drawn_without_success,
@@ -45,6 +54,7 @@ from tests.e2e.ft.conftest_ft.fault_injection.views import (
     compute_num_injections,
     compute_states_of_cell_name,
     compute_successful_form_names,
+    compute_unresolved_hook_harms,
 )
 from tests.e2e.ft.conftest_ft.modes import FTTestMode, resolve_mode
 
@@ -65,6 +75,8 @@ DEFAULT_SEED: int = 42
 DEFAULT_NUM_STEPS: int = 60
 DEFAULT_TRAINER_CRASH_INTERVAL_SECONDS: float = 120.0
 DEFAULT_ROLLOUT_CRASH_INTERVAL_SECONDS: float = 240.0
+
+HOOK_CHECKPOINT_SAVE_INTERVAL: int = 10
 
 
 @app.command(name="run")
@@ -104,6 +116,11 @@ def run_ci(
 
     prepare(ft_mode, config=config)
 
+    base_url = f"http://{config.create_backend().api_server_host(config)}:{API_SERVER_PORT}"
+    event_log = EventLog()
+    hook_context = compute_hook_fault_context(ft_mode, base_url=base_url, event_log=event_log, dump_dir=dump_dir)
+    print(f"Targeted fault hooks: {'enabled' if hook_context is not None else 'not reachable in this mode'}")
+
     debug_rollout_data_dir = None if ft_mode.has_real_rollout else materialize_cyclic_debug_rollout_data(num_steps)
     train_args = (
         get_common_train_args(
@@ -113,15 +130,23 @@ def run_ci(
         + get_weight_transfer_args(ft_mode)
         + get_fully_async_args(fully_async=fully_async)
         + get_api_server_args(config)
+        + get_hook_fault_args(hook_context, dump_dir=dump_dir)
         + "--mini-ft-controller-enable "
     )
 
-    base_url = f"http://{config.create_backend().api_server_host(config)}:{API_SERVER_PORT}"
+    cell_fault_forms = create_cell_fault_forms(base_url=base_url, config=config)
+    collect_hook_fires = None
+    if hook_context is not None:
+        cell_fault_forms = merge_hook_fault_forms(cell_fault_forms, hook_context)
+        collect_hook_fires = HookFireCollector(event_log=event_log, event_dir=hook_context.event_dir).collect
+
     injector = spawn_fault_injector(
         base_url=base_url,
         seed=seed,
         mean_interval_seconds_of_cell_type=mean_interval_seconds_of_cell_type,
-        cell_fault_forms=create_cell_fault_forms(base_url=base_url, config=config),
+        cell_fault_forms=cell_fault_forms,
+        collect_hook_fires=collect_hook_fires,
+        event_log=event_log,
     )
 
     try:
@@ -144,6 +169,39 @@ def run_ci(
     )
 
     print(f"Random failure soak test PASSED ({test_name}, mode={mode}, seed={seed}, steps={num_steps})")
+
+
+def compute_hook_fault_context(
+    ft_mode: FTTestMode, *, base_url: str, event_log: EventLog, dump_dir: str
+) -> HookFaultContext | None:
+    if not ft_mode.has_real_rollout or ft_mode.colocate:
+        return None
+    return HookFaultContext(
+        base_url=base_url,
+        event_log=event_log,
+        event_dir=Path(dump_dir) / EVENTS_DIRNAME,
+        checkpoint_dir=Path(dump_dir) / CHECKPOINT_DIRNAME,
+        tensor_parallel_size=compute_tensor_parallel_size(ft_mode),
+        ft_components=ft_mode.ft_components,
+    )
+
+
+def compute_tensor_parallel_size(ft_mode: FTTestMode) -> int:
+    tokens: list[str] = shlex.split(ft_mode.parallel_args)
+    size_of_flag: dict[str, str] = dict(zip(tokens, tokens[1:], strict=False))
+    return max(
+        int(size_of_flag.get("--tensor-model-parallel-size", 1)),
+        int(size_of_flag.get("--expert-tensor-parallel-size", 1)),
+    )
+
+
+def get_hook_fault_args(hook_context: HookFaultContext | None, *, dump_dir: str) -> str:
+    if hook_context is None:
+        return ""
+    return (
+        P2P_FAULT_INJECTION_ARGS
+        + f"--save {dump_dir}/{CHECKPOINT_DIRNAME} --save-interval {HOOK_CHECKPOINT_SAVE_INTERVAL} "
+    )
 
 
 def assert_mode_supports_fully_async(ft_mode: FTTestMode, *, mode: str) -> None:
@@ -176,6 +234,18 @@ def assert_healing(
         assert_rollout_cells_served_after_injection(injector)
 
     _assert_enabled_fault_forms_worked(injector, ft_components=ft_components)
+    assert_hook_harms_resolved(injector)
+
+
+def assert_hook_harms_resolved(injector: FaultInjectorHandle) -> None:
+    unresolved = compute_unresolved_hook_harms(injector.event_log.events)
+    assert not unresolved, (
+        f"Targeted fault hook witness failed: {len(unresolved)} armed hook(s) never ended in a delivered fault whose "
+        f"victim came back in service, so the run either lost the fault it armed, was answered something other than "
+        f"a delivery, or ended a replica short ({unresolved})"
+    )
+
+    print("Targeted fault hook witness passed: every armed hook fired and its victim recovered")
 
 
 def _assert_drawn_fault_forms_worked(injector: FaultInjectorHandle) -> None:

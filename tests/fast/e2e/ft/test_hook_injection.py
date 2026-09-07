@@ -810,7 +810,7 @@ class TestScenarioRecipe:
 
     def test_a_remote_request_expects_an_acceptance_and_a_local_one_a_fire(self):
         """The two actions are delivered by different processes and record different evidence of delivery."""
-        assert hook_injection._EXPECTED_OUTCOME_OF_TARGET == {
+        assert hook_injection.EXPECTED_OUTCOME_OF_TARGET == {
             FaultHookTarget.LOCAL: FaultHookOutcome.FIRED,
             FaultHookTarget.REMOTE_INFERENCE_CELL: FaultHookOutcome.ACCEPTED,
         }

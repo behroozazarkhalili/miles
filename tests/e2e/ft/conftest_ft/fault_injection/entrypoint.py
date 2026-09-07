@@ -29,14 +29,17 @@ class FaultInjectorHandle:
         cell_fault_forms: CellFaultForms,
         get_virtual_cells: Callable[[], list[dict]] | None = None,
         injection_enabled: Callable[[], bool] | None = None,
+        collect_hook_fires: Callable[[], None] | None = None,
+        event_log: EventLog | None = None,
         poll_interval_seconds: float = POLL_INTERVAL_SECONDS,
         unknown_injection_timeout_seconds: float = UNKNOWN_INJECTION_RESOLUTION_TIMEOUT_SECONDS,
     ) -> None:
-        self.event_log = EventLog()
+        self.event_log = event_log if event_log is not None else EventLog()
         self.cell_fault_forms = cell_fault_forms
         self._base_url = base_url
         self._cell_types: set[str] = set(mean_interval_seconds_of_cell_type)
         self._get_virtual_cells: Callable[[], list[dict]] | None = get_virtual_cells
+        self._collect_hook_fires: Callable[[], None] | None = collect_hook_fires
 
         def inject_until_stopped(stop_event: threading.Event) -> None:
             run_fault_injection_loop(
@@ -48,6 +51,7 @@ class FaultInjectorHandle:
                 cell_fault_forms=cell_fault_forms,
                 get_virtual_cells=get_virtual_cells,
                 injection_enabled=injection_enabled,
+                collect_hook_fires=collect_hook_fires,
                 poll_interval_seconds=poll_interval_seconds,
                 unknown_injection_timeout_seconds=unknown_injection_timeout_seconds,
             )
@@ -65,6 +69,8 @@ class FaultInjectorHandle:
                 f"stop: it may still crash a cell nothing will heal, and reading its log would race it"
             )
         )
+        if self._collect_hook_fires is not None:
+            self._collect_hook_fires()
         self._observe_final_snapshot()
 
     def _observe_final_snapshot(self) -> None:
@@ -84,6 +90,8 @@ def spawn_fault_injector(
     cell_fault_forms: CellFaultForms,
     get_virtual_cells: Callable[[], list[dict]] | None = None,
     injection_enabled: Callable[[], bool] | None = None,
+    collect_hook_fires: Callable[[], None] | None = None,
+    event_log: EventLog | None = None,
     poll_interval_seconds: float = POLL_INTERVAL_SECONDS,
     unknown_injection_timeout_seconds: float = UNKNOWN_INJECTION_RESOLUTION_TIMEOUT_SECONDS,
 ) -> FaultInjectorHandle:
@@ -94,6 +102,8 @@ def spawn_fault_injector(
         cell_fault_forms=cell_fault_forms,
         get_virtual_cells=get_virtual_cells,
         injection_enabled=injection_enabled,
+        collect_hook_fires=collect_hook_fires,
+        event_log=event_log,
         poll_interval_seconds=poll_interval_seconds,
         unknown_injection_timeout_seconds=unknown_injection_timeout_seconds,
     )

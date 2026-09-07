@@ -189,7 +189,7 @@ hf upload --repo-type dataset fzyzcjy/miles-test-rollout-Qwen3-30B-A3B-5layer \
 - **The identity rides with the weights**: `receiver_identity` comes back in the same metadata response as the session id and the weight buffers, so a reader cannot pair fresh weights with a stale identity. Miles verifies the identity's session and rank against the peer it is about to write to and fails that target otherwise; an engine running without the fault-control flag publishes no identity, transfers normally, and refuses a remote fault at the site rather than falling back to killing by name.
 - **The request and the answer are matched field by field**: the post carries `request_id`, the expected uuid, session and rank, and a mode the receiver actually implements. A 200 must answer `accepted` for the same request id, uuid, session and rank; a 409 naming an identity mismatch or an inactive receiver is the incarnation being gone, and its body may legitimately report the replacement's identity, so only the request id is matched there. A pending-action conflict, a payload conflict, any other status and a body that answers for another request are explicit failures, and a timeout or a disconnect is `unknown` — never a delivery and never a blind retry.
 - **Accepting is not firing**: the receiver signals itself after it answers, so the fire event records `accepted` for a remote fault and `fired` only for a local one. The scenario still has to see the victim lose the incarnation the write reached and come back under a replacement.
-- **`weight_update.after_base_weights` has no entry of its own**: it is a local-only point strictly later in the same update than `before_p2p_write`, so an entry there would crash a sender in the same shape `scenario_weight_update_p2p_local` already proves. It is wired and unit-tested so a soak can draw it.
+- **`weight_update.after_base_weights` has no entry of its own**: it is a local-only point strictly later in the same update than `before_p2p_write`, so an entry there would crash a sender in the same shape `scenario_weight_update_p2p_local` already proves. It is drawn by `scenario_random_crash`, whose hook forms sample the whole reachable set rather than pinning one point.
 - **A fire names the update it happened in**: `WeightUpdater.update_weights` opens a process-wide weight-update span, the fire event carries its version, and the trainer controller writes one `WeightUpdateAssignmentEvent` per sender before calling it. That pair is what lets a scenario say which engines the harmed sender owned, and it is what the p2p scenarios join their fire to as well.
 
 ### Fault Forms and Receivers
@@ -200,7 +200,12 @@ hf upload --repo-type dataset fzyzcjy/miles-test-rollout-Qwen3-30B-A3B-5layer \
 | ray | rollout | `inject_fault:sigkill` |
 | kubernetes | actor | those three kills, plus `delete_pod` |
 | kubernetes | rollout | `exec_sigkill`, `delete_pod` |
+| either | actor | plus `fault_hook:local`, when the soak can reach the hooks |
+| either | rollout | plus `fault_hook:remote_inference_cell`, when the soak can reach the hooks |
 
+- **A form can be unavailable rather than absent**: `BaseFaultForm.is_available` is asked about the cell that was drawn, and a kind whose every form says no defers that injection instead of forcing one. Only the hook forms ever say no, and only until the run has an assignment and a recovery source to arm against.
+- **Where the soak finds its sources**: `GET /api/v1/fault-hook-sources` answers with the trainer cells of the run whether or not `--ft-components` names `train`, while `GET /api/v1/cells` keeps listing only the cell types this deployment heals. A rollout-only soak can therefore draw `fault_hook:remote_inference_cell` against a live trainer generation, and the mini FT controller still sees no trainer to suspend or resume.
+- **A form can keep its own books**: `records_own_attempt` says the form writes what it did itself, so the loop does not record an `InjectionEvent` for it. Arming a hook is not harming a cell, and the one record the loop would write would claim it was.
 - **Each `FailureMode` is its own form**: pod deletion is a quarter of a kubernetes trainer injection, not half of it.
 - **The actor class decides what a kill means**, since an injection carries only a mode and a `sub_index`: `TrainRayActor` and `ServeActor` crash their own process, the only thing that costs torchft a member, while `CommandActor` SIGKILLs the isolated process group rooted at the engine subprocess. That includes the launch shell and every engine child it spawned, so a dead cell cannot leave an orphaned scheduler holding GPU memory while its replacement starts; the Ray actor observes the subprocess exit and reports the death as production sees it.
 - **Why an engine takes sigkill alone**: exiting and segfaulting are what a process does to itself from the inside, and no signal reproduces them from outside — SIGTERM is a clean shutdown, SIGSEGV is delivered rather than provoked. The other modes are refused, not approximated.
@@ -510,9 +515,11 @@ Architecture (external fault injection, not inside the training loop):
      e. Stop here unless EVERY enabled kind has recovered: every replica that kind has ever
         shown is present, its current (cell_id, workers_hash) is eligible, and at least one
         spare replica survives a kill
-     f. Draw a due kind, a cell of that kind and one of its fault forms - preferring a form
-        the log shows has never worked - apply it, record the attempt with the target's
-        workers_hash, then draw that kind's next injection time
+     f. Draw a due kind, a cell of that kind and one of its fault forms that is available for
+        that cell - preferring a form the log shows has never worked - apply it, record the
+        attempt with the target's workers_hash, then draw that kind's next injection time
+     g. Read the run's own FaultHookFireEvents back each poll and pair them to armed hooks by
+        request id, so an arm and its fire reduce to one outstanding harm rather than two
   3. inject_fault() runs on the actor's own ray concurrency group thread and kills the process,
      or the test layer deletes the pod on kubernetes
   4. The health checker notices by heartbeat timeout
@@ -535,9 +542,32 @@ Eligibility, per (cell_id, workers_hash), read off the observations alone:
                     paused for an offload, or the cell absent from the listing
   never inherits -> a new workers_hash starts with none
 
+Targeted fault hooks, whenever the mode has real disaggregated engines:
+  regime  -> the p2p weight transfer recipe plus --sglang-enable-p2p-fault-injection, and
+             --save <dump>/ckpt --save-interval 10 so a recovery source exists to arm against
+  forms   -> fault_hook:local among the actor forms when ft covers train, and
+             fault_hook:remote_inference_cell among the rollout forms when it covers rollout;
+             a remote hook is armed in a trainer and counted against the engine it harms
+  source  -> a trainer whose current workers_hash owns a non-empty WeightUpdateAssignmentEvent,
+             worker 0 of it, drawn from the same seeded rng. The trainers are listed for this
+             draw in their own bounded request, so a rollout-only soak - which never lists,
+             targets, schedules or counts trainer cells - can still arm one
+  point   -> uniformly among the hooks that source can be shown to reach: the two p2p write
+             hooks and after_base_weights always, before_all_gather only at TP/ETP > 1, and for
+             a remote request only the two the site names a single peer at
+  action  -> sigkill, delivered immediately (op29 adds the delay, op30 the hang)
+  state   -> armed (recorded before the request leaves) -> that request id fired and was
+             judged against the arm -> the victim it names back in service under another
+             generation. Every state but the last holds the run-wide harm slot
+
 Witnesses, counted per kind:
   forms   -> every form the enabled components make available succeeded at least once, so a
-             soak that clears the injection floors on one form still has to draw the others
+             soak that clears the injection floors on one form still has to draw the others;
+             a hook form only counts once its fire was judged a delivery and its victim came
+             back, so an arm the api server answered 200 to proves nothing on its own
+  hooks   -> no armed hook is left unresolved when the run ends: an arm whose fire never
+             arrived, whose fire answered stale/unknown/refused or named another point,
+             source or engine, or whose victim never served again, fails the run
   train   -> >= 2 accepted actor injections, >= 2 healed cells across the
              CellReconfigureEvents, and every injected cell index paired with a healing of
              that same index - no debt left when training ends
@@ -567,7 +597,22 @@ membership is asserted.
 - **Why the per-cell pairing**: a floor of ">= 2 healings" passes whenever the last crash never recovered. The default intervals are short enough that a soak reliably clears the floors.
 - **Why the step budget is 60**: a rollout injection waits for the previous victim to serve again under a new generation, plus a mean-240s exponential wait, so the second accepted rollout injection the witness demands takes well over ten minutes. The budget buys that time instead of lowering the gate that keeps the injector from killing a kind's last live replica.
 - **Why the rollout witness is one-sided**: the trainer witness reads the run's own CellReconfigureEvents, which miss nothing; the rollout witness reads sampled polls, which miss windows by construction. It therefore never demands seeing the down half of a recovery - it demands a Serving reading under a generation other than the one that was killed. Undercounting an intermediate recovery cannot fail the run; claiming one that never happened cannot pass it.
-- **Stopping the injector**: `stop_and_join` asserts the thread actually stopped, since a thread still mid-injection could crash a cell nothing will heal, and would race the witness being read.
+- **Why the soak arms hooks at all**: the wall-clock forms decide *when* a fault lands and never *where*, so the phases of a weight update they interrupt are whatever the schedule happened to hit. The hook forms put the same soak's faults at named points inside the update, at the cost of one extra draw per kind rather than a second scenario.
+- **Why an arm is recorded before the request is sent**: a 500 or a timeout does not mean nothing was armed — the worker may have taken the request and lost the reply. The record is written first and the responsibility is held from then on, so an arm whose answer never came still blocks the next fault and still fails the run if it never fires. Nothing is re-armed blindly.
+- **Why the arm and the fire are one outstanding harm, not two**: they are the same fault, joined by a request id the injector minted. `compute_hook_harms` folds the arm record, the fire read back from the run's events and the later observations into one entry, so the eligibility gate sees one debt and the witnesses read one outcome.
+- **Why the fire is read from the event dir rather than the log**: the fault fires in a trainer worker, possibly on another node, and often kills that worker; `EventLogger` writes one line per event and closes, so the record survives. Arms and fires also interleave across workers, so the pairing is by request id and never by which line appeared first.
+- **Why a fire is judged rather than counted**: `reach_fault_hook` records the point it reached, the identity it reached it in, the update it happened in and what the delivery answered. A fire naming another hook, another mode, another target, another process identity, no weight version, or — for a remote request — an engine the assignment never gave this sender or a receiver identity it never carried, is rejected. A rejected fire does not clear the arm, so the run fails rather than counting it.
+- **Why the update's own sender has to be the armed generation**: a process identity repeats every generation — the same cell index and rank come back with the replacement — so identity alone cannot say which incarnation fired. The fire is joined to the one `WeightUpdateAssignmentEvent` of its version and the armed cell, and that assignment's `trainer_workers_hash` and cell index have to be the ones the arm was taken against. The arm is sent to a cell endpoint, so a replacement appearing between the listing that chose the source and the request itself would be armed under the old cell's name; this is what stops such a fire from being counted, and the arm then stays outstanding until the run fails on it. Nothing is retried, and no replacement that appeared for its own reasons can pay off an arm whose fire was rejected, because a rejected fire names no victim at all.
+- **Why `accepted` and `fired` are the only deliveries**: a local fault runs in the process that reached the point, so it records `fired`; a remote one is delivered by the receiver, which answers before signalling itself, so it records `accepted`. Every other answer counts as no delivery, and none of them is retried.
+- **Why a request can end without harming anything, and what that is worth**: two answers prove a request cost the run nothing. An arming request the api server refused with its own 400, 404 or 422 refusal body never reached a worker, because every one of those is raised before the arm is passed on; a remote fire answered `stale_target` reached the receiver of the very engine the update assigned this sender, at the identity the arm was taken against, and was refused there. Both release the run-wide slot the arm holds, and neither counts as a successful injection, a recovery or a publication: the form still owes a real delivery. Every other answer keeps the request outstanding — a 500, a timeout or a broken connection may have armed a worker that will fire later, and `refused`, `not_scheduled` and `errored` are exceptions inside the sender that can still reach the p2p write and retire a cell. The 900s unknown-outcome deadline still fails a run whose request never resolves.
+- **Why a stale fire has to pass the same checks as a delivered one**: `stale_target` alone only says some receiver refused something. The identity of the fire — its hook, mode, target, delay, the process it fired in, the weight version, the one assignment that version gave the armed generation, the assigned engine at the assigned `workers_hash`, and the receiver's own boot uuid, session and rank — is checked exactly as it is for a delivery, and only then is the request released.
+- **Why conflicting terminal evidence fails the run**: acknowledgement and pre-arm refusal cannot both describe one request, nor can pre-arm refusal and delivery or harmless refusal and delivery. The check is independent of event order. The collector therefore keeps reading fires for resolved requests, remembers each raw fire it has already read, ignores only an exact repeat, and rejects different fire contents for the same request.
+- **Why the source is a trainer with a live assignment, not any trainer**: the write hooks are only reached by a sender, and `WeightUpdateAssignmentEvent` is the run's own record of which trainer generation was given targets. Matching it against the cell's current `workers_hash` also rules out arming a replacement against its predecessor's assignment. `before_all_gather` additionally needs TP or ETP above one, since below it the branch holding the hook is skipped.
+- **Why worker 0**: `miles/ray/specs/train.py` passes `worker_in_cell_index` as the actor's `rank`, and `train_actor.py` uses that same rank for `RANK` and for `TrainProcessIdentity.rank_within_cell`, so `sub_index` 0 is the cell's distributed rank 0. `get_data_replica_rank_and_size` orders data-replica columns by their smallest global rank, so rank 0's gathered rank is 0, and `plan_p2p` gives source rank 0 the first target whenever the target list is non-empty. It is worker 0 because that is what the code does today, not because leaders are conventionally index 0; changing either mapping has to change this draw.
+- **Why the remote form is a rollout form armed in a trainer**: the fault is delivered to an engine, so the engine's kind is what owes the recovery and what the rollout floors count. The trainer is only the trigger — a remote request does not harm it, and its cell name is never allowed to stand in for the victim. The injector lists only the kinds it crashes, so the trigger is found by a separate five-second listing of `actor` cells rather than by widening the poll: a trainer that no fault targets must not join the schedules, the spare counting or the trainer healing witness, and none of those read that listing.
+- **Why the victim of a remote hook is not chosen at draw time**: the request names no cell. The site names one, from the peer it actually connected to, and the fire carries that cell id, that `workers_hash` and the receiver's own boot uuid, session and rank. A candidate picked while sampling would be a guess that a later unrelated replacement could make look true.
+- **Why the soak saves checkpoints only when hooks are enabled**: the readiness gate the targeted scenarios use is reused whole — a completed training step, a checkpoint tracker naming an iteration, and a non-empty publication — so arming cannot take out the only source a replacement heals from. The interval is wide because the soak is 60 steps and only needs the tracker to exist.
+- **Stopping the injector**: `stop_and_join` asserts the thread actually stopped, since a thread still mid-injection could crash a cell nothing will heal, and would race the witness being read. It then reads the fire events and the cell listing one last time, in that order, so a fault that fired just before the stop still gets its victim's final reading.
 
 ### `scenario_realistic_gsm8k`
 

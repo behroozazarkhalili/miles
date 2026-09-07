@@ -34,6 +34,13 @@ class BaseFaultForm(abc.ABC):
     def harms_cell(self) -> bool:
         return True
 
+    @property
+    def records_own_attempt(self) -> bool:
+        return False
+
+    def is_available(self, cell: dict) -> bool:
+        return True
+
     @abc.abstractmethod
     def inject(self, cell: dict, rng: random.Random) -> None: ...
 

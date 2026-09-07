@@ -3,7 +3,7 @@ import random
 from collections.abc import Callable, Iterator
 from unittest.mock import MagicMock, patch
 
-from tests.e2e.ft.conftest_ft.fault_injection import core, fault_forms, state
+from tests.e2e.ft.conftest_ft.fault_injection import core, fault_forms, hook_forms, state
 
 from miles.ray.train.cell_monitor import compute_cell_status
 from miles.ray.train.cell_state import CellState, StateAllocatedAlive, StateAllocatedUninitialized
@@ -27,7 +27,11 @@ def patched_requests() -> Iterator[MagicMock]:
     # the loop lists cells through core and injects through fault_forms, so a mock on core alone
     # leaves every injection reaching the real network and timing out against a host nobody serves
     mock_requests = MagicMock()
-    with patch.object(core, "requests", mock_requests), patch.object(fault_forms, "requests", mock_requests):
+    with (
+        patch.object(core, "requests", mock_requests),
+        patch.object(fault_forms, "requests", mock_requests),
+        patch.object(hook_forms, "requests", mock_requests),
+    ):
         yield mock_requests
 
 
@@ -190,13 +194,29 @@ def api_server_fault_forms() -> fault_forms.CellFaultForms:
 
 
 class StubFaultForm(fault_forms.BaseFaultForm):
-    def __init__(self, form_name: str, on_inject: Callable[[dict, random.Random], None]) -> None:
+    def __init__(
+        self,
+        form_name: str,
+        on_inject: Callable[[dict, random.Random], None],
+        *,
+        available: bool = True,
+        records_own_attempt: bool = False,
+    ) -> None:
         self._name = form_name
         self._on_inject = on_inject
+        self._available = available
+        self._records_own_attempt = records_own_attempt
 
     @property
     def name(self) -> str:
         return self._name
+
+    @property
+    def records_own_attempt(self) -> bool:
+        return self._records_own_attempt
+
+    def is_available(self, cell: dict) -> bool:
+        return self._available
 
     def inject(self, cell: dict, rng: random.Random) -> None:
         self._on_inject(cell, rng)

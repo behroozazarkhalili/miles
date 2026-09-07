@@ -2,13 +2,15 @@ from pathlib import Path
 
 import pytest
 from tests.e2e.ft.conftest_ft import scenario_random_crash
-from tests.e2e.ft.conftest_ft.fault_injection import entrypoint, fault_forms, state
+from tests.e2e.ft.conftest_ft.fault_injection import entrypoint, fault_forms, hook_forms, state
+from tests.e2e.ft.conftest_ft.modes import resolve_mode
 from tests.e2e.ft.conftest_ft.scenario_random_crash import _assert_drawn_fault_forms_worked, assert_healing
 
 from miles.utils.audit_utils.event_logger.logger import EventLogger
 from miles.utils.audit_utils.event_logger.models import CellReconfigureEvent
 from miles.utils.audit_utils.process_identity import SimpleProcessIdentity
 from miles.utils.external_utils import command_utils
+from miles.utils.test_utils.fault_hooks import FaultHookName, FaultHookTarget
 from miles.utils.test_utils.fault_injector import FailureMode
 from miles.utils.workers.types import ClusterBackend
 
@@ -368,3 +370,73 @@ class TestTheSoakLaunchCommand:
         )
 
         assert "--update-weight-transfer-mode" not in train_args
+
+
+class TestHookFaultWiring:
+    def test_a_mode_with_real_disaggregated_engines_arms_hooks(self, tmp_path: Path) -> None:
+        """The hooks live inside a p2p weight update, so the soak arms them wherever one runs."""
+        context = scenario_random_crash.compute_hook_fault_context(
+            resolve_mode("kill_train_rollout__dp2_cp2"),
+            base_url="http://control",
+            event_log=state.EventLog(),
+            dump_dir=str(tmp_path),
+        )
+
+        assert context is not None and context.ft_components == ("train", "rollout")
+        assert context.tensor_parallel_size == 1
+
+    def test_a_mode_without_real_engines_arms_none(self, tmp_path: Path) -> None:
+        """Recorded rollout data runs no p2p update, so no hook could be reached."""
+        context = scenario_random_crash.compute_hook_fault_context(
+            resolve_mode("kill_train__dp2_cp2_tp2_ep2__fake_rollout__moe_5layer"),
+            base_url="http://control",
+            event_log=state.EventLog(),
+            dump_dir=str(tmp_path),
+        )
+
+        assert context is None
+
+    def test_the_tensor_parallel_size_the_all_gather_hook_needs_is_read_off_the_mode(self, tmp_path: Path) -> None:
+        """Only a mode that really shards over TP may draw the all-gather hook."""
+        context = scenario_random_crash.compute_hook_fault_context(
+            resolve_mode("kill_train_rollout__dp2_tp2"),
+            base_url="http://control",
+            event_log=state.EventLog(),
+            dump_dir=str(tmp_path),
+        )
+
+        assert context is not None and context.tensor_parallel_size == 2
+
+    def test_arming_hooks_turns_on_the_flags_the_hooks_need(self, tmp_path: Path) -> None:
+        """A remote fault needs the receiver's fault control, and arming needs a recovery source."""
+        context = scenario_random_crash.compute_hook_fault_context(
+            resolve_mode("kill_train_rollout__dp2_cp2"),
+            base_url="http://control",
+            event_log=state.EventLog(),
+            dump_dir=str(tmp_path),
+        )
+        args = scenario_random_crash.get_hook_fault_args(context, dump_dir=str(tmp_path))
+
+        assert "--sglang-enable-p2p-fault-injection " in args
+        assert f"--save {tmp_path}/ckpt " in args and "--save-interval " in args
+        assert scenario_random_crash.get_hook_fault_args(None, dump_dir=str(tmp_path)) == ""
+
+    def test_a_soak_that_armed_a_hook_nothing_fired_fails(self, tmp_path: Path) -> None:
+        """An arm the api server accepted proves nothing until production reaches the point."""
+        injector = _injector(cell_types=("rollout",))
+        injector.event_log.note_hook_arm(
+            request_id="soak-req-1",
+            form_name=hook_forms.REMOTE_HOOK_FORM_NAME,
+            cell_type="rollout",
+            source_cell_name=_ACTOR_CELL_NAME,
+            source_workers_hash="generation-0",
+            source_cell_index=0,
+            source_rank_within_cell=0,
+            hook=FaultHookName.WEIGHT_UPDATE_AFTER_P2P_SUBMIT.value,
+            mode=FailureMode.SIGKILL.value,
+            target=FaultHookTarget.REMOTE_INFERENCE_CELL.value,
+            acknowledged=True,
+        )
+
+        with pytest.raises(AssertionError, match="Targeted fault hook witness failed"):
+            scenario_random_crash.assert_hook_harms_resolved(injector)

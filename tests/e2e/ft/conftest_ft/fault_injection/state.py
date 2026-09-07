@@ -112,7 +112,45 @@ class ObservationsEvent(BaseEvent):
     cell_infos: dict[str, CellInfo]
 
 
-Event = InjectionEvent | ObservationsEvent
+class HookArmEvent(BaseEvent):
+    request_id: str
+    form_name: str
+    cell_type: str
+    source_cell_name: str
+    source_workers_hash: str
+    source_cell_index: int
+    source_rank_within_cell: int
+    hook: str
+    mode: str
+    target: str
+    acknowledged: bool
+
+
+class HookArmRefusedEvent(BaseEvent):
+    request_id: str
+    refused_because: str
+
+
+class HookFireEvent(BaseEvent):
+    request_id: str
+    hook: str
+    mode: str
+    target: str
+    outcome: str
+    weight_version: int | None
+    source_cell_index: int | None
+    source_rank_within_cell: int | None
+    victim_cell_name: str | None
+    victim_workers_hash: str | None
+    victim_receiver_boot_uuid: str | None
+    victim_session_id: str | None
+    victim_receiver_rank: int | None
+    delivered: bool
+    rejected_because: str | None
+    harmless_because: str | None
+
+
+Event = InjectionEvent | ObservationsEvent | HookArmEvent | HookArmRefusedEvent | HookFireEvent
 
 
 class EventLog:
@@ -139,6 +177,43 @@ class EventLog:
                 workers_hash=workers_hash,
             )
         )
+
+    def note_hook_arm(
+        self,
+        *,
+        request_id: str,
+        form_name: str,
+        cell_type: str,
+        source_cell_name: str,
+        source_workers_hash: str,
+        source_cell_index: int,
+        source_rank_within_cell: int,
+        hook: str,
+        mode: str,
+        target: str,
+        acknowledged: bool,
+    ) -> None:
+        self._append(
+            HookArmEvent(
+                request_id=request_id,
+                form_name=form_name,
+                cell_type=cell_type,
+                source_cell_name=source_cell_name,
+                source_workers_hash=source_workers_hash,
+                source_cell_index=source_cell_index,
+                source_rank_within_cell=source_rank_within_cell,
+                hook=hook,
+                mode=mode,
+                target=target,
+                acknowledged=acknowledged,
+            )
+        )
+
+    def note_hook_arm_refusal(self, *, request_id: str, refused_because: str) -> None:
+        self._append(HookArmRefusedEvent(request_id=request_id, refused_because=refused_because))
+
+    def note_hook_fire(self, event: HookFireEvent) -> None:
+        self._append(event)
 
     def observe(self, cells: list[dict]) -> None:
         self._append(ObservationsEvent(cell_infos={c["metadata"]["name"]: compute_cell_info(c) for c in cells}))

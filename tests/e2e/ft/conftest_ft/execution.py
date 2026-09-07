@@ -168,6 +168,8 @@ P2P_WEIGHT_TRANSFER_ARGS: str = (
     "--update-weight-transfer-mode p2p --sglang-remote-instance-weight-loader-start-seed-via-transfer-engine "
 )
 
+P2P_FAULT_INJECTION_ARGS: str = "--sglang-enable-p2p-fault-injection "
+
 
 def get_weight_transfer_args(mode: FTTestMode) -> str:
     if not mode.has_real_rollout:

@@ -22,6 +22,7 @@ logger = logging.getLogger(__name__)
 
 POLL_INTERVAL_SECONDS: float = 2.0
 UNKNOWN_INJECTION_RESOLUTION_TIMEOUT_SECONDS: float = 900.0
+LIST_TIMEOUT_SECONDS: float = 5.0
 
 
 class UnresolvedInjectionError(RuntimeError):
@@ -42,6 +43,7 @@ def run_fault_injection_loop(
     cell_fault_forms: CellFaultForms,
     get_virtual_cells: Callable[[], list[dict]] | None = None,
     injection_enabled: Callable[[], bool] | None = None,
+    collect_hook_fires: Callable[[], None] | None = None,
     poll_interval_seconds: float = POLL_INTERVAL_SECONDS,
     unknown_injection_timeout_seconds: float = UNKNOWN_INJECTION_RESOLUTION_TIMEOUT_SECONDS,
 ) -> None:
@@ -64,6 +66,8 @@ def run_fault_injection_loop(
 
         # Record every poll so the post-run witnesses see the same stream the injector saw.
         event_log.observe(cells)
+        if collect_hook_fires is not None:
+            collect_hook_fires()
 
         if stop_event.is_set():
             break
@@ -112,29 +116,34 @@ def run_fault_injection_loop(
         target = rng.choice(cells_of_type[cell_type])
         cell_name = target["metadata"]["name"]
         workers_hash = cell_workers_hash(target)
-        form = _draw_form(cell_fault_forms[cell_type], events=events, cell_type=cell_type, rng=rng)
+        form = _draw_form(cell_fault_forms[cell_type], events=events, cell=target, cell_type=cell_type, rng=rng)
+        if form is None:
+            logger.info("Deferring injection: no fault form of %s can be applied to %s yet", cell_type, cell_name)
+            continue
         if injection_enabled is not None and not injection_enabled():
             continue
         try:
             form.inject(target, rng)
         except Exception:
-            event_log.note_injection_attempt(
-                cell_name=cell_name,
-                form_name=form.name,
-                succeeded=False,
-                harmed=form.harms_cell,
-                workers_hash=workers_hash,
-            )
+            if not form.records_own_attempt:
+                event_log.note_injection_attempt(
+                    cell_name=cell_name,
+                    form_name=form.name,
+                    succeeded=False,
+                    harmed=form.harms_cell,
+                    workers_hash=workers_hash,
+                )
             logger.info("Failed to inject fault %s into %s", form.name, cell_name, exc_info=True)
             continue
 
-        event_log.note_injection_attempt(
-            cell_name=cell_name,
-            form_name=form.name,
-            succeeded=True,
-            harmed=form.harms_cell,
-            workers_hash=workers_hash,
-        )
+        if not form.records_own_attempt:
+            event_log.note_injection_attempt(
+                cell_name=cell_name,
+                form_name=form.name,
+                succeeded=True,
+                harmed=form.harms_cell,
+                workers_hash=workers_hash,
+            )
         next_injection_time_of_cell_type[cell_type] = _compute_next_injection_time(
             rng, mean_interval_seconds_of_cell_type[cell_type]
         )
@@ -167,18 +176,33 @@ def _cell_is_eligible(cell: dict, *, eligible: set[tuple[str, str]]) -> bool:
 
 
 def _draw_form(
-    forms: list[BaseFaultForm], *, events: list[Event], cell_type: str, rng: random.Random
-) -> BaseFaultForm:
+    forms: list[BaseFaultForm], *, events: list[Event], cell: dict, cell_type: str, rng: random.Random
+) -> BaseFaultForm | None:
+    available = [form for form in forms if form.is_available(cell)]
+    if not available:
+        return None
+
     worked = compute_successful_form_names(events, cell_type=cell_type)
-    unproven = [form for form in forms if form.name not in worked]
-    return rng.choice(unproven or forms)
+    unproven = [form for form in available if form.name not in worked]
+    return rng.choice(unproven or available)
 
 
 def list_cells(*, base_url: str, cell_types: set[str]) -> list[dict] | None:
+    items = _list_items(base_url=base_url, path="/api/v1/cells", description="cells")
+    if items is None:
+        return None
+    return [c for c in items if cell_type_of(c) in cell_types]
+
+
+def list_fault_hook_sources(*, base_url: str) -> list[dict] | None:
+    return _list_items(base_url=base_url, path="/api/v1/fault-hook-sources", description="fault hook sources")
+
+
+def _list_items(*, base_url: str, path: str, description: str) -> list[dict] | None:
     try:
-        resp = requests.get(f"{base_url}/api/v1/cells", timeout=5)
+        resp = requests.get(f"{base_url}{path}", timeout=LIST_TIMEOUT_SECONDS)
         resp.raise_for_status()
-        return [c for c in resp.json()["items"] if cell_type_of(c) in cell_types]
+        return resp.json()["items"]
     except Exception:
-        logger.info("Failed to list cells from api server", exc_info=True)
+        logger.info("Failed to list %s from api server", description, exc_info=True)
         return None

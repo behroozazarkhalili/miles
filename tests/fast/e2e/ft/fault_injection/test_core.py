@@ -649,6 +649,34 @@ class TestTargetSelection:
         assert injected
 
 
+class TestListingTheApiServer:
+    def test_the_managed_cells_and_the_hook_sources_are_two_lists(self) -> None:
+        """The soak heals only what /cells names, and arms only what the source endpoint names."""
+        asked: list[str] = []
+
+        def fake_get(url: str, timeout: float) -> MagicMock:
+            asked.append(url)
+            if url.endswith("/api/v1/fault-hook-sources"):
+                return mock_response({"items": [typed_cell("actor-0", "actor")]})
+            return mock_response({"items": [typed_cell("rollout-engine-0", "rollout")]})
+
+        with patched_requests() as mock_requests:
+            mock_requests.get.side_effect = fake_get
+            managed = core.list_cells(base_url="http://control", cell_types={"actor", "rollout"})
+            sources = core.list_fault_hook_sources(base_url="http://control")
+
+        assert asked == ["http://control/api/v1/cells", "http://control/api/v1/fault-hook-sources"]
+        assert [item["metadata"]["name"] for item in managed] == ["rollout-engine-0"]
+        assert [item["metadata"]["name"] for item in sources] == ["actor-0"]
+
+    def test_an_api_server_that_cannot_be_reached_yields_no_sources(self) -> None:
+        """A poll that failed is not the same as a run with no trainer, and neither may raise out of the loop."""
+        with patched_requests() as mock_requests:
+            mock_requests.get.side_effect = RuntimeError("api server unreachable")
+
+            assert core.list_fault_hook_sources(base_url="http://control") is None
+
+
 class TestFaultInjectionLoopErrorHandling:
     def test_list_cells_failure_is_retried_and_does_not_stop_the_loop(self) -> None:
         """A transient api-server outage must cost one poll, not the rest of the soak."""
@@ -932,3 +960,85 @@ class TestRaiseIfAnUnknownInjectionIsStuck:
         )
 
         core._raise_if_an_unknown_injection_is_stuck([entry], timeout_seconds=600.0)
+
+
+class TestFormAvailabilityAndSelfRecording:
+    def test_a_kind_whose_every_form_is_unavailable_injects_nothing(self) -> None:
+        """A hook form that has no source to arm yet defers the injection instead of forcing one."""
+        drawn: list[str] = []
+        stop_event = threading.Event()
+        polls = {"n": 0}
+
+        def fake_get(url: str, timeout: float) -> MagicMock:
+            polls["n"] += 1
+            if polls["n"] >= 6:
+                stop_event.set()
+            return mock_response({"items": [typed_cell(f"actor-{i}", "actor") for i in range(3)]})
+
+        log = state.EventLog()
+        _run_injection_loop(
+            fake_get=fake_get,
+            event_log=log,
+            cell_fault_forms=fixed_fault_forms(
+                [StubFaultForm("never_ready", lambda cell, rng: drawn.append("never_ready"), available=False)]
+            ),
+            stop_event=stop_event,
+        )
+
+        assert drawn == []
+        assert views.compute_num_injections(log.events) == 0
+
+    def test_the_loop_keeps_no_books_for_a_form_that_keeps_its_own(self) -> None:
+        """Arming a hook is not harming the cell the request was sent to, so the loop records nothing."""
+        drawn: list[str] = []
+        stop_event = threading.Event()
+        polls = {"n": 0}
+
+        def fake_get(url: str, timeout: float) -> MagicMock:
+            polls["n"] += 1
+            if len(drawn) >= 1 or polls["n"] >= 50:
+                stop_event.set()
+            return mock_response({"items": [typed_cell(f"actor-{i}", "actor") for i in range(3)]})
+
+        log = state.EventLog()
+        _run_injection_loop(
+            fake_get=fake_get,
+            event_log=log,
+            cell_fault_forms=fixed_fault_forms(
+                [
+                    StubFaultForm(
+                        "fault_hook:local",
+                        lambda cell, rng: drawn.append("fault_hook:local"),
+                        records_own_attempt=True,
+                    )
+                ]
+            ),
+            stop_event=stop_event,
+        )
+
+        assert drawn
+        assert not [event for event in log.events if isinstance(event, state.InjectionEvent)]
+
+    def test_a_form_that_keeps_its_own_books_records_nothing_when_it_raises(self) -> None:
+        """A failed arm owes its own record; the loop must not invent a harmed cell for it."""
+        stop_event = threading.Event()
+        polls = {"n": 0}
+
+        def fake_get(url: str, timeout: float) -> MagicMock:
+            polls["n"] += 1
+            if polls["n"] >= 4:
+                stop_event.set()
+            return mock_response({"items": [typed_cell(f"actor-{i}", "actor") for i in range(3)]})
+
+        def _raise(cell: dict, rng: random.Random) -> None:
+            raise RuntimeError("the api server never answered")
+
+        log = state.EventLog()
+        _run_injection_loop(
+            fake_get=fake_get,
+            event_log=log,
+            cell_fault_forms=fixed_fault_forms([StubFaultForm("fault_hook:local", _raise, records_own_attempt=True)]),
+            stop_event=stop_event,
+        )
+
+        assert not [event for event in log.events if isinstance(event, state.InjectionEvent)]
