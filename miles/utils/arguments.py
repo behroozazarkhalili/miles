@@ -652,6 +652,18 @@ def get_miles_extra_args_provider(add_custom_arguments=None):
                 ),
             )
             parser.add_argument(
+                "--partition-radix-cache-by-rollout-call",
+                action=argparse.BooleanOptionalAction,
+                help=(
+                    "Whether every generation request carries a radix cache key naming the rollout call "
+                    "the sample started under, so prefix KV computed under old weights cannot serve "
+                    "samples of a later call. Defaults to true when --fully-async is combined with "
+                    "--pause-generation-mode in_place, where the engine never flushes the cache and the "
+                    "staleness of a shared prompt is otherwise unbounded; an explicit "
+                    "--no-partition-radix-cache-by-rollout-call is respected."
+                ),
+            )
+            parser.add_argument(
                 "--rollout-temperature",
                 type=float,
                 default=1.0,
@@ -3890,6 +3902,16 @@ def miles_validate_args(args):
             f"--n-samples-per-prompt ({args.n_samples_per_prompt}): the worker submits whole groups, "
             f"so one group already puts n_samples_per_prompt trajectories in flight"
         )
+
+    if args.partition_radix_cache_by_rollout_call is None:
+        args.partition_radix_cache_by_rollout_call = args.fully_async and args.pause_generation_mode == "in_place"
+        if args.partition_radix_cache_by_rollout_call:
+            logger.info(
+                "--fully-async with --pause-generation-mode in_place never flushes the engine cache: "
+                "defaulting to --partition-radix-cache-by-rollout-call so prefix KV computed under old "
+                "weights cannot serve a later rollout call. Pass "
+                "--no-partition-radix-cache-by-rollout-call to keep one shared cache."
+            )
 
     _resolve_rollout_functions(args)
 

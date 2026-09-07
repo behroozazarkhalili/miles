@@ -514,6 +514,7 @@ def test_fully_async_rejects_abort_pause_mode():
         colocate=False,
         partial_rollout=False,
         pause_generation_mode="abort",
+        partition_radix_cache_by_rollout_call=False,
         recompute_logprobs_via_prefill=False,
         rollout_all_samples_process_path=None,
         eval_num_gpus=0,
@@ -1695,6 +1696,64 @@ class TestSessionServerPauseGenerationMode:
 
         warned = any("R3 payloads can become very large" in record.message for record in caplog.records)
         assert warned is expect_warning
+
+
+class TestPartitionRadixCacheByRolloutCallResolution:
+    def _parse(self, extra):
+        parser = argparse.ArgumentParser()
+        get_miles_extra_args_provider()(parser)
+        return parser.parse_args(extra + ["--num-rollout", "1"] + REQUIRED_ARGS)
+
+    def test_it_is_unset_before_validation(self):
+        """The flag is tri-state, so parsing alone must not decide it."""
+        assert self._parse([]).partition_radix_cache_by_rollout_call is None
+
+    def test_fully_async_with_in_place_pausing_turns_it_on(self, caplog):
+        """in_place never flushes the cache, so the fully async producer gets the partition by default."""
+        args = self._parse(["--fully-async", "--pause-generation-mode", "in_place"])
+
+        with caplog.at_level(logging.INFO, logger="miles.utils.arguments"):
+            miles_validate_args(args)
+
+        assert args.partition_radix_cache_by_rollout_call is True
+        assert any("--partition-radix-cache-by-rollout-call" in record.message for record in caplog.records)
+
+    @pytest.mark.parametrize(
+        argnames="extra",
+        argvalues=[
+            [],
+            ["--pause-generation-mode", "in_place"],
+            ["--fully-async"],
+            ["--fully-async", "--pause-generation-mode", "retract"],
+        ],
+    )
+    def test_every_other_configuration_leaves_it_off(self, caplog, extra):
+        """Existing runs keep one shared radix cache, so nothing changes for them."""
+        args = self._parse(extra)
+
+        with caplog.at_level(logging.INFO, logger="miles.utils.arguments"):
+            miles_validate_args(args)
+
+        assert args.partition_radix_cache_by_rollout_call is False
+        assert not any("--partition-radix-cache-by-rollout-call" in record.message for record in caplog.records)
+
+    def test_an_explicit_yes_is_respected_outside_the_default_configuration(self):
+        """A run that asks for the partition gets it even without fully async in_place pausing."""
+        args = self._parse(["--partition-radix-cache-by-rollout-call"])
+
+        miles_validate_args(args)
+
+        assert args.partition_radix_cache_by_rollout_call is True
+
+    def test_an_explicit_no_is_respected_inside_the_default_configuration(self):
+        """The default is only a default: fully async in_place can still opt out."""
+        args = self._parse(
+            ["--fully-async", "--pause-generation-mode", "in_place", "--no-partition-radix-cache-by-rollout-call"]
+        )
+
+        miles_validate_args(args)
+
+        assert args.partition_radix_cache_by_rollout_call is False
 
 
 class TestTitoFixedTemplateConfiguration:
