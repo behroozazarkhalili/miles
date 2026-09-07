@@ -7,6 +7,7 @@ from types import ModuleType
 import pytest
 
 _TENSOR_STAGING_MODULE = "miles.backends.training_utils.weight_update.protocols.tensor_staging"
+_P2P_TRANSFER_UTILS_MODULE = "miles.backends.training_utils.weight_update.protocols.p2p_transfer_utils"
 
 
 @contextmanager
@@ -52,3 +53,14 @@ def stubbed_missing_external_sdks(module_attributes: dict[str, dict[str, object]
 def tensor_staging() -> ModuleType:
     with stubbed_missing_external_sdks({"sglang.srt.model_loader.parameter_mapper": {"ParameterMapper": object}}):
         return importlib.import_module(_TENSOR_STAGING_MODULE)
+
+
+@pytest.fixture(scope="module")
+def p2p_transfer_utils() -> ModuleType:
+    with stubbed_missing_external_sdks(
+        {
+            "mooncake.engine": {"TransferEngine": object},
+            "sglang.srt.server_args": {"ServerArgs": object},
+        }
+    ):
+        return importlib.import_module(_P2P_TRANSFER_UTILS_MODULE)
