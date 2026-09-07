@@ -31,8 +31,8 @@ def _remote_weight_info(utils, session_id: str, base_address: int, names: list[s
     )
 
 
-def _cell_updater(module, manager, engine, *, engine_ind: int, peers: dict[int, object]):
-    updater = module._P2PInferenceCellUpdater(engine_ind=engine_ind, transfer_engine=engine, transfer_manager=manager)
+def _cell_updater(module, manager, engine, *, cell_id: str, peers: dict[int, object]):
+    updater = module._P2PInferenceCellUpdater(cell_id=cell_id, transfer_engine=engine, transfer_manager=manager)
     for engine_rank, remote_weight_info in peers.items():
         updater.add_peer(engine_rank=engine_rank, remote_weight_info=remote_weight_info)
     return updater
@@ -55,14 +55,14 @@ class TestPeerRouting:
             p2p_inference_cell_updater,
             manager,
             engine,
-            engine_ind=0,
+            cell_id="cell-0",
             peers={0: _remote_weight_info(p2p_transfer_utils, "cell-0-rank-0", 0xA000)},
         )
         second = _cell_updater(
             p2p_inference_cell_updater,
             manager,
             engine,
-            engine_ind=1,
+            cell_id="cell-1",
             peers={0: _remote_weight_info(p2p_transfer_utils, "cell-1-rank-0", 0xB000)},
         )
 
@@ -84,7 +84,7 @@ class TestPeerRouting:
             p2p_inference_cell_updater,
             manager,
             engine,
-            engine_ind=0,
+            cell_id="cell-0",
             peers={
                 0: _remote_weight_info(p2p_transfer_utils, "cell-0-rank-0", 0xA000),
                 1: _remote_weight_info(p2p_transfer_utils, "cell-0-rank-1", 0xC000),
@@ -106,14 +106,14 @@ class TestPeerRouting:
             p2p_inference_cell_updater,
             manager,
             engine,
-            engine_ind=0,
+            cell_id="cell-0",
             peers={0: _remote_weight_info(p2p_transfer_utils, "cell-0-rank-0", 0xA000)},
         )
         second = _cell_updater(
             p2p_inference_cell_updater,
             manager,
             engine,
-            engine_ind=1,
+            cell_id="cell-1",
             peers={0: _remote_weight_info(p2p_transfer_utils, "cell-1-rank-0", 0xB000)},
         )
 
@@ -132,7 +132,7 @@ class TestPeerRouting:
             p2p_inference_cell_updater,
             manager,
             _RecordingTransferEngine(),
-            engine_ind=0,
+            cell_id="cell-0",
             peers={0: _remote_weight_info(p2p_transfer_utils, "cell-0-rank-0", 0xA000)},
         )
 
@@ -156,7 +156,7 @@ class TestSubmissionSemantics:
             p2p_inference_cell_updater,
             manager,
             engine,
-            engine_ind=0,
+            cell_id="cell-0",
             peers={0: _remote_weight_info(p2p_transfer_utils, "cell-0-rank-0", 0xA000)},
         )
 
@@ -180,7 +180,7 @@ class TestSubmissionSemantics:
             p2p_inference_cell_updater,
             manager,
             engine,
-            engine_ind=0,
+            cell_id="cell-0",
             peers={0: _remote_weight_info(p2p_transfer_utils, "cell-0-rank-0", 0xA000)},
         )
 
@@ -197,7 +197,7 @@ class TestSubmissionSemantics:
             p2p_inference_cell_updater,
             manager,
             _RecordingTransferEngine(),
-            engine_ind=0,
+            cell_id="cell-0",
             peers={0: _remote_weight_info(p2p_transfer_utils, "cell-0-rank-0", 0xA000)},
         )
 
@@ -214,7 +214,7 @@ class TestSubmissionSemantics:
             p2p_inference_cell_updater,
             manager,
             _RecordingTransferEngine(),
-            engine_ind=0,
+            cell_id="cell-0",
             peers={0: _remote_weight_info(p2p_transfer_utils, "cell-0-rank-0", 0xA000, names=["layer.0"])},
         )
 

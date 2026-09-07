@@ -13,8 +13,8 @@ logger = logging.getLogger(__name__)
 
 
 class _P2PInferenceCellUpdater:
-    def __init__(self, engine_ind: int, transfer_engine: Any, transfer_manager: P2PTransferManager) -> None:
-        self.engine_ind = engine_ind
+    def __init__(self, cell_id: str, transfer_engine: Any, transfer_manager: P2PTransferManager) -> None:
+        self.cell_id = cell_id
         self._transfer_engine = transfer_engine
         self._transfer_manager = transfer_manager
         self._peer_by_engine_rank: dict[int, RemoteWeightInfo] = {}
@@ -22,7 +22,7 @@ class _P2PInferenceCellUpdater:
     def add_peer(self, engine_rank: int, remote_weight_info: RemoteWeightInfo) -> None:
         assert (
             engine_rank not in self._peer_by_engine_rank
-        ), f"[P2P-Shared] Engine rank {engine_rank} already registered for engine {self.engine_ind}"
+        ), f"[P2P-Shared] Engine rank {engine_rank} already registered for cell {self.cell_id}"
         self._peer_by_engine_rank[engine_rank] = remote_weight_info
 
     def submit_write(
