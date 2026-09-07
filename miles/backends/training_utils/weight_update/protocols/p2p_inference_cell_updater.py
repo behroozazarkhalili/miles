@@ -6,10 +6,8 @@ from typing import Any, NamedTuple
 import torch
 
 from miles.backends.training_utils.weight_update.inference_cell_health import InferenceCellHealth
-from miles.backends.training_utils.weight_update.protocols.p2p_transfer_utils import (
-    P2PTransferManager,
-    RemoteWeightInfo,
-)
+from miles.backends.training_utils.weight_update.protocols.p2p_cell_executor import _CellWriteExecutor
+from miles.backends.training_utils.weight_update.protocols.p2p_transfer_utils import RemoteWeightInfo
 
 logger = logging.getLogger(__name__)
 
@@ -19,13 +17,14 @@ class _P2PInferenceCellUpdater:
         self,
         cell_id: str,
         transfer_engine: Any,
-        transfer_manager: P2PTransferManager,
         health: InferenceCellHealth,
+        transfer_timeout: float,
     ) -> None:
         self.cell_id = cell_id
         self._transfer_engine = transfer_engine
-        self._transfer_manager = transfer_manager
         self._health = health
+        self._transfer_timeout = transfer_timeout
+        self._executor = _CellWriteExecutor(cell_id)
         self._disposed = False
         self._peer_by_engine_rank: dict[int, RemoteWeightInfo] = {}
         self._pending_writes: list[Future] = []
@@ -51,15 +50,12 @@ class _P2PInferenceCellUpdater:
         ), f"[P2P-Shared] Engine rank {engine_rank} already registered for cell {self.cell_id}"
         self._peer_by_engine_rank[engine_rank] = remote_weight_info
 
-    def dispose(self) -> None:
-        self._disposed = True
-
     def submit_write(
         self, engine_rank: int, names: list[str], weight_memory_registry: dict[str, tuple[int, int, int]]
     ) -> Future | None:
         if not self.accepts_writes:
             return None
-        future = self._transfer_manager.submit(
+        future = self._executor.submit(
             self._write_one_peer,
             self._peer_by_engine_rank[engine_rank],
             names,
@@ -81,9 +77,13 @@ class _P2PInferenceCellUpdater:
         unfinished, self._pending_writes = self._pending_writes, []
         return unfinished
 
+    def dispose(self) -> _CellWriteExecutor | None:
+        self._disposed = True
+        return None if self._executor.close() else self._executor
+
     def _collect_write(self, future: Future) -> None:
         try:
-            future.result(timeout=0.0 if self.is_errored else self._transfer_manager.transfer_timeout)
+            future.result(timeout=0.0 if self.is_errored else self._transfer_timeout)
         except FutureTimeoutError as error:
             self._abandon_write(future, error)
             return
@@ -115,7 +115,7 @@ class _P2PInferenceCellUpdater:
         """P2P write from shared CPU pinned buffers to a single remote session.
 
         Used by the parallelized submission path where each session within an
-        engine rank is submitted as a separate task to P2PTransferManager.
+        engine rank is submitted as a separate task to this cell's write executor.
         """
         if not self.accepts_writes:
             logger.warning(f"[P2P-Shared] skipping a queued write to cell {self.cell_id}")
