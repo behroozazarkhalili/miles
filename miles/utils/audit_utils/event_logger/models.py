@@ -138,6 +138,23 @@ class EngineEnvReportEvent(EventBase):
     server_info: dict[str, Any]
 
 
+class WeightUpdateAssignmentEvent(EventBase):
+    type: Literal["weight_update_assignment"] = "weight_update_assignment"
+    weight_version: int
+    trainer_cell_id: str
+    trainer_cell_index: int
+    trainer_workers_hash: str
+    assigned_workers_hash_of_cell_id: dict[str, str]
+
+
+class FaultHookFireEvent(EventBase):
+    type: Literal["fault_hook_fire"] = "fault_hook_fire"
+    hook: str
+    mode: str
+    request_id: str
+    weight_version: int | None = None
+
+
 class MetricEvent(EventBase):
     type: Literal["metric"] = "metric"
     rollout_id: int | None = None
@@ -155,6 +172,8 @@ Event = Annotated[
     | TrainAdvantageComputationEvent
     | EnvReportEvent
     | EngineEnvReportEvent
+    | WeightUpdateAssignmentEvent
+    | FaultHookFireEvent
     | MetricEvent,
     Discriminator("type"),
 ]

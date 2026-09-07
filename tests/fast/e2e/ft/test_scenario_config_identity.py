@@ -2,10 +2,12 @@ import dataclasses
 import itertools
 from pathlib import Path
 
-from tests.e2e.ft.conftest_ft import scenario_random_crash, scenario_realistic_gsm8k
+from tests.e2e.ft.conftest_ft import hook_injection, scenario_random_crash, scenario_realistic_gsm8k
 from tests.e2e.ft.conftest_ft.fault_injection import state
 
 from miles.utils.external_utils import command_utils
+from miles.utils.test_utils.fault_hooks import FaultHookName
+from miles.utils.test_utils.fault_injector import FailureMode
 
 
 @dataclasses.dataclass
@@ -34,6 +36,11 @@ class _StubInjector:
         self.event_log = state.EventLog()
 
     def stop_and_join(self) -> None:
+        pass
+
+
+class _StubArmer(_StubInjector):
+    def start(self) -> None:
         pass
 
 
@@ -105,6 +112,39 @@ class TestOneConfigPerSoak:
         assert [config.run_id for config in seen.created] == ["sentinel-0"]
         assert dump_run_ids == ["sentinel-0"]
         assert [config is seen.created[0] for config in seen.prepared] == [True, True]
+        assert [config is seen.created[0] for config in seen.asked_for_host] == [True]
+        assert [config is seen.created[0] for config in seen.trained] == [True]
+
+    def test_the_targeted_all_gather_test_builds_one_config_and_aims_every_step_at_it(
+        self, monkeypatch, tmp_path: Path
+    ) -> None:
+        """The armer is aimed at the api server of one release, which has to be the release that trains."""
+        seen = _Seen()
+        _install(monkeypatch, seen)
+        dump_run_ids: list[str] = []
+        monkeypatch.setattr(
+            hook_injection,
+            "resolve_dump_dir",
+            lambda test_name, *, run_id: dump_run_ids.append(run_id) or str(tmp_path / "all_gather"),
+        )
+        monkeypatch.setattr(hook_injection, "prepare", lambda mode, *, config: seen.prepared.append(config))
+        monkeypatch.setattr(hook_injection, "get_common_train_args", lambda mode, **kwargs: "")
+        monkeypatch.setattr(hook_injection, "get_ft_args", lambda mode: "")
+        monkeypatch.setattr(hook_injection, "HookArmer", lambda **kwargs: _StubArmer())
+
+        hook_injection.run_targeted_hook_scenario(
+            test_name="weight_update_all_gather",
+            mode="kill_train_rollout__dp2_tp2",
+            num_steps=1,
+            hook=FaultHookName.WEIGHT_UPDATE_BEFORE_ALL_GATHER,
+            failure_mode=FailureMode.SIGKILL,
+            request_id="req-1",
+            sub_index=0,
+        )
+
+        assert [config.run_id for config in seen.created] == ["sentinel-0"]
+        assert dump_run_ids == ["sentinel-0"]
+        assert [config is seen.created[0] for config in seen.prepared] == [True]
         assert [config is seen.created[0] for config in seen.asked_for_host] == [True]
         assert [config is seen.created[0] for config in seen.trained] == [True]
 

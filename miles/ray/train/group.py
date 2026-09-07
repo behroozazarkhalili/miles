@@ -27,6 +27,7 @@ from miles.utils.audit_utils.event_logger.logger import get_event_logger, is_eve
 from miles.utils.audit_utils.event_logger.models import (
     CellReconfigureEvent,
     TrainGroupStepEndEvent,
+    WeightUpdateAssignmentEvent,
     WitnessAllocateIdEvent,
 )
 from miles.utils.audit_utils.process_identity import TrainerControllerProcessIdentity
@@ -448,6 +449,8 @@ class TrainerController:
         if not assignments:
             return build_untouched_targets_report(info.engine_cell_ids)
 
+        _record_update_assignments(assignments, weight_version=weight_version)
+
         outcomes = await asyncio.gather(
             *[
                 cell.execute(
@@ -811,6 +814,26 @@ class TrainerController:
     @property
     def num_cells(self) -> int:
         return len(self._cells)
+
+
+def _record_update_assignments(
+    assignments: list[tuple[TrainerCell, UpdatableEngines]], *, weight_version: int
+) -> None:
+    if not is_event_logger_initialized():
+        return
+
+    event_logger = get_event_logger()
+    for cell, assignment in assignments:
+        event_logger.log(
+            WeightUpdateAssignmentEvent,
+            dict(
+                weight_version=weight_version,
+                trainer_cell_id=cell.cell_id,
+                trainer_cell_index=cell.cell_index,
+                trainer_workers_hash=cell.workers_hash,
+                assigned_workers_hash_of_cell_id=dict(assignment.snapshot_cell_id_to_hashes),
+            ),
+        )
 
 
 def _first_exception(results) -> BaseException | None:

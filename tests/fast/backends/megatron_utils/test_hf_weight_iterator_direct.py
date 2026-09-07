@@ -114,3 +114,57 @@ def test_gather_batches_pack_by_size_only(direct_module, monkeypatch):
         Namespace(update_weight_buffer_size=6), params, size_multiplier=2
     )
     assert [[param.name for param in batch] for batch in batches] == [["layer.a"], ["layer.b"], ["layer.c"]]
+
+
+class _FakeGroupInfo:
+    def __init__(self, size: int) -> None:
+        self.size = size
+        self.group = object()
+
+
+class _FakeParallelState:
+    def __init__(self, tp_size: int) -> None:
+        self.tp = _FakeGroupInfo(tp_size)
+        self.etp = _FakeGroupInfo(tp_size)
+
+
+class _FakeHandle:
+    def wait(self) -> None:
+        return None
+
+
+def _sharded_param() -> torch.nn.Parameter:
+    param = torch.nn.Parameter(torch.zeros(2), requires_grad=False)
+    param.tensor_model_parallel = True
+    param.partition_dim = 0
+    param.partition_stride = 1
+    return param
+
+
+def _record_all_gather_order(direct_module, monkeypatch, *, tp_size: int) -> list[str]:
+    order: list[str] = []
+    monkeypatch.setattr(direct_module, "get_parallel_state", lambda: _FakeParallelState(tp_size))
+    monkeypatch.setattr(direct_module, "reach_fault_hook", lambda hook: order.append(f"hook:{hook.value}"))
+
+    def fake_all_gather(buffers, tensor, group=None, async_op=False):
+        order.append("all_gather")
+        return _FakeHandle()
+
+    monkeypatch.setattr(direct_module.dist, "all_gather", fake_all_gather)
+
+    direct_module.all_gather_params_async(Namespace(swiglu=False), [(_param("layer.a", 2), _sharded_param())])
+    return order
+
+
+class TestAllGatherFaultHook:
+    def test_the_hook_is_reached_immediately_before_the_real_collective(self, direct_module, monkeypatch):
+        """A hook placed after the gathers would crash a rank that has already survived the collective under test."""
+        order = _record_all_gather_order(direct_module, monkeypatch, tp_size=2)
+
+        assert order == ["hook:weight_update.before_all_gather", "all_gather"]
+
+    def test_no_hook_is_reached_when_the_param_needs_no_collective(self, direct_module, monkeypatch):
+        """Without tensor parallelism there is no all-gather to fail, so arming one must not fire here."""
+        order = _record_all_gather_order(direct_module, monkeypatch, tp_size=1)
+
+        assert order == []

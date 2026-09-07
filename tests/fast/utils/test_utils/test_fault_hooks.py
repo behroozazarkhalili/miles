@@ -1,9 +1,14 @@
 from __future__ import annotations
 
 import threading
+from pathlib import Path
 
 import pytest
 
+from miles.utils.audit_utils.event_logger import logger as event_logger_module
+from miles.utils.audit_utils.event_logger.logger import EventLogger, read_events
+from miles.utils.audit_utils.event_logger.models import Event, FaultHookFireEvent
+from miles.utils.audit_utils.process_identity import SimpleProcessIdentity
 from miles.utils.test_utils import fault_hooks
 from miles.utils.test_utils.fault_hooks import FaultHookAlreadyArmedError, FaultHookName, arm_fault_hook
 
@@ -170,3 +175,85 @@ class TestArmingIsValidated:
         fault_hooks.reach_fault_hook(_HOOK)
 
         assert injected == ["sigkill", "exit"]
+
+
+class TestFireEvidence:
+    def test_a_fire_is_recorded_as_an_event_before_the_fault_runs(
+        self, registry: fault_hooks._FaultHookRegistry, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        """A sigkill leaves no chance to write afterwards, so the evidence of the fire must already be on disk."""
+        monkeypatch.setattr(
+            event_logger_module,
+            "_event_logger",
+            EventLogger(log_dir=tmp_path, source=SimpleProcessIdentity(component="main"), file_name="worker.jsonl"),
+        )
+        events_when_injected: list[list[Event]] = []
+        monkeypatch.setattr(
+            fault_hooks, "inject_fault", lambda mode: events_when_injected.append(read_events(tmp_path))
+        )
+
+        arm_fault_hook(hook=_HOOK.value, mode="sigkill", request_id="req-1")
+        with fault_hooks.weight_update_span(weight_version=7):
+            fault_hooks.reach_fault_hook(_HOOK)
+
+        [recorded] = events_when_injected
+        [fire] = [event for event in recorded if isinstance(event, FaultHookFireEvent)]
+        assert (fire.hook, fire.mode, fire.request_id, fire.weight_version) == (_HOOK.value, "sigkill", "req-1", 7)
+
+    def test_a_process_without_an_event_logger_still_fires(
+        self, registry: fault_hooks._FaultHookRegistry, injected: list[str], monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """A process with no event dir must still fire, so unit-test paths keep working."""
+        monkeypatch.setattr(event_logger_module, "_event_logger", None)
+
+        arm_fault_hook(hook=_HOOK.value, mode="sigkill", request_id="req-1")
+        fault_hooks.reach_fault_hook(_HOOK)
+
+        assert injected == ["sigkill"]
+
+
+class TestWeightUpdateSpan:
+    def test_a_fire_outside_an_update_names_no_version(
+        self, registry: fault_hooks._FaultHookRegistry, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        """Every hook site sits inside an update today, and a fire without one must not claim to belong to any."""
+        monkeypatch.setattr(
+            event_logger_module,
+            "_event_logger",
+            EventLogger(log_dir=tmp_path, source=SimpleProcessIdentity(component="main"), file_name="worker.jsonl"),
+        )
+        monkeypatch.setattr(fault_hooks, "inject_fault", lambda mode: None)
+
+        arm_fault_hook(hook=_HOOK.value, mode="sigkill", request_id="req-1")
+        fault_hooks.reach_fault_hook(_HOOK)
+
+        [fire] = [event for event in read_events(tmp_path) if isinstance(event, FaultHookFireEvent)]
+        assert fire.weight_version is None
+
+    def test_the_span_is_visible_from_a_thread_the_update_did_not_create(self) -> None:
+        """The p2p write hooks run on per-cell writer threads, which no contextvar would reach."""
+        seen: list[object] = []
+
+        with fault_hooks.weight_update_span(weight_version=3):
+            reader = threading.Thread(target=lambda: seen.append(fault_hooks.current_weight_update_span()))
+            reader.start()
+            reader.join(timeout=_THREAD_JOIN_TIMEOUT_SECONDS)
+
+        assert [span.weight_version for span in seen] == [3]
+
+    def test_the_span_is_cleared_when_the_update_raises(self) -> None:
+        """A failed update must not leave its version attached to the fires of the next one."""
+        with pytest.raises(RuntimeError):
+            with fault_hooks.weight_update_span(weight_version=3):
+                raise RuntimeError("update failed")
+
+        assert fault_hooks.current_weight_update_span() is None
+
+    def test_a_second_span_in_one_process_is_refused(self) -> None:
+        """Updates are serial in a trainer worker, and a nested span would misattribute whatever fires inside it."""
+        with fault_hooks.weight_update_span(weight_version=3):
+            with pytest.raises(AssertionError):
+                with fault_hooks.weight_update_span(weight_version=4):
+                    pass
+
+        assert fault_hooks.current_weight_update_span() is None

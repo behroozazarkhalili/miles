@@ -32,6 +32,7 @@ from miles.backends.training_utils.weight_update.utils import record_lora_checks
 from miles.utils.distributed_utils import get_gloo_group
 from miles.utils.lora import LORA_ADAPTER_NAME
 from miles.utils.multi_lora import is_multi_lora_enabled, slot_lora_name
+from miles.utils.test_utils.fault_hooks import weight_update_span
 from miles.utils.timer import timer
 
 logger = logging.getLogger(__name__)
@@ -120,6 +121,10 @@ class WeightUpdater:
     @torch.no_grad()
     def update_weights(self, weight_version: int) -> WeightUpdateReport:
         """Run one weight sync: session frame + base-bucket stream + adapter pushes for LoRA."""
+        with weight_update_span(weight_version=weight_version):
+            return self._update_weights(weight_version)
+
+    def _update_weights(self, weight_version: int) -> WeightUpdateReport:
         protocol = self.protocol
         if not protocol.begin_sync(weight_version, self._iter_base_buckets):
             self.weight_version = weight_version - 1

@@ -19,6 +19,7 @@
 | `scenario_realistic_gsm8k` | `test_realistic_gsm8k__kill_train_rollout.py`, no modes |
 | `scenario_random_crash_fully_async` | `kill_train_rollout__dp2_cp2` |
 | `scenario_realistic_gsm8k_fully_async` | `test_realistic_gsm8k_fully_async__kill_train_rollout.py`, no modes |
+| `scenario_weight_update_all_gather` | `kill_train_rollout__dp2_tp2` |
 
 - **Forced absences**, one reason each:
     - `kill_train__dp4_cp2_tp2_pp2_ep2_etp2__moe_full` is multi-node, and no multi-node CI lane exists.
@@ -43,6 +44,7 @@
 | `scenario_realistic_gsm8k` | soak | model still reaches gsm8k accuracy under random crashes |
 | `scenario_random_crash_fully_async` | soak | same, through `train_async.py --fully-async` |
 | `scenario_realistic_gsm8k_fully_async` | soak | same, through `train_async.py --fully-async` |
+| `scenario_weight_update_all_gather` | targeted | a trainer worker dying inside the weight update's own TP all-gather is survived |
 
 ### Modes
 
@@ -63,10 +65,11 @@
 | `kill_train__dp2_cp2` | 1 | 4 + 4 | 2 | CP2 | 4 engines × 1 GPU | dense Qwen3-0.6B | `("train",)` | `scenario_trainer_with_failure` under real generation; needs the dense model (see below) |
 | `kill_rollout__dp4__colocate` | 1 | 4 shared | 4 | — | 4 engines × 1 GPU, colocated | dense Qwen3-0.6B | `("rollout",)` | the only rollout-only mode: crashes engines, not trainer cells |
 | `kill_train_rollout__dp2_cp2` | 1 | 4 + 4 | 2 | CP2 | 4 engines × 1 GPU | dense Qwen3-0.6B | `("train", "rollout")` | both kinds crash in the same run, sync and fully-async; disaggregated, since colocation makes the two crashes contend for the same gpus |
+| `kill_train_rollout__dp2_tp2` | 1 | 4 + 4 | 2 | TP2 | 4 engines × 1 GPU | dense Qwen3-0.6B | `("train", "rollout")` | the only mode whose trainer runs a real TP all-gather in the weight update, which the targeted hook scenarios crash inside; the killed sender takes its engines with it, so both kinds must be recoverable |
 | `kill_train__dp4_cp2_tp2_pp2_ep2_etp2__moe_full` | 4 train + 2 rollout | 32 + 16 | 4 | CP2 TP2 PP2 EP2 ETP2 | 2 engines × 8 GPU | full MoE | `("train",)` | full model, all parallelism; multi-node, so no CI entry |
 
 - **Batch shape**: `--rollout-batch-size 32 --n-samples-per-prompt 8 --global-batch-size 256` everywhere — 256 samples per rollout, divisible by both 2 and 4 cells. Uneven distribution across replicas is **not** exercised.
-- **Model**: 1-node modes use the 5-layer MoE `Qwen3-30B-A3B-5layer`, except the three dense modes.
+- **Model**: 1-node modes use the 5-layer MoE `Qwen3-30B-A3B-5layer`, except the dense modes.
 
 ## Running the code
 
@@ -102,6 +105,7 @@ PYTHONPATH=. python tests/e2e/ft/conftest_ft/scenario_trainer_no_failure.py run 
 - **Debugging**: prefer the individual subcommands over `run` — with a shared `--dump-dir` (plus `--phase` when multi-phase) you re-run only what changed.
 - **`scenario_rollout_deterministic`**: the comparison subcommands, with the injection constants fixed in the module rather than exposed as options.
 - **`scenario_random_crash`**: only `run`, with `--mode` / `--seed` / `--num-steps` / `--trainer-crash-interval-seconds` / `--rollout-crash-interval-seconds` / `--fully-async`.
+- **`scenario_weight_update_all_gather`**: only `run`, with `--mode` / `--num-steps`; what it arms is fixed in the module.
 - **`scenario_realistic_gsm8k`**: only `run`, with `--seed` / `--num-rollout` / `--trainer-crash-interval-seconds` / `--rollout-crash-interval-seconds` / `--metric-threshold` / `--fully-async`; no `--mode`.
 - **`scenario_*_fully_async`**: only `run`, with the same options minus `--fully-async`, which they pin.
 - **Dumps**: `resolve_dump_dir` in `conftest_ft/app.py` puts them under `$MILES_TEST_DUMPS_ROOT/<run_id>/<test_name>/`, falling back to `/node_public/dumps` when the cluster sets no root. A comparison scenario's `run` deletes them when it ends; the soak scenarios (`scenario_random_crash`, `scenario_realistic_gsm8k`) only clear a stale directory before starting, so a finished soak leaves its dumps behind for inspection. The run id is what stops two agents running the same test from deleting each other's dumps.
@@ -147,6 +151,15 @@ hf upload --repo-type dataset fzyzcjy/miles-test-rollout-Qwen3-30B-A3B-5layer \
 
 - **Why only some are bitwise**: baseline and target reduce over different topologies, so allreduce kernel ordering differs — unless `--deterministic-mode` and `--debug-deterministic-collective` are on.
 - **Why `train/grad_norm` is exempt in `scenario_trainer_deterministic`**: it sums squared shard fragments, so its bracketing follows the dist-optimizer shard count (8 flat vs 2 per cell); a few fp32 ulps are inherent. The grads stay bitwise-checked through the dumps. It is exact in `scenario_rollout_deterministic`, where ft on rollout alone leaves one trainer topology and no shard-count bracketing to excuse.
+
+### Targeted Fault Hooks
+
+- **What they are**: named points in production code (`FaultHookName`) that a test can arm from outside, through `POST /api/v1/cells/<cell>/arm-fault-hook`; the first thread to reach an armed point consumes it and runs the fault there.
+- **Who accepts one**: trainer cells only — the hooks live in trainer worker processes, and the only thing asked to arm one is the trainer controller that owns the named cell, so anything else is not a fault hook source at all rather than a requester left waiting for a fault nothing reaches.
+- **Every arm names the incarnation it chose**: `expected_workers_hash` is required and non-empty, and it is the hash the caller saw when it picked the source. The owning trainer controller matches it against the generation it currently holds and freezes that worker's already-held handle before its first `await`, so a replacement created afterwards can only be reached through a handle this request never took. It refuses — 400, with the reason — when the cell is gone, runs another hash, has not finished `init`, or has no such `sub_index`; it never re-aims at the replacement and never retries. No handle is built for the arm and none re-handshakes: under kubernetes the frozen handle was pinned to a boot uuid when the cell ran `init`, so a process that merely reuses the endpoint is refused by the rpc boot guard before the call is submitted. The call goes out on the worker's `fault_injector` concurrency group and is bounded, so arming waits for neither the training step nor the weight update.
+- **One-shot and exclusive**: a second arm at an already armed point is refused instead of replacing the first, and the slot frees itself when the fault fires.
+- **`weight_update.before_all_gather`**: `all_gather_params_async` in `hf_weight_iterator_direct.py`, inside the `tp_size > 1` branch, immediately before the real `dist.all_gather(..., async_op=True)`.
+- **A fire names the update it happened in**: `WeightUpdater.update_weights` opens a process-wide weight-update span, the fire event carries its version, and the trainer controller writes one `WeightUpdateAssignmentEvent` per sender before calling it. That pair is what lets a scenario say which engines the harmed sender owned.
 
 ### Fault Forms and Receivers
 
@@ -347,6 +360,57 @@ Assertions:
 - **Why every namespace, not just `train/`**: an engine crash shows up first in `rollout/raw_reward` or `rollout/log_probs`. `perf/` is left out by name, being wall-clock and throughput that a relaunch moves by definition, and a metric in neither namespace fails the run rather than being dropped quietly.
 - **Why the weights-moved gate**: bitwise equality is also satisfied by two runs that trained on nothing.
 - **Why not a loss or reward curve**: neither is a progress signal here — the reward is `deterministic_random`, a hash of the response, and GRPO's surrogate loss is not monotone even while a run learns. Over eight rollouts neither moves for a reason worth asserting, and the weights either changed or they did not.
+
+### `scenario_weight_update_all_gather`
+
+```
+Type: targeted (no baseline, no compare); passes if the armed hook fires and the run recovers from it
+Entry: test_weight_update_all_gather__kill_train_rollout__dp2_tp2.py, ft-short
+Steps: 8 (DEFAULT_NUM_STEPS)
+Requires: real disaggregated engines, TP2, ft_components == ("train", "rollout"), >= 2 trainer cells,
+          >= 2 engines
+Regime: --update-weight-transfer-mode p2p
+        --sglang-remote-instance-weight-loader-start-seed-via-transfer-engine
+        --save <dump>/ckpt --save-interval 1, --mini-ft-controller-enable
+
+1. A background thread polls /api/v1/cells every 2s and records every snapshot
+2. The arm waits for a completed training step, a checkpoint tracker naming an iteration >= 1, a
+   non-empty publication of a rollout other than the startup sync, and the armed cell observed
+   healthy. It then snapshots every cell's workers_hash and arms
+   WEIGHT_UPDATE_BEFORE_ALL_GATHER with sigkill in worker 0 of the last trainer cell, once
+3. The next weight update reaches that point in hf_weight_iterator_direct.all_gather_params_async
+   and the worker dies before the collective it was about to enter
+
+Witnesses:
+  fire       -> exactly one FaultHookFireEvent with the armed request id, whose whole
+                TrainProcessIdentity (component, model id, cell index, rank) is the armed worker's,
+                carrying the weight version of the update it fired in
+  assignment -> exactly one WeightUpdateAssignmentEvent for that version and that trainer cell,
+                whose trainer_workers_hash is the incarnation that was armed
+  eviction   -> the armed cell observed under another workers_hash after the snapshot, healthy
+                again under it, and never the armed hash alive at the end
+  healing    -> a CellReconfigureEvent after that assignment dropping the cell index, then a later
+                one healing it back
+  isolation  -> every engine the assignment names left the incarnation it was written to, and each
+                was observed healthy and Serving under a replacement
+  blast      -> >= 1 engine outside the assignment kept the incarnation it had when the hook was
+                armed and was observed Serving after the harm
+  progress   -> >= 1 publication carrying a non-empty checksum after that assignment
+```
+
+- **Why a named point and not a wall clock**: an update is a small share of a step, so a random injector rarely lands inside one, and never lands at a chosen line of it.
+- **Why the hook sits before the collective, not after the bucket loop**: a hook placed once the gathers are done crashes a rank that already survived the thing under test.
+- **Why the arm waits for a completed step, a checkpoint and a real publication**: killing a worker before those exist takes out the only source a replacement could be healed from, and the run would fail for a reason the scenario is not about. A tracker file that exists but names no iteration, and a checksum event carrying only empty dicts, are exactly the states that look ready and are not.
+- **Why an arm is not a fault**: the api server answering 200 only proves the request was accepted, so the run fails unless the fire event says production reached the point.
+- **Why the ack time is never used as the fault time**: the armed worker dies at the hook, so its rpc reply can be lost and the fire can be recorded before the arm is acknowledged. Every ordering the witnesses need comes from the pre-arm snapshot, from the assignment, or from the observations themselves.
+- **Why the fire is an event and not a log line**: the fault kills the process, arms and fires interleave across workers, and only a request id pairs them; `EventLogger` writes and closes per event, so the record survives the sigkill that follows it.
+- **Why the whole process identity is compared**: a run can hold two roles, several trained models and many cells, and every one of them numbers its cells and ranks from zero.
+- **Why an assignment event exists at all**: which engines a sender owned in one update is the controller's decision, and nothing in a cell name reproduces it. It is written after the assignment is computed and before any sender is called, so a fault fired inside the call always has it to be read against.
+- **Why the fire carries a weight version**: it is the join to that assignment. The trainer worker opens a process-wide span for the duration of `WeightUpdater.update_weights` — a plain module global, because the p2p write hooks run on per-cell writer threads no contextvar would reach — and clears it in a `finally`. Updates are serial in a worker, so a second span is refused rather than nested.
+- **Why the armed incarnation is compared against the assignment**: it rules out the case the observations alone cannot, where the cell was already replaced before the fault fired and a healthy-looking second hash is really a third one.
+- **Why the healing witness is anchored to that assignment**: a run has other reconfigures, and picking any eviction and any healing from the whole log would let an earlier unrelated crash pay for this fault.
+- **Why both ft components**: a trainer that dies mid-update takes its assigned engines down with it, so the run only recovers if engines are recoverable too.
+- **What the progress witness cannot yet say**: `InferenceEngineWeightChecksumEvent` names no cell, so "an unrelated engine published after the fault" is asserted as that engine still Serving its original incarnation plus a non-empty publication of the run. Op33 gives the event a cell and a version, and this witness tightens to that engine's own publication.
 
 ### `scenario_random_crash`
 

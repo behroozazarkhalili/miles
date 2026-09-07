@@ -4,6 +4,7 @@ from unittest.mock import MagicMock, patch
 from miles.backends.training_utils.weight_update.inference_cell_health import InferenceCellHealth
 from miles.backends.training_utils.weight_update.report import WeightUpdateReport
 from miles.backends.training_utils.weight_update.updater import WeightUpdater
+from miles.utils.test_utils.fault_hooks import current_weight_update_span
 
 _UPDATER_MODULE = "miles.backends.training_utils.weight_update.updater"
 _HEALTH_MODULE = "miles.backends.training_utils.weight_update.inference_cell_health"
@@ -51,6 +52,7 @@ class _FakeCellIsolatingProtocol:
         self.rollout_engines: list = []
         self.group_name = "test"
         self.sent_buckets: list[list] = []
+        self.spans_while_sending: list = []
 
     def connect(
         self,
@@ -70,6 +72,7 @@ class _FakeCellIsolatingProtocol:
 
     def send_bucket(self, bucket) -> None:
         self.sent_buckets.append(list(bucket))
+        self.spans_while_sending.append(current_weight_update_span())
 
     def after_base_weights(self) -> None:
         pass
@@ -387,3 +390,27 @@ class TestCrossRankAgreement:
         assert not [entry for entry in gathered_at[2] if entry[1] == "continue_generation"]
         assert ("cell-0", "continue_generation") not in calls
         assert ("cell-1", "continue_generation") in calls
+
+
+class TestWeightUpdateSpan:
+    """A fault reached inside an update has to be able to name the update it happened in."""
+
+    def test_the_version_is_readable_while_the_update_runs(self) -> None:
+        """The hook sites read it to correlate their fire with the assignment this update was given."""
+        protocol = _FakeCellIsolatingProtocol()
+        updater = _make_updater([_RecordingApiClient([], cell_id) for cell_id in _CELL_IDS], protocol)
+        updater._hf_weight_iterator.iter_hf_weights.return_value = iter([[("w", None)]])
+
+        _run(updater, weight_version=5)
+
+        assert [span.weight_version for span in protocol.spans_while_sending] == [5]
+
+    def test_the_span_is_closed_when_the_update_returns(self) -> None:
+        """A version left open would be attributed to whatever the process reaches next."""
+        updater = _make_updater(
+            [_RecordingApiClient([], cell_id) for cell_id in _CELL_IDS], _FakeCellIsolatingProtocol()
+        )
+
+        _run(updater, weight_version=5)
+
+        assert current_weight_update_span() is None

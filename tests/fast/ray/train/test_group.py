@@ -17,7 +17,7 @@ from miles.ray.rollout.inference_controller import UpdatableEngines
 from miles.ray.train.group import TrainerController, compute_trainer_health_checker_config
 from miles.utils import object_store
 from miles.utils.audit_utils.event_logger.logger import EventLogger, read_events, set_event_logger
-from miles.utils.audit_utils.event_logger.models import CellReconfigureEvent
+from miles.utils.audit_utils.event_logger.models import CellReconfigureEvent, WeightUpdateAssignmentEvent
 from miles.utils.audit_utils.process_identity import SimpleProcessIdentity
 from miles.utils.audit_utils.witness.allocator import WitnessIdAllocator
 from miles.utils.data import RolloutDataPack
@@ -1300,6 +1300,7 @@ class _FakeTrainerCell:
     def __init__(self, cell_index: int, *, outcome=None) -> None:
         self.cell_index = cell_index
         self.cell_id = f"cell-{cell_index}"
+        self.workers_hash = f"trainer-hash-{cell_index}"
         self.is_alive = True
         self.calls: list[dict] = []
         self.retired_reasons: list[str] = []
@@ -1813,3 +1814,68 @@ class TestUpdateWeightsDeadline:
         await group.save_model(rollout_id=1)
 
         assert "timeout" not in group._execute_first_alive.await_args.kwargs
+
+
+class TestUpdateAssignmentsAreRecorded:
+    """Which engines a trainer owned in one update is the only thing that can hold a fault against them."""
+
+    @pytest.fixture
+    def _event_log_dir(self, tmp_path: Path):
+        set_event_logger(EventLogger(log_dir=tmp_path, source=SimpleProcessIdentity(component="main")))
+        try:
+            yield tmp_path
+        finally:
+            set_event_logger(None)
+
+    @staticmethod
+    def _assignments(log_dir: Path) -> list[WeightUpdateAssignmentEvent]:
+        return [e for e in read_events(log_dir) if isinstance(e, WeightUpdateAssignmentEvent)]
+
+    async def test_every_sender_records_the_engines_and_incarnations_it_was_given(self, _event_log_dir: Path):
+        """Guessing an assignment from cell names would blame engines a fault never touched."""
+        cells = [_FakeTrainerCell(0), _FakeTrainerCell(1)]
+        controller = _make_fanout_controller(cells)
+
+        await controller.update_weights(info=_p2p_info(3))
+
+        recorded = sorted(self._assignments(_event_log_dir), key=lambda event: event.trainer_cell_id)
+        assert [(e.trainer_cell_id, e.trainer_workers_hash, e.weight_version) for e in recorded] == [
+            ("cell-0", "trainer-hash-0", 1),
+            ("cell-1", "trainer-hash-1", 1),
+        ]
+        assert [e.assigned_workers_hash_of_cell_id for e in recorded] == [
+            {"engine-0": "hash-0", "engine-1": "hash-1"},
+            {"engine-2": "hash-2"},
+        ]
+
+    async def test_the_assignment_is_recorded_before_the_sender_is_called(self, _event_log_dir: Path):
+        """A fault fires inside the call, so an assignment written afterwards would never be there to read."""
+        seen_during_call: list[int] = []
+
+        class _RecordingCell(_FakeTrainerCell):
+            async def execute(self, fn_name: str, *, timeout: float, info, weight_version: int):
+                seen_during_call.append(len(TestUpdateAssignmentsAreRecorded._assignments(_event_log_dir)))
+                return await super().execute(fn_name, timeout=timeout, info=info, weight_version=weight_version)
+
+        controller = _make_fanout_controller([_RecordingCell(0)])
+
+        await controller.update_weights(info=_p2p_info(1))
+
+        assert seen_during_call == [1]
+
+    async def test_a_cell_that_was_given_no_engine_records_nothing(self, _event_log_dir: Path):
+        """It sends to nobody, so an assignment for it would name a set no fault of its can harm."""
+        controller = _make_fanout_controller([_FakeTrainerCell(0), _FakeTrainerCell(1)])
+
+        await controller.update_weights(info=_p2p_info(1))
+
+        assert [e.trainer_cell_id for e in self._assignments(_event_log_dir)] == ["cell-0"]
+
+    async def test_an_update_without_an_event_logger_still_runs(self):
+        """Production runs without --save-debug-event-data, and recording is an audit trail, not a dependency."""
+        cells = [_FakeTrainerCell(0)]
+        controller = _make_fanout_controller(cells)
+
+        report = await controller.update_weights(info=_p2p_info(1))
+
+        assert report.updated_cell_ids == ("engine-0",)

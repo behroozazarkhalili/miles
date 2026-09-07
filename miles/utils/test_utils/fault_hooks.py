@@ -3,12 +3,16 @@ from __future__ import annotations
 import logging
 import os
 import threading
+from collections.abc import Iterator
+from contextlib import contextmanager
 
 try:
     from enum import StrEnum
 except ImportError:
     from backports.strenum import StrEnum
 
+from miles.utils.audit_utils.event_logger.logger import get_event_logger, is_event_logger_initialized
+from miles.utils.audit_utils.event_logger.models import FaultHookFireEvent
 from miles.utils.pydantic_utils import FrozenStrictBaseModel
 from miles.utils.test_utils.fault_injector import FailureMode, inject_fault
 from miles.utils.tracking_utils.structured_log import log_structured
@@ -31,6 +35,10 @@ class FaultHookAction(FrozenStrictBaseModel):
     request_id: str
 
 
+class WeightUpdateSpan(FrozenStrictBaseModel):
+    weight_version: int
+
+
 class FaultHookAlreadyArmedError(Exception):
     pass
 
@@ -48,16 +56,43 @@ def reach_fault_hook(hook: FaultHookName) -> None:
     if (action := _REGISTRY.consume(hook)) is None:
         return
 
-    log_structured(
-        logger.warning,
-        tag=LOG_TAG,
-        op="fire",
+    _record_fire(action)
+    inject_fault(mode=action.mode.value)
+
+
+@contextmanager
+def weight_update_span(*, weight_version: int) -> Iterator[None]:
+    global _WEIGHT_UPDATE_SPAN
+    assert _WEIGHT_UPDATE_SPAN is None, (
+        f"a weight update of version {_WEIGHT_UPDATE_SPAN} is already open in this process, and nesting a second one "
+        f"would leave a fault reached inside it attributed to whichever span happened to be read"
+    )
+    _WEIGHT_UPDATE_SPAN = WeightUpdateSpan(weight_version=weight_version)
+    try:
+        yield
+    finally:
+        _WEIGHT_UPDATE_SPAN = None
+
+
+def current_weight_update_span() -> WeightUpdateSpan | None:
+    return _WEIGHT_UPDATE_SPAN
+
+
+# ============================== fire bookkeeping ==============================
+
+
+def _record_fire(action: FaultHookAction) -> None:
+    span = current_weight_update_span()
+    fields = dict(
         hook=action.hook.value,
         mode=action.mode.value,
         request_id=action.request_id,
-        pid=os.getpid(),
+        weight_version=None if span is None else span.weight_version,
     )
-    inject_fault(mode=action.mode.value)
+
+    log_structured(logger.warning, tag=LOG_TAG, op="fire", pid=os.getpid(), **fields)
+    if is_event_logger_initialized():
+        get_event_logger().log(FaultHookFireEvent, fields)
 
 
 # ============================== registry ================================
@@ -88,6 +123,8 @@ class _FaultHookRegistry:
         )
 
     def consume(self, hook: FaultHookName) -> FaultHookAction | None:
+        if hook not in self._armed:
+            return None
         with self._lock:
             return self._armed.pop(hook, None)
 
@@ -97,3 +134,4 @@ class _FaultHookRegistry:
 
 
 _REGISTRY = _FaultHookRegistry()
+_WEIGHT_UPDATE_SPAN: WeightUpdateSpan | None = None
