@@ -193,6 +193,7 @@ class MockSourceController:
         sub_index: int,
         request_id: str,
         target: str,
+        delay_ms: int,
     ) -> FaultHookArmingReport:
         if self.arm_fault_hook_error is not None:
             raise self.arm_fault_hook_error
@@ -205,6 +206,7 @@ class MockSourceController:
                 sub_index=sub_index,
                 request_id=request_id,
                 target=target,
+                delay_ms=delay_ms,
             )
         )
         return FaultHookArmingReport(refused_because=self.refused_because)
@@ -274,8 +276,8 @@ class MockTrainerWorkerHandle:
     def __init__(self, armed: list[dict[str, object]]) -> None:
         self._armed = armed
 
-    async def arm_fault_hook(self, *, hook: str, mode: str, request_id: str, target: str) -> None:
-        self._armed.append(dict(hook=hook, mode=mode, request_id=request_id, target=target))
+    async def arm_fault_hook(self, *, hook: str, mode: str, request_id: str, target: str, delay_ms: int) -> None:
+        self._armed.append(dict(hook=hook, mode=mode, request_id=request_id, target=target, delay_ms=delay_ms))
 
 
 class MockTrainerCell:

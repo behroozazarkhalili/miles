@@ -35,12 +35,12 @@ class _RecordingHandle:
         self._before_arm = before_arm
         self.hangs = False
 
-    async def arm_fault_hook(self, *, hook: str, mode: str, request_id: str, target: str) -> None:
+    async def arm_fault_hook(self, *, hook: str, mode: str, request_id: str, target: str, delay_ms: int) -> None:
         if self._before_arm is not None:
             await self._before_arm()
         if self.hangs:
             await asyncio.Event().wait()
-        self.armed.append(dict(hook=hook, mode=mode, request_id=request_id, target=target))
+        self.armed.append(dict(hook=hook, mode=mode, request_id=request_id, target=target, delay_ms=delay_ms))
 
 
 class _FakeCell:
@@ -74,6 +74,7 @@ async def _arm(controller: TrainerController, *, expected_workers_hash: str = _H
         sub_index=sub_index,
         request_id="req-1",
         target=FaultHookTarget.REMOTE_INFERENCE_CELL.value,
+        delay_ms=250,
     )
 
 
@@ -93,6 +94,7 @@ class TestArmingTheGenerationTheCallerChose:
                 mode="sigkill",
                 request_id="req-1",
                 target="remote_inference_cell",
+                delay_ms=250,
             )
         ]
 
@@ -171,8 +173,8 @@ class _HookableWorker:
         self.armed: list[dict[str, object]] = []
 
     @rpc(concurrency_group="fault_injector")
-    def arm_fault_hook(self, *, hook: str, mode: str, request_id: str, target: str) -> None:
-        self.armed.append(dict(hook=hook, mode=mode, request_id=request_id, target=target))
+    def arm_fault_hook(self, *, hook: str, mode: str, request_id: str, target: str, delay_ms: int) -> None:
+        self.armed.append(dict(hook=hook, mode=mode, request_id=request_id, target=target, delay_ms=delay_ms))
 
 
 class _EndpointTransport(httpx.AsyncBaseTransport):

@@ -98,6 +98,7 @@ def run_targeted_hook_scenario(
     target: FaultHookTarget,
     request_id: str,
     sub_index: int,
+    delay_ms: int = 0,
 ) -> TargetedHookRun:
     ft_mode = resolve_mode(mode)
     assert_mode_reaches_the_hooks(ft_mode, mode=mode)
@@ -106,7 +107,7 @@ def run_targeted_hook_scenario(
     dump_dir: str = resolve_dump_dir(f"{test_name}_{mode}", run_id=config.run_id)
     print(f"Dump directory: {dump_dir}")
     print(f"Steps: {num_steps}, cluster backend: {config.cluster_backend.value}")
-    print(f"Arming {hook.value} ({failure_mode.value}, {target.value}) as {request_id!r}")
+    print(f"Arming {hook.value} ({failure_mode.value}, {target.value}, delay {delay_ms}ms) as {request_id!r}")
 
     prepare(ft_mode, config=config)
 
@@ -131,6 +132,7 @@ def run_targeted_hook_scenario(
         mode=failure_mode,
         target=target,
         request_id=request_id,
+        delay_ms=delay_ms,
     )
     armer.start()
 
@@ -189,6 +191,7 @@ class ArmedFaultHook:
     mode: FailureMode
     target: FaultHookTarget
     request_id: str
+    delay_ms: int
     expected_source: TrainProcessIdentity
     trainer_workers_hash: str
     inference_workers_hash_of_cell_id: dict[str, str]
@@ -214,6 +217,7 @@ def arm_fault_hook_over_api(
     mode: FailureMode,
     target: FaultHookTarget,
     request_id: str,
+    delay_ms: int,
     trainer_snapshot: CellSnapshot,
     inference_snapshot: CellSnapshot,
 ) -> ArmedFaultHook:
@@ -227,6 +231,7 @@ def arm_fault_hook_over_api(
             "target": target.value,
             "sub_index": sub_index,
             "request_id": request_id,
+            "delay_ms": delay_ms,
         },
         timeout=ARM_REQUEST_TIMEOUT_SECONDS,
     )
@@ -238,6 +243,7 @@ def arm_fault_hook_over_api(
         mode=mode,
         target=target,
         request_id=request_id,
+        delay_ms=delay_ms,
         expected_source=TrainProcessIdentity(
             component=ACTOR_ROLE,
             model_id=ARMED_TRAINER_MODEL_ID,
@@ -265,6 +271,7 @@ class HookArmer:
         mode: FailureMode,
         target: FaultHookTarget,
         request_id: str,
+        delay_ms: int = 0,
         poll_interval_seconds: float = POLL_INTERVAL_SECONDS,
     ) -> None:
         self.event_log = EventLog()
@@ -279,6 +286,7 @@ class HookArmer:
         self._mode = mode
         self._target = target
         self._request_id = request_id
+        self._delay_ms = delay_ms
 
         def observe_and_arm(stop_event: threading.Event) -> None:
             while not stop_event.wait(timeout=poll_interval_seconds):
@@ -318,6 +326,7 @@ class HookArmer:
             mode=self._mode,
             target=self._target,
             request_id=self._request_id,
+            delay_ms=self._delay_ms,
             trainer_snapshot=trainer_snapshot,
             inference_snapshot=compute_cell_snapshot(cells, cell_type=ROLLOUT_CELL_TYPE),
         )
@@ -376,6 +385,10 @@ def assert_hook_fired(armed: ArmedFaultHook, *, event_dir: Path) -> FaultHookFir
     assert fire.target == armed.target.value, (
         f"Fault hook witness failed: request {armed.request_id!r} fired against {fire.target}, not the "
         f"{armed.target.value} it was armed for"
+    )
+    assert fire.delay_ms == armed.delay_ms, (
+        f"Fault hook witness failed: request {armed.request_id!r} fired after a {fire.delay_ms}ms delay, not the "
+        f"{armed.delay_ms}ms it was armed for, so the fault landed at a moment the scenario did not ask about"
     )
     expected_outcome = EXPECTED_OUTCOME_OF_TARGET[armed.target]
     assert fire.outcome == expected_outcome.value, (

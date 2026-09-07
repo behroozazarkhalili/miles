@@ -269,6 +269,45 @@ class TestArmFaultHook:
         assert not reached.is_alive()
         assert injected == ["sigkill"]
 
+    def test_the_delay_the_request_carries_is_armed_in_the_trainer(self, monkeypatch: pytest.MonkeyPatch):
+        """The registry that honours the wait is this process's own, so an rpc that drops it arms another fault."""
+        monkeypatch.setattr(fault_hooks, "_REGISTRY", fault_hooks._FaultHookRegistry())
+        actor = _actor_with(InitOnce("TrainRayActor"))
+
+        actor.arm_fault_hook(
+            hook=FaultHookName.WEIGHT_UPDATE_BEFORE_P2P_WRITE.value,
+            mode="sigkill",
+            request_id="req-1",
+            target=FaultHookTarget.LOCAL.value,
+            delay_ms=250,
+        )
+        actor.arm_fault_hook(
+            hook=FaultHookName.WEIGHT_UPDATE_BEFORE_ALL_GATHER.value,
+            mode="sigkill",
+            request_id="req-2",
+            target=FaultHookTarget.LOCAL.value,
+        )
+
+        armed = fault_hooks._REGISTRY.armed_hooks()
+        assert armed[FaultHookName.WEIGHT_UPDATE_BEFORE_P2P_WRITE].delay_ms == 250
+        assert armed[FaultHookName.WEIGHT_UPDATE_BEFORE_ALL_GATHER].delay_ms == 0
+
+    def test_a_delay_the_worker_cannot_honour_is_refused_by_the_trainer(self, monkeypatch: pytest.MonkeyPatch):
+        """A rejected arm tells the harness nothing is armed; a clamped one would fire at an unasked-for moment."""
+        monkeypatch.setattr(fault_hooks, "_REGISTRY", fault_hooks._FaultHookRegistry())
+        actor = _actor_with(InitOnce("TrainRayActor"))
+
+        with pytest.raises(ValueError):
+            actor.arm_fault_hook(
+                hook=FaultHookName.WEIGHT_UPDATE_BEFORE_P2P_WRITE.value,
+                mode="sigkill",
+                request_id="req-1",
+                target=FaultHookTarget.LOCAL.value,
+                delay_ms=-1,
+            )
+
+        assert fault_hooks._REGISTRY.armed_hooks() == {}
+
     def test_a_second_arm_at_the_same_hook_is_reported_to_the_caller(self, monkeypatch: pytest.MonkeyPatch):
         """The caller must learn its request was refused instead of waiting for a fault that replaced nothing."""
         monkeypatch.setattr(fault_hooks, "_REGISTRY", fault_hooks._FaultHookRegistry())

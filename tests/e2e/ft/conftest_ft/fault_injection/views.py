@@ -189,6 +189,7 @@ class HookHarm:
     hook: str
     mode: str
     target: str
+    delay_ms: int
     source_cell_name: str
     source_workers_hash: str
     source_cell_index: int
@@ -253,6 +254,7 @@ def _absorb_hook_arm(harms: dict[str, HookHarm], event: HookArmEvent) -> None:
         hook=event.hook,
         mode=event.mode,
         target=event.target,
+        delay_ms=event.delay_ms,
         source_cell_name=event.source_cell_name,
         source_workers_hash=event.source_workers_hash,
         source_cell_index=event.source_cell_index,

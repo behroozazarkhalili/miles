@@ -108,6 +108,7 @@ def _fire(
     victim_cell_id: str | None = None,
     victim_workers_hash: str | None = None,
     receiver_identity: bool = True,
+    delay_ms: int = 0,
 ) -> FaultHookFireEvent:
     if outcome is None:
         outcome = hook_forms.EXPECTED_OUTCOME_OF_TARGET[target]
@@ -121,6 +122,7 @@ def _fire(
         weight_version=weight_version,
         target=target.value,
         outcome=outcome.value,
+        delay_ms=delay_ms,
         victim_cell_id=(victim_cell_id if victim_cell_id is not None else _ENGINE) if remote else None,
         victim_workers_hash=(
             (victim_workers_hash if victim_workers_hash is not None else _ENGINE_HASH) if remote else None
@@ -166,7 +168,13 @@ def _observe_cluster(
     )
 
 
-def _arm(log: EventLog, *, target: FaultHookTarget = FaultHookTarget.LOCAL, acknowledged: bool = True) -> None:
+def _arm(
+    log: EventLog,
+    *,
+    target: FaultHookTarget = FaultHookTarget.LOCAL,
+    acknowledged: bool = True,
+    delay_ms: int = 0,
+) -> None:
     for state in [False, True] if acknowledged else [False]:
         log.note_hook_arm(
             request_id=_REQUEST_ID,
@@ -183,6 +191,7 @@ def _arm(log: EventLog, *, target: FaultHookTarget = FaultHookTarget.LOCAL, ackn
             hook=FaultHookName.WEIGHT_UPDATE_AFTER_P2P_SUBMIT.value,
             mode=FailureMode.SIGKILL.value,
             target=target.value,
+            delay_ms=delay_ms,
             acknowledged=state,
         )
 
@@ -516,6 +525,110 @@ class TestArmingRefusedBeforeAnythingWasArmed:
             compute_hook_harms(log.events)
 
 
+# =================================== delays ===================================
+
+
+class TestDrawingASoakDelay:
+    def test_the_same_seed_draws_the_same_delays(self) -> None:
+        """A soak that failed on a delayed fault has to be replayable from its seed alone."""
+        first = [hook_forms.draw_fault_hook_delay_ms(random.Random(20260929)) for _ in range(5)]
+        second = [hook_forms.draw_fault_hook_delay_ms(random.Random(20260929)) for _ in range(5)]
+
+        assert first == second
+
+    def test_successive_draws_from_one_generator_differ(self) -> None:
+        """A helper returning one constant would give the soak a single delay dressed up as a random one."""
+        rng = random.Random(20260929)
+
+        drawn = [hook_forms.draw_fault_hook_delay_ms(rng) for _ in range(20)]
+
+        assert len(set(drawn)) > 1
+
+    def test_every_draw_is_a_delay_the_worker_accepts(self) -> None:
+        """An arm above the worker's bound is refused, so a draw outside it would break the soak, not delay it."""
+        rng = random.Random(20260929)
+
+        drawn = [hook_forms.draw_fault_hook_delay_ms(rng) for _ in range(200)]
+
+        assert all(isinstance(delay, int) and not isinstance(delay, bool) for delay in drawn)
+        assert min(drawn) >= hook_forms.SOAK_DELAY_MS_MIN
+        assert max(drawn) <= hook_forms.SOAK_DELAY_MS_MAX
+
+    def test_the_whole_documented_range_is_asked_of_the_generator(self) -> None:
+        """An exclusive upper bound would drop the longest delay the soak is written to cover."""
+        asked: list[tuple[int, int]] = []
+
+        class _RecordingRandom(random.Random):
+            def randint(self, a: int, b: int) -> int:
+                asked.append((a, b))
+                return b
+
+        drawn = hook_forms.draw_fault_hook_delay_ms(_RecordingRandom(0))
+
+        assert asked == [(hook_forms.SOAK_DELAY_MS_MIN, hook_forms.SOAK_DELAY_MS_MAX)]
+        assert drawn == hook_forms.SOAK_DELAY_MS_MAX
+
+
+class TestTheSoakArmsADrawnDelay:
+    def test_the_drawn_delay_is_both_sent_and_recorded(self, tmp_path: Path) -> None:
+        """The delay only becomes evidence if the same value reaches the worker and the run's own books."""
+        log = EventLog()
+        _write_events(tmp_path / "events", file_name="controller.jsonl", events=[_assignment()])
+        form = LocalHookFaultForm(_context(tmp_path, log=log))
+
+        with _api_server_listing() as mock_requests:
+            mock_requests.post.side_effect = lambda url, json, timeout: mock_response({})
+            form.inject(_drawn_trainer_cell(), random.Random(20260929))
+
+        (harm,) = compute_hook_harms(log.events)
+        (post,) = mock_requests.post.call_args_list
+        assert post.kwargs["json"]["delay_ms"] == harm.delay_ms
+        assert hook_forms.SOAK_DELAY_MS_MIN <= harm.delay_ms <= hook_forms.SOAK_DELAY_MS_MAX
+
+    def test_the_delay_comes_from_the_generator_the_form_was_drawn_with(self, tmp_path: Path) -> None:
+        """The soak draws its source, its point and its delay from one seeded stream, or a replay diverges."""
+        log = EventLog()
+        _write_events(tmp_path / "events", file_name="controller.jsonl", events=[_assignment()])
+        form = LocalHookFaultForm(_context(tmp_path, log=log))
+        replay = random.Random(20260929)
+        replay.choice([_TRAINER])
+        replay.choice(form.candidate_hooks())
+
+        with _api_server_listing() as mock_requests:
+            mock_requests.post.side_effect = lambda url, json, timeout: mock_response({})
+            form.inject(_drawn_trainer_cell(), random.Random(20260929))
+
+        (harm,) = compute_hook_harms(log.events)
+        assert harm.delay_ms == hook_forms.draw_fault_hook_delay_ms(replay)
+
+    def test_a_fire_that_waited_the_armed_delay_is_delivered(self, tmp_path: Path) -> None:
+        """A delayed fault that really ran is the evidence the soak armed it for."""
+        log = EventLog()
+        _observe_cluster(log)
+        _arm(log, delay_ms=500)
+        _write_events(tmp_path / "events", file_name="controller.jsonl", events=[_assignment()])
+        _write_events(tmp_path / "events", file_name="actor.jsonl", events=[_fire(delay_ms=500)])
+
+        _collect(log, tmp_path)
+
+        (harm,) = compute_hook_harms(log.events)
+        assert harm.delivered and harm.fire.delay_ms == 500
+
+    def test_a_fire_that_waited_another_time_leaves_the_request_outstanding(self, tmp_path: Path) -> None:
+        """A fault that landed inside the update it was armed to outlive tested the moment nobody asked about."""
+        log = EventLog()
+        _observe_cluster(log)
+        _arm(log, delay_ms=500)
+        _write_events(tmp_path / "events", file_name="controller.jsonl", events=[_assignment()])
+        _write_events(tmp_path / "events", file_name="actor.jsonl", events=[_fire(delay_ms=0)])
+
+        _collect(log, tmp_path)
+
+        (harm,) = compute_hook_harms(log.events)
+        assert not harm.delivered and "not the 500ms it was armed for" in harm.fire.rejected_because
+        assert compute_unresolved_hook_harms(log.events)
+
+
 # ============================== fire collection ===============================
 
 
@@ -666,6 +779,7 @@ class TestFireCollection:
         (_fire(outcome=FaultHookOutcome.UNKNOWN), "not the fired"),
         (_fire(outcome=FaultHookOutcome.REFUSED), "not the fired"),
         (_fire(target=FaultHookTarget.REMOTE_INFERENCE_CELL), "not the armed local"),
+        (_fire(delay_ms=500), "not the 0ms it was armed for"),
     ],
 )
 def test_a_fire_that_does_not_match_the_arm_is_rejected(
@@ -854,7 +968,7 @@ def test_a_delivered_fire_naming_a_refused_request_fails_the_run(tmp_path: Path)
     _write_events(
         tmp_path / "events",
         file_name="actor.jsonl",
-        events=[_fire(request_id=harm.request_id, hook=harm.hook, mode=harm.mode)],
+        events=[_fire(request_id=harm.request_id, hook=harm.hook, mode=harm.mode, delay_ms=harm.delay_ms)],
     )
 
     _collect(log, tmp_path)

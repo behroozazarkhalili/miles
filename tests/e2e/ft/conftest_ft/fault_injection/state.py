@@ -123,6 +123,7 @@ class HookArmEvent(BaseEvent):
     hook: str
     mode: str
     target: str
+    delay_ms: int
     acknowledged: bool
 
 
@@ -137,6 +138,7 @@ class HookFireEvent(BaseEvent):
     mode: str
     target: str
     outcome: str
+    delay_ms: int
     weight_version: int | None
     source_cell_index: int | None
     source_rank_within_cell: int | None
@@ -191,6 +193,7 @@ class EventLog:
         hook: str,
         mode: str,
         target: str,
+        delay_ms: int,
         acknowledged: bool,
     ) -> None:
         self._append(
@@ -205,6 +208,7 @@ class EventLog:
                 hook=hook,
                 mode=mode,
                 target=target,
+                delay_ms=delay_ms,
                 acknowledged=acknowledged,
             )
         )

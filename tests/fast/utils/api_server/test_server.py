@@ -18,6 +18,7 @@ from miles.utils.ft_utils.api_server.fault_hook_sources import _FaultHookSourceR
 from miles.utils.ft_utils.api_server.handles import _CellHandler
 from miles.utils.ft_utils.api_server.registry import _CellRegistry
 from miles.utils.http_utils import find_available_port
+from miles.utils.test_utils.fault_hooks import MAX_FAULT_HOOK_DELAY_MS
 from miles.utils.test_utils.fault_injector import FailureMode
 from miles.utils.workers.cell_operations.ray import RayCellOperations
 
@@ -451,6 +452,7 @@ class TestStartApiServerRegistration:
                     "mode": "sigkill",
                     "request_id": "req-1",
                     "target": "remote_inference_cell",
+                    "delay_ms": 400,
                 },
             )
             suspended = await client.patch("/api/v1/cells/trainer-engine-actor-0", json={"spec": {"suspend": True}})
@@ -463,6 +465,7 @@ class TestStartApiServerRegistration:
                 mode="sigkill",
                 request_id="req-1",
                 target="remote_inference_cell",
+                delay_ms=400,
             )
         ]
         assert suspended.status_code == 404
@@ -721,6 +724,7 @@ class TestArmFaultHook:
                 sub_index=2,
                 request_id="req-1",
                 target="local",
+                delay_ms=0,
             )
         ]
 
@@ -817,6 +821,84 @@ class TestArmFaultHook:
 
         assert [resp.status_code for resp in (missing, empty, null)] == [422] * 3
         assert source_controller.armed == []
+
+    @pytest.mark.asyncio
+    async def test_a_delay_survives_the_route(
+        self, source_controller: MockSourceController, async_client: httpx.AsyncClient
+    ) -> None:
+        """A delayed fault is a different scenario from an immediate one, so the wait cannot be dropped in transit."""
+        resp = await async_client.post(
+            f"/api/v1/cells/{SOURCE_CELL_ID}/arm-fault-hook",
+            json={
+                "expected_workers_hash": SOURCE_WORKERS_HASH,
+                "hook": "weight_update.before_all_gather",
+                "mode": "sigkill",
+                "request_id": "req-1",
+                "delay_ms": 250,
+            },
+        )
+
+        assert resp.status_code == 200
+        assert source_controller.armed[0]["delay_ms"] == 250
+
+    @pytest.mark.asyncio
+    async def test_arming_waits_for_nothing_by_default(
+        self, source_controller: MockSourceController, async_client: httpx.AsyncClient
+    ) -> None:
+        """Every scenario written before delays existed asks for a fault that runs where the hook is reached."""
+        resp = await async_client.post(
+            f"/api/v1/cells/{SOURCE_CELL_ID}/arm-fault-hook",
+            json={
+                "expected_workers_hash": SOURCE_WORKERS_HASH,
+                "hook": "weight_update.before_all_gather",
+                "mode": "sigkill",
+                "request_id": "req-1",
+            },
+        )
+
+        assert resp.status_code == 200
+        assert source_controller.armed[0]["delay_ms"] == 0
+
+    @pytest.mark.asyncio
+    async def test_a_delay_that_is_not_a_bounded_whole_number_of_milliseconds_is_refused(
+        self, source_controller: MockSourceController, async_client: httpx.AsyncClient
+    ) -> None:
+        """A delay nobody can honour must fail the arm rather than be rounded into some other scenario."""
+        url = f"/api/v1/cells/{SOURCE_CELL_ID}/arm-fault-hook"
+        armed = {
+            "expected_workers_hash": SOURCE_WORKERS_HASH,
+            "hook": "weight_update.before_all_gather",
+            "mode": "sigkill",
+            "request_id": "req-1",
+        }
+
+        negative = await async_client.post(url, json={**armed, "delay_ms": -1})
+        too_long = await async_client.post(url, json={**armed, "delay_ms": MAX_FAULT_HOOK_DELAY_MS + 1})
+        fractional = await async_client.post(url, json={**armed, "delay_ms": 1.5})
+        boolean = await async_client.post(url, json={**armed, "delay_ms": True})
+        text = await async_client.post(url, json={**armed, "delay_ms": "100"})
+
+        assert [resp.status_code for resp in (negative, too_long, fractional, boolean, text)] == [422] * 5
+        assert source_controller.armed == []
+
+    @pytest.mark.asyncio
+    async def test_the_longest_delay_the_worker_accepts_survives_the_route(
+        self, source_controller: MockSourceController, async_client: httpx.AsyncClient
+    ) -> None:
+        """The bound is inclusive, and a request at it must reach the worker rather than be refused here."""
+        resp = await async_client.post(
+            f"/api/v1/cells/{SOURCE_CELL_ID}/arm-fault-hook",
+            json={
+                "expected_workers_hash": SOURCE_WORKERS_HASH,
+                "hook": "weight_update.before_all_gather",
+                "mode": "sigkill",
+                "request_id": "req-1",
+                "delay_ms": MAX_FAULT_HOOK_DELAY_MS,
+            },
+        )
+
+        assert resp.status_code == 200
+        assert source_controller.armed[0]["delay_ms"] == MAX_FAULT_HOOK_DELAY_MS
 
     @pytest.mark.asyncio
     async def test_an_engine_cell_is_no_fault_hook_source(

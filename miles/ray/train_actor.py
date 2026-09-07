@@ -183,8 +183,8 @@ class TrainRayActor(NodeProbeMixin):
         _inject_fault(mode=mode)
 
     @rpc(concurrency_group="fault_injector")
-    def arm_fault_hook(self, *, hook: str, mode: str, request_id: str, target: str) -> None:
-        _arm_fault_hook(hook=hook, mode=mode, request_id=request_id, target=target)
+    def arm_fault_hook(self, *, hook: str, mode: str, request_id: str, target: str, delay_ms: int = 0) -> None:
+        _arm_fault_hook(hook=hook, mode=mode, request_id=request_id, target=target, delay_ms=delay_ms)
 
     @rpc(concurrency_group="kill_self")
     def kill_self(self) -> None:

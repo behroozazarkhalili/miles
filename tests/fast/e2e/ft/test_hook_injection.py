@@ -67,6 +67,7 @@ def _armed(
     snapshot_at: datetime = _T0,
     expected_source=None,
     target: FaultHookTarget = FaultHookTarget.LOCAL,
+    delay_ms: int = 0,
 ) -> hook_injection.ArmedFaultHook:
     return hook_injection.ArmedFaultHook(
         cell_name=_ARMED_CELL,
@@ -75,6 +76,7 @@ def _armed(
         mode=FailureMode.SIGKILL,
         target=target,
         request_id=_REQUEST_ID,
+        delay_ms=delay_ms,
         expected_source=expected_source or _source(rank=sub_index),
         trainer_workers_hash=trainer_hash,
         inference_workers_hash_of_cell_id=dict(inference if inference is not None else {**_ASSIGNED, **_UNRELATED}),
@@ -101,6 +103,7 @@ def _fire(
     outcome: FaultHookOutcome = FaultHookOutcome.FIRED,
     victim: tuple[str, str] | None = None,
     receiver_rank: int | None = 1,
+    delay_ms: int = 0,
 ) -> FaultHookFireEvent:
     return FaultHookFireEvent(
         timestamp=at,
@@ -111,6 +114,7 @@ def _fire(
         weight_version=weight_version,
         target=target.value,
         outcome=outcome.value,
+        delay_ms=delay_ms,
         victim_cell_id=None if victim is None else victim[0],
         victim_workers_hash=None if victim is None else victim[1],
         victim_worker_in_cell_index=None,
@@ -207,6 +211,7 @@ class TestTheArmRequestNamesTheGenerationItChose:
             mode=FailureMode.SIGKILL,
             target=FaultHookTarget.LOCAL,
             request_id=_REQUEST_ID,
+            delay_ms=300,
             trainer_snapshot=snapshot,
             inference_snapshot=hook_injection.CellSnapshot(
                 taken_at=_T0, workers_hash_of_cell_id={}, alive_cell_ids=frozenset()
@@ -221,6 +226,7 @@ class TestTheArmRequestNamesTheGenerationItChose:
             "target": FaultHookTarget.LOCAL.value,
             "sub_index": 2,
             "request_id": _REQUEST_ID,
+            "delay_ms": 300,
         }
         assert armed.trainer_workers_hash == _ARMED_HASH
 
@@ -364,6 +370,21 @@ class TestFireWitness:
 
         with pytest.raises(AssertionError, match="outside any weight update"):
             hook_injection.assert_hook_fired(_armed(), event_dir=tmp_path)
+
+    def test_a_fire_that_waited_another_time_than_it_was_armed_for_fails_the_run(self, tmp_path: Path):
+        """A delayed request that fired inside the update tested the moment the scenario was not written about."""
+        _write_events(tmp_path, file_name="actor.jsonl", events=[_fire(delay_ms=0)])
+
+        with pytest.raises(AssertionError, match="delay"):
+            hook_injection.assert_hook_fired(_armed(delay_ms=500), event_dir=tmp_path)
+
+    def test_the_delay_the_request_asked_for_is_carried_by_the_fire(self, tmp_path: Path):
+        """The worker records what it waited, which is how a run proves the fault landed after the update moved on."""
+        _write_events(tmp_path, file_name="actor.jsonl", events=[_fire(delay_ms=500)])
+
+        fire = hook_injection.assert_hook_fired(_armed(delay_ms=500), event_dir=tmp_path)
+
+        assert fire.delay_ms == 500
 
     def test_a_run_that_never_armed_fails_before_any_other_witness(self):
         """Without an arm there is no request id to look for, and a silent skip would report green."""

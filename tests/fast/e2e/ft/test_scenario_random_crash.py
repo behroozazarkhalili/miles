@@ -435,6 +435,7 @@ class TestHookFaultWiring:
             hook=FaultHookName.WEIGHT_UPDATE_AFTER_P2P_SUBMIT.value,
             mode=FailureMode.SIGKILL.value,
             target=FaultHookTarget.REMOTE_INFERENCE_CELL.value,
+            delay_ms=0,
             acknowledged=True,
         )
 

@@ -20,6 +20,7 @@ async def _arm(registry: _FaultHookSourceRegistry, *, cell_id: str = SOURCE_CELL
         sub_index=2,
         request_id="req-1",
         target=FaultHookTarget.REMOTE_INFERENCE_CELL,
+        delay_ms=250,
     )
 
 
@@ -60,6 +61,7 @@ class TestRoutingAnArm:
                 sub_index=2,
                 request_id="req-1",
                 target="remote_inference_cell",
+                delay_ms=250,
             )
         ]
 
@@ -101,6 +103,7 @@ class TestRoutingAnArm:
             sub_index=0,
             request_id="req-1",
             target=FaultHookTarget.LOCAL,
+            delay_ms=0,
         )
 
         assert report.refused_because == "it now runs another incarnation"

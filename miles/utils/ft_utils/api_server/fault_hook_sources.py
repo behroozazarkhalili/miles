@@ -26,6 +26,7 @@ class _FaultHookSourceController(Protocol):
         sub_index: int,
         request_id: str,
         target: str,
+        delay_ms: int,
     ) -> FaultHookArmingReport: ...
 
 
@@ -47,6 +48,7 @@ class _FaultHookSourceRegistry:
         sub_index: int,
         request_id: str,
         target: FaultHookTarget,
+        delay_ms: int,
     ) -> FaultHookArmingReport:
         controller = await self._resolve(cell_id)
         return await controller.arm_fault_hook(
@@ -57,6 +59,7 @@ class _FaultHookSourceRegistry:
             sub_index=sub_index,
             request_id=request_id,
             target=target.value,
+            delay_ms=delay_ms,
         )
 
     async def _resolve(self, cell_id: str) -> _FaultHookSourceController:
