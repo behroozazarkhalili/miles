@@ -21,6 +21,7 @@ from sglang.srt.server_args import ServerArgs
 from miles.backends.sglang_utils.sglang_api_client import SGLangApiClient
 from miles.backends.training_utils.parallel import ParallelState
 from miles.backends.training_utils.weight_update.hf_weight_iterator import WeightUpdatePlacement
+from miles.backends.training_utils.weight_update.inference_cell_health import InferenceCellHealth
 from miles.backends.training_utils.weight_update.protocol import WeightTransferProtocol
 from miles.backends.training_utils.weight_update.protocols.p2p_inference_cell_updater import (
     TransferEngineMeta,
@@ -69,6 +70,8 @@ class UpdateWeightP2P(WeightTransferProtocol):
         self._shared_param_mapper: ParameterMapper | None = None
         self._weight_memory_registry: dict[str, tuple[int, int, int]] = {}
         self._replicas_by_representation: dict[str, torch.nn.Module] = {}
+        self.inference_cell_health = InferenceCellHealth()
+        self._cell_updaters_by_cell_id: dict[str, _P2PInferenceCellUpdater] = {}
         self.remote_weight_infos_by_session_id: dict[str, tuple] = {}
         self.session_id_to_server_args: dict[str, ServerArgs] = {}
         # in self._transfer_engine_meta_list: tuple of
@@ -116,14 +119,15 @@ class UpdateWeightP2P(WeightTransferProtocol):
 
                 # Last engine rank: fire-and-forget all sessions to background,
                 # as the weight will no longer be overwritten
-                futures = [
-                    cell_updater.submit_write(
+                futures = []
+                for cell_updater in meta.cell_updaters:
+                    future = cell_updater.submit_write(
                         engine_rank=meta.engine_rank,
                         names=transfer_ready_params,
                         weight_memory_registry=self._weight_memory_registry,
                     )
-                    for cell_updater in meta.cell_updaters
-                ]
+                    if future is not None:
+                        futures.append(future)
 
                 if i != last_idx:
                     # Non-last engine rank needs to be fully written to target before next update can happen.
@@ -160,9 +164,24 @@ class UpdateWeightP2P(WeightTransferProtocol):
 
         self.disconnect()
         self.rollout_engines = rollout_engines
+        self.inference_cell_health = InferenceCellHealth(engine_cell_ids)
 
         targets = self.transfer_plan.plan_p2p(engine_gpu_counts)
         self.is_sender = bool(targets)
+
+        if self.is_sender and self._transfer_engine is None:
+            # Create ONE transfer engine for all engine ranks
+            self._transfer_engine = create_transfer_engine()
+
+        self._cell_updaters_by_cell_id = {
+            cell_id: _P2PInferenceCellUpdater(
+                cell_id=cell_id,
+                transfer_engine=self._transfer_engine,
+                transfer_manager=self.transfer_manager,
+                health=self.inference_cell_health,
+            )
+            for cell_id in engine_cell_ids
+        }
 
         if self.is_sender:
             self.group_name = f"miles-p2p_{self.transfer_plan._gathered_dp_rank}"
@@ -176,10 +195,6 @@ class UpdateWeightP2P(WeightTransferProtocol):
             for target in targets:
                 targets_grouped_by_engine_rank.setdefault(target.engine_rank, []).append(target)
 
-            if self._transfer_engine is None:
-                # Create ONE transfer engine for all engine ranks
-                self._transfer_engine = create_transfer_engine()
-            cell_updaters_by_engine_ind: dict[int, _P2PInferenceCellUpdater] = {}
             for engine_rank, rank_targets in targets_grouped_by_engine_rank.items():
                 rank_session_ids = [targets_to_session_id[(t.engine_ind, t.engine_rank)] for t in rank_targets]
                 self._assert_one_weight_representation(engine_rank=engine_rank, session_ids=rank_session_ids)
@@ -191,14 +206,7 @@ class UpdateWeightP2P(WeightTransferProtocol):
                 rank_cell_updaters = []
                 for t in rank_targets:
                     target_session_id = targets_to_session_id[(t.engine_ind, t.engine_rank)]
-                    cell_updater = cell_updaters_by_engine_ind.get(t.engine_ind)
-                    if cell_updater is None:
-                        cell_updater = _P2PInferenceCellUpdater(
-                            cell_id=engine_cell_ids[t.engine_ind],
-                            transfer_engine=self._transfer_engine,
-                            transfer_manager=self.transfer_manager,
-                        )
-                        cell_updaters_by_engine_ind[t.engine_ind] = cell_updater
+                    cell_updater = self._cell_updaters_by_cell_id[engine_cell_ids[t.engine_ind]]
                     cell_updater.add_peer(
                         engine_rank=t.engine_rank,
                         remote_weight_info=RemoteWeightInfo(
@@ -216,7 +224,11 @@ class UpdateWeightP2P(WeightTransferProtocol):
 
     def disconnect(self) -> None:
         self.transfer_manager.wait_transfers()
+        for cell_updater in self._cell_updaters_by_cell_id.values():
+            cell_updater.dispose()
         self._transfer_engine_meta_list = []
+        self._cell_updaters_by_cell_id = {}
+        self.inference_cell_health = InferenceCellHealth()
         self.remote_weight_infos_by_session_id = {}
         self.session_id_to_server_args = {}
         self.rollout_engines = []

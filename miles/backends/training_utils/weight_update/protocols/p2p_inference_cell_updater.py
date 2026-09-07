@@ -4,6 +4,7 @@ from typing import Any, NamedTuple
 
 import torch
 
+from miles.backends.training_utils.weight_update.inference_cell_health import InferenceCellHealth
 from miles.backends.training_utils.weight_update.protocols.p2p_transfer_utils import (
     P2PTransferManager,
     RemoteWeightInfo,
@@ -13,11 +14,34 @@ logger = logging.getLogger(__name__)
 
 
 class _P2PInferenceCellUpdater:
-    def __init__(self, cell_id: str, transfer_engine: Any, transfer_manager: P2PTransferManager) -> None:
+    def __init__(
+        self,
+        cell_id: str,
+        transfer_engine: Any,
+        transfer_manager: P2PTransferManager,
+        health: InferenceCellHealth,
+    ) -> None:
         self.cell_id = cell_id
         self._transfer_engine = transfer_engine
         self._transfer_manager = transfer_manager
+        self._health = health
+        self._disposed = False
         self._peer_by_engine_rank: dict[int, RemoteWeightInfo] = {}
+
+    @property
+    def is_errored(self) -> bool:
+        return self._health.is_errored(self.cell_id)
+
+    @property
+    def is_disposed(self) -> bool:
+        return self._disposed
+
+    @property
+    def accepts_writes(self) -> bool:
+        return not self._disposed and not self.is_errored
+
+    def mark_errored(self, error: BaseException) -> None:
+        self._health.mark_errored(self.cell_id, error)
 
     def add_peer(self, engine_rank: int, remote_weight_info: RemoteWeightInfo) -> None:
         assert (
@@ -25,9 +49,14 @@ class _P2PInferenceCellUpdater:
         ), f"[P2P-Shared] Engine rank {engine_rank} already registered for cell {self.cell_id}"
         self._peer_by_engine_rank[engine_rank] = remote_weight_info
 
+    def dispose(self) -> None:
+        self._disposed = True
+
     def submit_write(
         self, engine_rank: int, names: list[str], weight_memory_registry: dict[str, tuple[int, int, int]]
-    ) -> Future:
+    ) -> Future | None:
+        if not self.accepts_writes:
+            return None
         return self._transfer_manager.submit_returning_future(
             self._write_one_peer,
             self._peer_by_engine_rank[engine_rank],
@@ -46,6 +75,10 @@ class _P2PInferenceCellUpdater:
         Used by the parallelized submission path where each session within an
         engine rank is submitted as a separate task to P2PTransferManager.
         """
+        if not self.accepts_writes:
+            logger.warning(f"[P2P-Shared] skipping a queued write to cell {self.cell_id}")
+            return
+
         source_ptrs, source_lens = [], []
         valid_names = []
 
