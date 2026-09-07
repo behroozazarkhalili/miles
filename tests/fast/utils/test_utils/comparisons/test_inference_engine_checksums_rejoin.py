@@ -21,6 +21,7 @@ def _write_updates(side_dir: Path, engines_per_rollout: list[int], *, trainer_mo
             dict(
                 rollout_id=rollout_id,
                 weight_version=rollout_id + 1,
+                adjacent_weight_change_expected=True,
                 trainer_model_id=trainer_model_id,
                 engine_checksums={f"cell-{index}": {"rank0/w": f"hash-{rollout_id}"} for index in range(num_engines)},
             ),

@@ -181,6 +181,7 @@ def _publication(
         rollout_id=rollout_id,
         weight_version=weight_version,
         trainer_model_id=trainer_model_id,
+        adjacent_weight_change_expected=True,
         engine_checksums=checksums,
     )
 

@@ -124,6 +124,9 @@ def _orchestration_args(**overrides) -> Namespace:
         debug_rollout_only=False,
         save_inference_engine_weight_checksum=True,
         start_rollout_id=0,
+        update_weights_interval=1,
+        lora_rank=0,
+        lora_adapter_path=None,
         ci_ft_test_actions=None,
         ci_ft_test_actions_path=None,
         mini_ft_controller_enable=True,
@@ -348,6 +351,7 @@ class TestTheScriptLogsTheChecksumsTheEnginesNowServe:
             weight_version=11,
             trainer_model_id=None,
             engine_checksums={"cell-a": {"rank0/w": "e0"}, "cell-b": {"rank0/w": "e1"}},
+            adjacent_weight_change_expected=True,
         )
 
     async def test_a_cell_that_failed_this_update_is_left_out_of_the_audit(self):
@@ -380,4 +384,37 @@ class TestTheScriptLogsTheChecksumsTheEnginesNowServe:
             weight_version=11,
             trainer_model_id="solver",
             engine_checksums={"cell-a": {"rank0/w": "e0"}},
+            adjacent_weight_change_expected=True,
         )
+
+    async def test_a_run_that_publishes_every_step_asks_for_the_adjacency_check(self):
+        """The default single-step run is exactly the one the adjacency rule was written for."""
+        response = _checksum_response({"cell-a": {"w": "e0"}})
+
+        _, event_logger = await self._log(_orchestration_args(), response=response)
+
+        assert event_logger.log.call_args.args[1]["adjacent_weight_change_expected"] is True
+
+    async def test_an_interval_greater_than_one_disables_the_adjacency_check(self):
+        """We do not support --update-weights-interval > 1, so its publications cannot be held to moving weights."""
+        response = _checksum_response({"cell-a": {"w": "e0"}})
+
+        _, event_logger = await self._log(_orchestration_args(update_weights_interval=2), response=response)
+
+        assert event_logger.log.call_args.args[1]["adjacent_weight_change_expected"] is False
+
+    async def test_a_lora_run_disables_the_adjacency_check(self):
+        """A LoRA sync pushes adapters, so the base weights it republishes may legitimately be unchanged."""
+        response = _checksum_response({"cell-a": {"w": "e0"}})
+
+        _, event_logger = await self._log(_orchestration_args(lora_rank=8), response=response)
+
+        assert event_logger.log.call_args.args[1]["adjacent_weight_change_expected"] is False
+
+    async def test_a_lora_adapter_path_alone_disables_the_adjacency_check(self):
+        """LoRA is also switched on by loading an adapter, and that run is just as unverifiable."""
+        response = _checksum_response({"cell-a": {"w": "e0"}})
+
+        _, event_logger = await self._log(_orchestration_args(lora_adapter_path="/adapters/one"), response=response)
+
+        assert event_logger.log.call_args.args[1]["adjacent_weight_change_expected"] is False

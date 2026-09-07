@@ -45,6 +45,22 @@ def group_observations_by_publication(events: Iterable[Event]) -> dict[Publicati
     }
 
 
+def adjacent_change_expected_by_publication(events: Iterable[Event]) -> dict[PublicationKey, bool]:
+    expected: dict[PublicationKey, bool] = {}
+
+    for event in events:
+        if not isinstance(event, InferenceEngineWeightChecksumEvent):
+            continue
+        key = PublicationKey(trainer_model_id=event.trainer_model_id, weight_version=event.weight_version)
+        claimed = expected.setdefault(key, event.adjacent_weight_change_expected)
+        assert claimed == event.adjacent_weight_change_expected, (
+            f"{format_publication(key)} was recorded both with and without adjacent_weight_change_expected, so one "
+            f"published version would be judged under two different rules"
+        )
+
+    return expected
+
+
 def canonical_checksums_by_publication(events: Iterable[Event]) -> dict[PublicationKey, InferenceEngineChecksums]:
     return {key: observations[0].checksums for key, observations in group_observations_by_publication(events).items()}
 

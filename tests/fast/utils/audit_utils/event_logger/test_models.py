@@ -12,6 +12,7 @@ class TestInferenceEngineWeightChecksumEvent:
             "source": {"component": "main"},
             "rollout_id": None,
             "weight_version": 3,
+            "adjacent_weight_change_expected": True,
             "engine_checksums": {"cell-a": {"rank0/embed.weight": "aaa"}},
         }
 
@@ -24,6 +25,7 @@ class TestInferenceEngineWeightChecksumEvent:
             "timestamp": "2026-01-01T00:00:00Z",
             "source": {"component": "main"},
             "rollout_id": 3,
+            "adjacent_weight_change_expected": True,
             "engine_checksums": {"cell-a": {"rank0/embed.weight": "aaa"}},
         }
 
@@ -37,8 +39,22 @@ class TestInferenceEngineWeightChecksumEvent:
             "source": {"component": "main"},
             "rollout_id": 3,
             "weight_version": 3,
+            "adjacent_weight_change_expected": True,
             "engine_checksums": [{"rank0/embed.weight": "aaa"}],
         }
 
         with pytest.raises(ValidationError, match="engine_checksums"):
+            InferenceEngineWeightChecksumEvent.model_validate(data)
+
+    def test_a_missing_adjacent_change_flag_is_rejected(self) -> None:
+        """Guessing whether the adjacency rule applies would either silence it or fire it on a mode we disable."""
+        data = {
+            "timestamp": "2026-01-01T00:00:00Z",
+            "source": {"component": "main"},
+            "rollout_id": 3,
+            "weight_version": 3,
+            "engine_checksums": {"cell-a": {"rank0/embed.weight": "aaa"}},
+        }
+
+        with pytest.raises(ValidationError, match="adjacent_weight_change_expected"):
             InferenceEngineWeightChecksumEvent.model_validate(data)

@@ -5,6 +5,7 @@ import pytest
 from miles.utils.audit_utils.event_logger.models import InferenceEngineWeightChecksumEvent, MetricEvent
 from miles.utils.audit_utils.inference_engine_checksum_grouping import (
     PublicationKey,
+    adjacent_change_expected_by_publication,
     canonical_checksums_by_publication,
     format_publication,
     group_observations_by_publication,
@@ -21,6 +22,7 @@ def _event(
     engine_checksums: dict[str, dict[str, str]],
     rollout_id: int = 0,
     trainer_model_id: str | None = None,
+    adjacent_weight_change_expected: bool = True,
 ) -> InferenceEngineWeightChecksumEvent:
     return InferenceEngineWeightChecksumEvent(
         timestamp=_FIXED_TS,
@@ -28,6 +30,7 @@ def _event(
         rollout_id=rollout_id,
         weight_version=weight_version,
         trainer_model_id=trainer_model_id,
+        adjacent_weight_change_expected=adjacent_weight_change_expected,
         engine_checksums=engine_checksums,
     )
 
@@ -185,3 +188,47 @@ class TestFormatPublication:
     def test_the_unnamed_policy_gets_a_stable_label(self) -> None:
         """Single policy runs still need a readable, stable label in every issue they raise."""
         assert format_publication(PublicationKey(trainer_model_id=None, weight_version=4)) == "default/weight_v4"
+
+
+class TestAdjacentChangeExpectedByPublication:
+    def test_the_producers_answer_is_carried_through(self) -> None:
+        """The rule is disabled by the run that produced the events, not by anything the analyzer infers."""
+        events = [_event(weight_version=3, adjacent_weight_change_expected=False, engine_checksums={"a": {"w": "x"}})]
+
+        assert adjacent_change_expected_by_publication(events) == {PublicationKey(None, 3): False}
+
+    def test_a_publication_observed_twice_under_one_policy_is_one_answer(self) -> None:
+        """A version reported by several updates of the same run repeats its claim rather than restating it."""
+        events = [
+            _event(rollout_id=0, weight_version=3, engine_checksums={"a": {"w": "x"}}),
+            _event(rollout_id=1, weight_version=3, engine_checksums={"a": {"w": "y"}}),
+        ]
+
+        assert adjacent_change_expected_by_publication(events) == {PublicationKey(None, 3): True}
+
+    def test_two_observations_of_one_publication_that_disagree_are_rejected(self) -> None:
+        """Letting either value win would judge one published version under a rule the other half never claimed."""
+        events = [
+            _event(rollout_id=0, weight_version=3, engine_checksums={"a": {"w": "x"}}),
+            _event(
+                rollout_id=1,
+                weight_version=3,
+                adjacent_weight_change_expected=False,
+                engine_checksums={"a": {"w": "x"}},
+            ),
+        ]
+
+        with pytest.raises(AssertionError, match="both with and without"):
+            adjacent_change_expected_by_publication(events)
+
+    def test_each_publication_keeps_its_own_answer(self) -> None:
+        """A run that changes mode mid-flight disables only the versions it published in that mode."""
+        events = [
+            _event(weight_version=3, engine_checksums={"a": {"w": "x"}}),
+            _event(weight_version=4, adjacent_weight_change_expected=False, engine_checksums={"a": {"w": "y"}}),
+        ]
+
+        assert adjacent_change_expected_by_publication(events) == {
+            PublicationKey(None, 3): True,
+            PublicationKey(None, 4): False,
+        }

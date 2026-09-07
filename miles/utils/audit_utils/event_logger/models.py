@@ -119,6 +119,7 @@ class InferenceEngineWeightChecksumEvent(EventBase):
     trainer_model_id: str | None = None
     # One {tensor -> hash} dict per rollout engine; a TP>1 engine's ranks merge with a rank{r}/ prefix.
     engine_checksums: dict[str, dict[str, str]]
+    adjacent_weight_change_expected: bool
 
 
 class TrainAdvantageComputationEvent(_ActorTrainEventBase):

@@ -17,6 +17,7 @@ def _make_event(
     weight_version: int,
     engine_checksums: dict[str, dict[str, str]],
     trainer_model_id: str | None = None,
+    adjacent_weight_change_expected: bool = True,
 ) -> InferenceEngineWeightChecksumEvent:
     return InferenceEngineWeightChecksumEvent(
         timestamp=_FIXED_TS,
@@ -24,6 +25,7 @@ def _make_event(
         rollout_id=rollout_id,
         weight_version=weight_version,
         trainer_model_id=trainer_model_id,
+        adjacent_weight_change_expected=adjacent_weight_change_expected,
         engine_checksums=engine_checksums,
     )
 
@@ -204,3 +206,14 @@ class TestCheck:
         ]
         with pytest.raises(AssertionError, match="reported no tensor checksum"):
             check(events)
+
+    def test_a_mode_that_disables_the_adjacency_check_still_compares_cells(self) -> None:
+        """Only weight movement is unverifiable in those modes; two cells of one version must still agree."""
+        events = [
+            _make_event(
+                weight_version=1,
+                adjacent_weight_change_expected=False,
+                engine_checksums={"cell-a": {"rank0/w": "aaa"}, "cell-b": {"rank0/w": "zzz"}},
+            )
+        ]
+        assert len(check(events)) == 1

@@ -149,6 +149,7 @@ def _publication(
         rollout_id=1,
         weight_version=weight_version,
         trainer_model_id=trainer_model_id,
+        adjacent_weight_change_expected=True,
         engine_checksums={cell_id: {"w": f"hash-{cell_id}"} for cell_id in cell_ids},
     )
 
@@ -1395,6 +1396,7 @@ def _write_recovery_source(tmp_path: Path) -> None:
                 source=_CONTROLLER,
                 rollout_id=1,
                 weight_version=1,
+                adjacent_weight_change_expected=True,
                 engine_checksums={"rollout-engine-00000": {"embedding": "abc"}},
             ),
         ],

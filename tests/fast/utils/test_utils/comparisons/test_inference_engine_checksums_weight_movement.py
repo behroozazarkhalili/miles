@@ -21,6 +21,7 @@ def _write_checksums(side_dir: Path, checksums: list[str]) -> None:
             dict(
                 rollout_id=index,
                 weight_version=index + 1,
+                adjacent_weight_change_expected=True,
                 trainer_model_id=None,
                 engine_checksums={"cell-a": {"rank0/w": checksum}},
             ),

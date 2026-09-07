@@ -1,6 +1,7 @@
 import asyncio
 import logging
 import socket
+from argparse import Namespace
 from typing import NamedTuple
 
 import ray
@@ -38,6 +39,7 @@ from miles.utils.hot_restart import (
     wait_trainers_idle,
     wait_until_worker_not_initialized,
 )
+from miles.utils.lora import is_lora_enabled
 from miles.utils.test_utils.ft_test_actions import FTTestActionOrchestrationExecutor
 from miles.utils.workers.types import DeployComponent, DeploymentIdentity
 from miles.utils.workers.worker_handle import BaseWorkerHandle
@@ -378,8 +380,13 @@ async def _maybe_log_inference_engine_weight_checksums(
             weight_version=weight_version,
             trainer_model_id=trainer_model_id,
             engine_checksums=engine_checksums,
+            adjacent_weight_change_expected=_compute_adjacent_weight_change_expected(args),
         ),
     )
+
+
+def _compute_adjacent_weight_change_expected(args: Namespace) -> bool:
+    return args.update_weights_interval == 1 and not is_lora_enabled(args)
 
 
 # TODO: move (when reorganizing files)

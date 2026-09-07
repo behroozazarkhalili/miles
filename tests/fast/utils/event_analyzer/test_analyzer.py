@@ -128,10 +128,16 @@ def _log_inference_engine_checksum_event(
     rollout_id: int,
     weight_version: int,
     engine_checksums: dict[str, dict[str, str]],
+    adjacent_weight_change_expected: bool = True,
 ) -> None:
     event_logger.log(
         InferenceEngineWeightChecksumEvent,
-        dict(rollout_id=rollout_id, weight_version=weight_version, engine_checksums=engine_checksums),
+        dict(
+            rollout_id=rollout_id,
+            weight_version=weight_version,
+            adjacent_weight_change_expected=adjacent_weight_change_expected,
+            engine_checksums=engine_checksums,
+        ),
     )
 
 
@@ -260,6 +266,23 @@ class TestInferenceEngineWeightProgressRuleWiredIn:
                 rollout_id=weight_version,
                 weight_version=weight_version,
                 engine_checksums={"cell-a": {"rank0/w": checksum}},
+            )
+        event_logger.close()
+
+        assert run_analysis(event_dir=tmp_path) == []
+
+    def test_a_run_that_disabled_the_rule_reports_nothing(self, tmp_path: Path) -> None:
+        """An interval>1 or LoRA-only run must not fail the whole training run on a check it opted out of."""
+        event_logger = EventLogger(
+            log_dir=tmp_path, file_name="e.jsonl", source=SimpleProcessIdentity(component="main")
+        )
+        for weight_version in (1, 2):
+            _log_inference_engine_checksum_event(
+                event_logger,
+                rollout_id=weight_version,
+                weight_version=weight_version,
+                adjacent_weight_change_expected=False,
+                engine_checksums={"cell-a": {"rank0/w": "aaa"}},
             )
         event_logger.close()
 

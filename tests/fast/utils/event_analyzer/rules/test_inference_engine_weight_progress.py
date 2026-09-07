@@ -2,6 +2,8 @@
 
 from datetime import datetime, timezone
 
+import pytest
+
 from miles.utils.audit_utils.event_analyzer.rules.inference_engine_weight_progress import check
 from miles.utils.audit_utils.event_logger.models import InferenceEngineWeightChecksumEvent
 from miles.utils.audit_utils.process_identity import SimpleProcessIdentity
@@ -15,6 +17,7 @@ def _make_event(
     engine_checksums: dict[str, dict[str, str]],
     rollout_id: int | None = None,
     trainer_model_id: str | None = None,
+    adjacent_weight_change_expected: bool = True,
 ) -> InferenceEngineWeightChecksumEvent:
     return InferenceEngineWeightChecksumEvent(
         timestamp=_FIXED_TS,
@@ -22,6 +25,7 @@ def _make_event(
         rollout_id=weight_version if rollout_id is None else rollout_id,
         weight_version=weight_version,
         trainer_model_id=trainer_model_id,
+        adjacent_weight_change_expected=adjacent_weight_change_expected,
         engine_checksums=engine_checksums,
     )
 
@@ -140,3 +144,66 @@ class TestCheck:
         ]
 
         assert [issue.label_current for issue in check(events)] == ["default/weight_v2", "default/weight_v3"]
+
+
+class TestCheckWhenTheProducerDisabledTheRule:
+    def test_a_disabled_publication_is_not_judged(self) -> None:
+        """An interval>1 or LoRA-only run may legitimately republish identical base weights."""
+        events = [
+            _make_event(weight_version=1, adjacent_weight_change_expected=False, engine_checksums=_same()),
+            _make_event(weight_version=2, adjacent_weight_change_expected=False, engine_checksums=_same()),
+        ]
+
+        assert check(events) == []
+
+    def test_a_disabled_predecessor_disables_the_pair(self) -> None:
+        """Whether the weights should have moved is a property of the update that published them."""
+        events = [
+            _make_event(weight_version=1, adjacent_weight_change_expected=False, engine_checksums=_same()),
+            _make_event(weight_version=2, adjacent_weight_change_expected=True, engine_checksums=_same()),
+        ]
+
+        assert check(events) == []
+
+    def test_a_disabled_publication_breaks_the_chain_instead_of_vanishing(self) -> None:
+        """Dropping it would leave v1 and v3 looking adjacent and report a run nobody claimed to check."""
+        events = [
+            _make_event(weight_version=1, adjacent_weight_change_expected=True, engine_checksums=_same()),
+            _make_event(weight_version=2, adjacent_weight_change_expected=False, engine_checksums=_same()),
+            _make_event(weight_version=3, adjacent_weight_change_expected=True, engine_checksums=_same()),
+        ]
+
+        assert check(events) == []
+
+    def test_two_observations_of_one_publication_that_disagree_are_rejected(self) -> None:
+        """One published version cannot both claim and disclaim the check, so silently taking one side is a lie."""
+        events = [
+            _make_event(rollout_id=0, weight_version=1, engine_checksums=_same()),
+            _make_event(rollout_id=1, weight_version=2, engine_checksums=_same()),
+            _make_event(
+                rollout_id=2, weight_version=2, adjacent_weight_change_expected=False, engine_checksums=_same()
+            ),
+        ]
+
+        with pytest.raises(AssertionError, match="both with and without"):
+            check(events)
+
+    def test_a_repeated_disabled_observation_is_still_one_claim(self) -> None:
+        """Reporting the same disabled version twice must not read as a conflict."""
+        events = [
+            _make_event(
+                rollout_id=0, weight_version=1, adjacent_weight_change_expected=False, engine_checksums=_same()
+            ),
+            _make_event(
+                rollout_id=1, weight_version=2, adjacent_weight_change_expected=False, engine_checksums=_same()
+            ),
+            _make_event(
+                rollout_id=2, weight_version=2, adjacent_weight_change_expected=False, engine_checksums=_same()
+            ),
+        ]
+
+        assert check(events) == []
+
+
+def _same() -> dict[str, dict[str, str]]:
+    return {"cell-a": {"w": "aaa"}}

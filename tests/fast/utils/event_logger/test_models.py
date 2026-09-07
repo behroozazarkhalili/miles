@@ -153,12 +153,14 @@ class TestInferenceEngineWeightChecksumEvent:
             source=_FIXED_SOURCE,
             rollout_id=4,
             weight_version=9,
+            adjacent_weight_change_expected=True,
             engine_checksums=engine_checksums,
         )
         parsed = _event_adapter.validate_json(event.model_dump_json())
         assert isinstance(parsed, InferenceEngineWeightChecksumEvent)
         assert parsed.rollout_id == 4
         assert parsed.weight_version == 9
+        assert parsed.adjacent_weight_change_expected is True
         assert parsed.engine_checksums == engine_checksums
 
 
@@ -222,6 +224,7 @@ class TestDiscriminatedUnionParsesAllEvents:
                 source=_FIXED_SOURCE,
                 rollout_id=0,
                 weight_version=1,
+                adjacent_weight_change_expected=True,
                 engine_checksums={"cell-a": {"rank0/w": "aaa"}},
             ),
         ]
