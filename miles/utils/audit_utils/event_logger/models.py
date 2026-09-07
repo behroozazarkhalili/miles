@@ -1,4 +1,5 @@
 from datetime import datetime
+from enum import Enum
 from typing import Annotated, Any, Literal
 
 from pydantic import Discriminator
@@ -145,6 +146,53 @@ class MetricEvent(EventBase):
     metrics: dict[str, Any]
 
 
+class SampleOwner(str, Enum):
+    DATA_SOURCE = "data_source"
+    RETRY_BUFFER = "retry_buffer"
+    IN_FLIGHT = "in_flight"
+    OUTPUT_BUFFER = "output_buffer"
+    HANDED_TO_TRAINER = "handed_to_trainer"
+    TRAINED = "trained"
+    DROPPED = "dropped"
+
+
+class SampleOwnerTransitionEvent(EventBase):
+    lineage_id: str | None = None
+    type: Literal["sample_owner_transition"] = "sample_owner_transition"
+    sample_indices: list[int]
+    trainer_model_id: str | None = None
+    from_owner: SampleOwner
+    to_owner: SampleOwner
+    rollout_id: int | None = None
+    reason: str | None = None
+
+
+class RolloutHoldingsSnapshotEvent(EventBase):
+    lineage_id: str | None = None
+    type: Literal["rollout_holdings_snapshot"] = "rollout_holdings_snapshot"
+    rollout_id: int
+    trainer_model_id: str | None = None
+    holdings: dict[SampleOwner, list[int]]
+    replays_samples: bool
+    reason: Literal["step", "save", "final"]
+
+
+class TrainerTrainedSamplesEvent(EventBase):
+    lineage_id: str | None = None
+    type: Literal["trainer_trained_samples"] = "trainer_trained_samples"
+    rollout_id: int
+    trainer_model_id: str | None = None
+    sample_indices: list[int]
+
+
+class RolloutStateRestoreEvent(EventBase):
+    lineage_id: str | None = None
+    parent_lineage_id: str | None = None
+    type: Literal["rollout_state_restore"] = "rollout_state_restore"
+    rollout_id: int | None = None
+    rollout_ids: dict[str, int] | None = None
+
+
 Event = Annotated[
     TrainEngineLocalWeightChecksumEvent
     | WitnessSnapshotParamEvent
@@ -155,7 +203,11 @@ Event = Annotated[
     | TrainAdvantageComputationEvent
     | EnvReportEvent
     | EngineEnvReportEvent
-    | MetricEvent,
+    | MetricEvent
+    | SampleOwnerTransitionEvent
+    | RolloutHoldingsSnapshotEvent
+    | TrainerTrainedSamplesEvent
+    | RolloutStateRestoreEvent,
     Discriminator("type"),
 ]
 

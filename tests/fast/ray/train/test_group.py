@@ -15,7 +15,7 @@ from miles.backends.megatron_utils.ft.types import TrainStepOutcome, TrainStepOu
 from miles.ray.train.group import TrainerController, compute_trainer_health_checker_config
 from miles.utils import object_store
 from miles.utils.audit_utils.event_logger.logger import EventLogger, read_events, set_event_logger
-from miles.utils.audit_utils.event_logger.models import CellReconfigureEvent
+from miles.utils.audit_utils.event_logger.models import CellReconfigureEvent, TrainerTrainedSamplesEvent
 from miles.utils.audit_utils.process_identity import SimpleProcessIdentity
 from miles.utils.audit_utils.witness.allocator import WitnessIdAllocator
 from miles.utils.data import RolloutDataPack
@@ -27,6 +27,40 @@ from miles.utils.workers.naming import compute_cell_id
 pytestmark = pytest.mark.asyncio
 
 _DUMMY_DATA_PACK = RolloutDataPack(sample_indices=[0], data_ref=_MooncakeStoreObjectRef(payload="data"))
+
+
+class TestTrainedSampleOwnership:
+    @pytest.mark.parametrize(
+        "use_critic, num_critic_only_steps, rollout_id, expected_role",
+        [
+            (True, 2, 0, "critic"),
+            (True, 2, 1, "critic"),
+            (True, 2, 2, "actor"),
+            (True, 0, 0, "actor"),
+            (False, 2, 0, "actor"),
+        ],
+    )
+    def test_exactly_one_role_records_the_consumed_batch(
+        self,
+        ownership_event_dir: Path,
+        use_critic: bool,
+        num_critic_only_steps: int,
+        rollout_id: int,
+        expected_role: str,
+    ) -> None:
+        """Critic warmup and actor training must each record exactly one consumption event."""
+        for role in ("actor", "critic"):
+            controller = TrainerController.__new__(TrainerController)
+            controller._role = role
+            controller.args = SimpleNamespace(
+                use_critic=use_critic, num_critic_only_steps=num_critic_only_steps, trainer_model_id=None
+            )
+            controller._log_trained_samples(rollout_id=rollout_id, sample_indices=[1], lineage_id=f"pack-{role}")
+
+        [event] = [e for e in read_events(ownership_event_dir) if isinstance(e, TrainerTrainedSamplesEvent)]
+        assert event.sample_indices == [1]
+        assert event.rollout_id == rollout_id
+        assert event.lineage_id == f"pack-{expected_role}"
 
 
 def _make_mock_args(
@@ -66,6 +100,8 @@ def _make_mock_args(
         object_store_backend="ray",
         worker_comm_backend="ray",
         trainer_model_id=None,
+        num_critic_only_steps=0,
+        use_critic=False,
     )
 
 
@@ -1208,7 +1244,13 @@ class TestCellStatusesUnderConcurrentReconcile:
 class TestUpdateWeightsReturnsTheVersion:
     def _make_group(self, *, per_worker_versions: list[int | None]) -> TrainerController:
         group = TrainerController.__new__(TrainerController)
-        group.args = SimpleNamespace(debug_train_only=False, debug_rollout_only=False, trainer_model_id=None)
+        group.args = SimpleNamespace(
+            debug_train_only=False,
+            debug_rollout_only=False,
+            trainer_model_id=None,
+            num_critic_only_steps=0,
+            use_critic=False,
+        )
         group._execute_first_alive = AsyncMock(return_value=per_worker_versions)
         return group
 

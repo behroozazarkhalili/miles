@@ -6,12 +6,14 @@ from pathlib import Path
 from typing import Any
 
 from miles.backends.megatron_utils.ft.types import TrainStepOutcome, TrainStepOutput
+from miles.backends.megatron_utils.megatron_config import ACTOR_ROLE, CRITIC_ROLE
 from miles.ray.rollout.inference_controller import UpdatableEngines
 from miles.ray.specs.train import compute_trainer_num_cells, compute_trainer_pool_id
 from miles.ray.train.cell import TrainerCell
 from miles.ray.train.cell_monitor import create_trainer_cell_health_checker
 from miles.utils import object_store
 from miles.utils.async_utils import AsyncioGatherUtils, gather_and_raise_first
+from miles.utils.audit_utils import sample_ownership
 from miles.utils.audit_utils.event_analyzer import analyzer as event_analyzer
 from miles.utils.audit_utils.event_logger.logger import get_event_logger, is_event_logger_initialized
 from miles.utils.audit_utils.event_logger.models import (
@@ -215,6 +217,11 @@ class TrainerController:
                 snapshot_alive_cells=snapshot_alive_cells,
                 results=results,
             )
+            self._log_trained_samples(
+                rollout_id=rollout_id,
+                sample_indices=rollout_data_pack.sample_indices,
+                lineage_id=rollout_data_pack.lineage_id,
+            )
 
             return worker_results
 
@@ -255,6 +262,26 @@ class TrainerController:
                 TrainGroupStepEndEvent,
                 dict(rollout_id=rollout_id, cell_outcomes=cell_outcomes),
             )
+
+    def _log_trained_samples(
+        self, *, rollout_id: int, sample_indices: list[int] | None, lineage_id: str | None
+    ) -> None:
+        if not sample_indices:
+            return
+        critic_only = (
+            bool(self.args.use_critic)
+            and self.args.num_critic_only_steps
+            and rollout_id < self.args.num_critic_only_steps
+        )
+        recording_role = CRITIC_ROLE if critic_only else ACTOR_ROLE
+        if self._role != recording_role:
+            return
+        sample_ownership.log_trained_samples(
+            rollout_id=rollout_id,
+            trainer_model_id=self.args.trainer_model_id,
+            sample_indices=sample_indices,
+            lineage_id=lineage_id,
+        )
 
     def _check_train_one_attempt(self, snapshot_alive_cells, results):
         outcomes = TrainerController._compute_attempt_outcomes(snapshot_alive_cells, results)
