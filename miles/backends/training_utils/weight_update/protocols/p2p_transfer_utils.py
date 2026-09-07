@@ -4,11 +4,9 @@ from argparse import Namespace
 from collections import defaultdict
 from collections.abc import Callable, Sequence
 from concurrent.futures import Future, ThreadPoolExecutor
-from concurrent.futures import TimeoutError as FutureTimeoutError
 from typing import NamedTuple
 
 import ray
-import torch
 from sglang.srt.server_args import ServerArgs
 from miles.backends.sglang_utils.sglang_api_client import SGLangApiClient
 from miles.backends.training_utils.parallel import get_parallel_state
@@ -148,55 +146,25 @@ class RemoteWeightInfo:
 class P2PTransferManager:
     """Generic async task manager for P2P writes.
 
-    Accepts arbitrary callables via submit(), runs them in a thread pool,
-    and tracks futures for bulk waiting.
+    Accepts arbitrary callables via submit() and runs them in a thread pool. The
+    futures belong to the inference cell updater that submitted them, which is
+    the only place that knows whose failure a broken write is.
     """
 
     def __init__(self, num_workers: int = 8, transfer_timeout: float = 30.0):
         self.num_workers = num_workers
         self.transfer_timeout = transfer_timeout
         self.executor: ThreadPoolExecutor | None = None
-        self.transfer_futures: list[Future] = []
 
     def ensure_started(self) -> None:
         if self.executor is None:
             # NOTE: RDMA ops won't be affected by the python GIL
             self.executor = ThreadPoolExecutor(max_workers=self.num_workers)
 
-    def submit(self, fn: Callable, *args) -> None:
-        """Submit a callable to the thread pool."""
+    def submit(self, fn: Callable, *args) -> Future:
+        """Submit a callable to the thread pool and return its future."""
         self.ensure_started()
-        future = self.executor.submit(fn, *args)
-        self.transfer_futures.append(future)
-
-    def submit_returning_future(self, fn: Callable, *args) -> torch.Future:
-        """Submit a callable and return its future (also tracked for bulk waiting)."""
-        self.ensure_started()
-        future = self.executor.submit(fn, *args)
-        self.transfer_futures.append(future)
-        return future
-
-    def wait_transfers(self) -> None:
-        """Wait for all submitted tasks to complete."""
-        awaited_futures = self.transfer_futures
-        self.transfer_futures = []
-
-        errors: list[Exception] = []
-        for future in awaited_futures:
-            try:
-                future.result(timeout=self.transfer_timeout)
-            except FutureTimeoutError as e:
-                logger.exception(f"[P2P] Transfer future failed: {e}")
-                errors.append(e)
-                self.transfer_futures.append(future)
-            except Exception as e:
-                logger.exception(f"[P2P] Transfer future failed: {e}")
-                errors.append(e)
-
-        if errors:
-            raise RuntimeError(
-                f"[P2P] {len(errors)} of {len(awaited_futures)} transfers failed: {errors}"
-            ) from errors[0]
+        return self.executor.submit(fn, *args)
 
 
 def create_server_args_from_dict(data_dict: dict) -> ServerArgs:

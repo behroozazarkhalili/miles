@@ -1,4 +1,5 @@
 import threading
+import time
 
 import pytest
 
@@ -82,7 +83,8 @@ class TestPeerRouting:
 
         first.submit_write(engine_rank=0, names=_NAMES, weight_memory_registry=_REGISTRY)
         second.submit_write(engine_rank=0, names=_NAMES, weight_memory_registry=_REGISTRY)
-        manager.wait_transfers()
+        first.wait_for_pending_writes()
+        second.wait_for_pending_writes()
 
         assert sorted(session_id for session_id, _s, _t, _l in engine.writes) == ["cell-0-rank-0", "cell-1-rank-0"]
         by_session = {session_id: target_ptrs for session_id, _s, target_ptrs, _l in engine.writes}
@@ -106,7 +108,7 @@ class TestPeerRouting:
         )
 
         updater.submit_write(engine_rank=1, names=_NAMES, weight_memory_registry=_REGISTRY)
-        manager.wait_transfers()
+        updater.wait_for_pending_writes()
 
         assert [session_id for session_id, _s, _t, _l in engine.writes] == ["cell-0-rank-1"]
         assert engine.writes[0][2] == [0xC000, 0xC001]
@@ -133,7 +135,8 @@ class TestPeerRouting:
 
         first.submit_write(engine_rank=0, names=_NAMES, weight_memory_registry=_REGISTRY)
         second.submit_write(engine_rank=0, names=_NAMES, weight_memory_registry=_REGISTRY)
-        manager.wait_transfers()
+        first.wait_for_pending_writes()
+        second.wait_for_pending_writes()
 
         assert {tuple(source_ptrs) for _sid, source_ptrs, _t, _l in engine.writes} == {(0x1000, 0x2000)}
         assert {tuple(source_lens) for _sid, _s, _t, source_lens in engine.writes} == {(8, 16)}
@@ -177,11 +180,11 @@ class TestSubmissionSemantics:
         try:
             future = updater.submit_write(engine_rank=0, names=_NAMES, weight_memory_registry=_REGISTRY)
             assert not future.done()
-            assert manager.transfer_futures == [future]
+            assert updater._pending_writes == [future]
         finally:
             gate.set()
 
-        manager.wait_transfers()
+        updater.wait_for_pending_writes()
 
         assert future.done()
 
@@ -280,10 +283,10 @@ class TestErrorState:
 
         assert updater.submit_write(engine_rank=0, names=_NAMES, weight_memory_registry=_REGISTRY) is None
 
-        manager.wait_transfers()
+        updater.wait_for_pending_writes()
 
         assert engine.writes == []
-        assert manager.transfer_futures == []
+        assert updater._pending_writes == []
 
     def test_only_the_errored_cell_stops_being_written(
         self, p2p_inference_cell_updater, p2p_transfer_utils, manager
@@ -311,7 +314,8 @@ class TestErrorState:
 
         first.submit_write(engine_rank=0, names=_NAMES, weight_memory_registry=_REGISTRY)
         second.submit_write(engine_rank=0, names=_NAMES, weight_memory_registry=_REGISTRY)
-        manager.wait_transfers()
+        first.wait_for_pending_writes()
+        second.wait_for_pending_writes()
 
         assert [session_id for session_id, _s, _t, _l in engine.writes] == ["cell-1-rank-0"]
         assert second.is_errored is False
@@ -408,3 +412,199 @@ class TestStickyRefusal:
             release.set()
             if manager.executor is not None:
                 manager.executor.shutdown(wait=True)
+
+
+class TestWriteCollection:
+    """A write that fails is the failure of the cell it was addressed to, not of the trainer rank."""
+
+    def test_a_failed_write_errors_only_its_own_cell(
+        self, p2p_inference_cell_updater, p2p_transfer_utils, manager
+    ) -> None:
+        """Raising out of the bucket stream would abandon the update for every other cell at once."""
+        engine = _RecordingTransferEngine(failing_sessions={"cell-0-rank-0"})
+        health = InferenceCellHealth(["cell-0", "cell-1"])
+        first = _cell_updater(
+            p2p_inference_cell_updater,
+            manager,
+            engine,
+            cell_id="cell-0",
+            peers={0: _remote_weight_info(p2p_transfer_utils, "cell-0-rank-0", 0xA000)},
+            health=health,
+        )
+        second = _cell_updater(
+            p2p_inference_cell_updater,
+            manager,
+            engine,
+            cell_id="cell-1",
+            peers={0: _remote_weight_info(p2p_transfer_utils, "cell-1-rank-0", 0xB000)},
+            health=health,
+        )
+
+        first.submit_write(engine_rank=0, names=_NAMES, weight_memory_registry=_REGISTRY)
+        second.submit_write(engine_rank=0, names=_NAMES, weight_memory_registry=_REGISTRY)
+        first.wait_for_pending_writes()
+        second.wait_for_pending_writes()
+
+        assert health.errored_cell_ids == ["cell-0"]
+        assert isinstance(health.error_of("cell-0"), RuntimeError)
+        assert second.is_errored is False
+        assert first._pending_writes == []
+
+    def test_every_write_of_a_cell_is_awaited_even_after_one_of_them_failed(
+        self, p2p_inference_cell_updater, p2p_transfer_utils, manager
+    ) -> None:
+        """A write left running would still be reading the shared buffers the next bucket overwrites."""
+        engine = _RecordingTransferEngine(failing_sessions={"cell-0-rank-0"})
+        updater = _cell_updater(
+            p2p_inference_cell_updater,
+            manager,
+            engine,
+            cell_id="cell-0",
+            peers={
+                0: _remote_weight_info(p2p_transfer_utils, "cell-0-rank-0", 0xA000),
+                1: _remote_weight_info(p2p_transfer_utils, "cell-0-rank-1", 0xC000),
+            },
+        )
+
+        updater.submit_write(engine_rank=0, names=_NAMES, weight_memory_registry=_REGISTRY)
+        updater.submit_write(engine_rank=1, names=_NAMES, weight_memory_registry=_REGISTRY)
+        updater.wait_for_pending_writes()
+
+        assert sorted(session_id for session_id, _s, _t, _l in engine.writes) == ["cell-0-rank-0", "cell-0-rank-1"]
+        assert updater.is_errored is True
+        assert updater._pending_writes == []
+
+    def test_a_single_awaited_write_is_attributed_without_touching_the_others(
+        self, p2p_inference_cell_updater, p2p_transfer_utils, manager
+    ) -> None:
+        """The non-last engine rank is awaited one write at a time, and the last rank must stay in flight."""
+        engine = _RecordingTransferEngine(failing_sessions={"cell-0-rank-0"})
+        updater = _cell_updater(
+            p2p_inference_cell_updater,
+            manager,
+            engine,
+            cell_id="cell-0",
+            peers={
+                0: _remote_weight_info(p2p_transfer_utils, "cell-0-rank-0", 0xA000),
+                1: _remote_weight_info(p2p_transfer_utils, "cell-0-rank-1", 0xC000),
+            },
+        )
+
+        first = updater.submit_write(engine_rank=0, names=_NAMES, weight_memory_registry=_REGISTRY)
+        updater.wait_for_write(first)
+        left_running = updater._pending_writes
+
+        assert updater.is_errored is True
+        assert left_running == []
+        assert updater.submit_write(engine_rank=1, names=_NAMES, weight_memory_registry=_REGISTRY) is None
+
+    def test_a_write_that_outlives_the_timeout_stays_tracked(
+        self, p2p_inference_cell_updater, p2p_transfer_utils
+    ) -> None:
+        """A timed-out write is still reading the shared buffers, so forgetting it loses the only handle on it."""
+        gate = threading.Event()
+        manager = p2p_transfer_utils.P2PTransferManager(num_workers=2, transfer_timeout=0.05)
+        engine = _RecordingTransferEngine(gate=gate)
+        updater = _cell_updater(
+            p2p_inference_cell_updater,
+            manager,
+            engine,
+            cell_id="cell-0",
+            peers={0: _remote_weight_info(p2p_transfer_utils, "cell-0-rank-0", 0xA000)},
+        )
+
+        try:
+            future = updater.submit_write(engine_rank=0, names=_NAMES, weight_memory_registry=_REGISTRY)
+            updater.wait_for_pending_writes()
+
+            assert updater.is_errored is True
+            assert updater._pending_writes == [future]
+            assert updater.take_unfinished_writes() == [future]
+        finally:
+            gate.set()
+
+        manager.transfer_timeout = 30.0
+        assert future.result(timeout=30.0) is None
+
+
+class TestCollectionBudget:
+    """A cell that lost one write is collected without paying the transfer timeout again for each queued one."""
+
+    def _stuck_cell(self, module, utils, *, transfer_timeout: float, engine_ranks: list[int]):
+        gate = threading.Event()
+        manager = utils.P2PTransferManager(num_workers=1, transfer_timeout=transfer_timeout)
+        engine = _RecordingTransferEngine(gate=gate)
+        updater = _cell_updater(
+            module,
+            manager,
+            engine,
+            cell_id="cell-0",
+            peers={
+                rank: _remote_weight_info(utils, f"cell-0-rank-{rank}", 0xA000 + 0x1000 * rank)
+                for rank in engine_ranks
+            },
+        )
+        futures = [
+            updater.submit_write(engine_rank=rank, names=_NAMES, weight_memory_registry=_REGISTRY)
+            for rank in engine_ranks
+        ]
+        return gate, engine, updater, futures
+
+    def test_the_queued_writes_of_a_failed_cell_are_not_each_waited_for(
+        self, p2p_inference_cell_updater, p2p_transfer_utils
+    ) -> None:
+        """One stuck write plus a bucket stream would multiply the timeout until the trainer deadline fires."""
+        gate, _engine, updater, futures = self._stuck_cell(
+            p2p_inference_cell_updater, p2p_transfer_utils, transfer_timeout=0.2, engine_ranks=[0, 1, 2, 3, 4]
+        )
+
+        try:
+            started = time.monotonic()
+            updater.wait_for_pending_writes()
+            elapsed = time.monotonic() - started
+        finally:
+            gate.set()
+
+        assert elapsed < 0.9
+        assert updater.is_errored is True
+        assert all(future.cancelled() for future in futures[1:])
+        assert updater._pending_writes == [futures[0]]
+
+    def test_no_queued_write_runs_after_the_stuck_one_returns(
+        self, p2p_inference_cell_updater, p2p_transfer_utils
+    ) -> None:
+        """A late write to a cell the trainer already gave up on reaches an engine that is being replaced."""
+        gate, engine, updater, futures = self._stuck_cell(
+            p2p_inference_cell_updater, p2p_transfer_utils, transfer_timeout=0.05, engine_ranks=[0, 1, 2]
+        )
+
+        updater.wait_for_pending_writes()
+        gate.set()
+        futures[0].result(timeout=30.0)
+
+        assert [session_id for session_id, _s, _t, _l in engine.writes] == ["cell-0-rank-0"]
+
+    def test_a_healthy_cell_still_gets_its_full_budget(self, p2p_inference_cell_updater, p2p_transfer_utils) -> None:
+        """The shortcut must apply to failed cells only; a slow healthy write has to be waited for."""
+        gate = threading.Event()
+        gate.set()
+        manager = p2p_transfer_utils.P2PTransferManager(num_workers=1, transfer_timeout=30.0)
+        engine = _RecordingTransferEngine(gate=gate)
+        updater = _cell_updater(
+            p2p_inference_cell_updater,
+            manager,
+            engine,
+            cell_id="cell-0",
+            peers={
+                0: _remote_weight_info(p2p_transfer_utils, "cell-0-rank-0", 0xA000),
+                1: _remote_weight_info(p2p_transfer_utils, "cell-0-rank-1", 0xB000),
+            },
+        )
+
+        updater.submit_write(engine_rank=0, names=_NAMES, weight_memory_registry=_REGISTRY)
+        updater.submit_write(engine_rank=1, names=_NAMES, weight_memory_registry=_REGISTRY)
+        updater.wait_for_pending_writes()
+
+        assert updater.is_errored is False
+        assert sorted(session_id for session_id, _s, _t, _l in engine.writes) == ["cell-0-rank-0", "cell-0-rank-1"]
+        assert updater._pending_writes == []
