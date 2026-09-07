@@ -20,6 +20,10 @@ from miles.backends.sglang_utils.sglang_api_client import SGLangApiClient
 from miles.backends.training_utils.parallel import ParallelState
 from miles.backends.training_utils.weight_update.hf_weight_iterator import WeightUpdatePlacement
 from miles.backends.training_utils.weight_update.protocol import WeightTransferProtocol
+from miles.backends.training_utils.weight_update.protocols.p2p_inference_cell_updater import (
+    TransferEngineMeta,
+    _P2PInferenceCellUpdater,
+)
 from miles.backends.training_utils.weight_update.protocols.tensor_staging import NamedTensorStager
 from miles.utils.distributed_utils import get_gloo_group
 
@@ -27,7 +31,6 @@ from .p2p_transfer_utils import (
     P2PTransferManager,
     RemoteTransferPlan,
     RemoteWeightInfo,
-    TransferEngineMeta,
     create_transfer_engine,
     query_remote_weight_infos,
     register_cpu_memory,
@@ -99,12 +102,12 @@ class UpdateWeightP2P(WeightTransferProtocol):
                 # Last engine rank: fire-and-forget all sessions to background,
                 # as the weight will no longer be overwritten
                 futures = [
-                    self.transfer_manager.submit_returning_future(
-                        self._do_p2p_write_one_session,
-                        remote_session,
-                        transfer_ready_params,
+                    cell_updater.submit_write(
+                        engine_rank=meta.engine_rank,
+                        names=transfer_ready_params,
+                        weight_memory_registry=self._weight_memory_registry,
                     )
-                    for remote_session in meta.remote_weight_infos
+                    for cell_updater in meta.cell_updaters
                 ]
 
                 if i != last_idx:
@@ -158,8 +161,9 @@ class UpdateWeightP2P(WeightTransferProtocol):
             # - single CPU replica shared among all sessions
             # - related remote weight info
             self._transfer_engine_meta_list: list[TransferEngineMeta] = []
+            cell_updaters_by_engine_ind: dict[int, _P2PInferenceCellUpdater] = {}
             first_engine_rank = True
-            for rank_targets in targets_grouped_by_engine_rank.values():
+            for engine_rank, rank_targets in targets_grouped_by_engine_rank.items():
                 first_target = rank_targets[0]
                 session_id = targets_to_session_id[(first_target.engine_ind, first_target.engine_rank)]
                 parallelism_config = RankParallelismConfig.from_dict(
@@ -179,55 +183,31 @@ class UpdateWeightP2P(WeightTransferProtocol):
                     self._shared_param_mapper = ParameterMapper.from_model(model_replica)
                     first_engine_rank = False
 
-                remote_infos = [
-                    RemoteWeightInfo(
-                        targets_to_session_id[(t.engine_ind, t.engine_rank)],
-                        self.remote_weight_infos_by_session_id[targets_to_session_id[(t.engine_ind, t.engine_rank)]][
-                            0
-                        ],
+                rank_cell_updaters = []
+                for t in rank_targets:
+                    target_session_id = targets_to_session_id[(t.engine_ind, t.engine_rank)]
+                    cell_updater = cell_updaters_by_engine_ind.get(t.engine_ind)
+                    if cell_updater is None:
+                        cell_updater = _P2PInferenceCellUpdater(
+                            engine_ind=t.engine_ind,
+                            transfer_engine=self._transfer_engine,
+                            transfer_manager=self.transfer_manager,
+                        )
+                        cell_updaters_by_engine_ind[t.engine_ind] = cell_updater
+                    cell_updater.add_peer(
+                        engine_rank=t.engine_rank,
+                        remote_weight_info=RemoteWeightInfo(
+                            target_session_id,
+                            self.remote_weight_infos_by_session_id[target_session_id][0],
+                        ),
                     )
-                    for t in rank_targets
-                ]
+                    rank_cell_updaters.append(cell_updater)
 
                 self._transfer_engine_meta_list.append(
-                    TransferEngineMeta(model_replica=model_replica, remote_weight_infos=remote_infos)
+                    TransferEngineMeta(
+                        engine_rank=engine_rank, model_replica=model_replica, cell_updaters=rank_cell_updaters
+                    )
                 )
-
-    def _do_p2p_write_one_session(self, remote_session: RemoteWeightInfo, names: list[str]) -> None:
-        """P2P write from shared CPU pinned buffers to a single remote session.
-
-        Used by the parallelized submission path where each session within an
-        engine rank is submitted as a separate task to P2PTransferManager.
-        """
-        source_ptrs, source_lens = [], []
-        valid_names = []
-
-        for name in names:
-            cpu_reg = self._weight_memory_registry.get(name)
-            assert cpu_reg, f"the _weight_memory_registry of {name} failed"
-
-            data_ptr, numel, ele_size = cpu_reg
-            source_ptrs.append(data_ptr)
-            source_lens.append(numel * ele_size)
-            valid_names.append(name)
-
-        if not source_ptrs:
-            return
-
-        session_id = remote_session.session_id
-        target_ptrs = []
-        for name in valid_names:
-            if name in remote_session.weights_info:
-                target_ptrs.append(remote_session.weights_info[name].address)
-
-        assert len(target_ptrs) == len(source_ptrs), (
-            f"[P2P-Shared] Pointer count mismatch for session {session_id}, "
-            f"source: {len(source_ptrs)}, target: {len(target_ptrs)}"
-        )
-
-        ret = self._transfer_engine.batch_transfer_sync_write(session_id, source_ptrs, target_ptrs, source_lens)
-        if ret < 0:
-            raise RuntimeError(f"[P2P-Shared] Transfer failed for session {session_id}, error: {ret}")
 
 
 def _create_cpu_replica(
