@@ -5,15 +5,20 @@ from unittest.mock import MagicMock, patch
 
 from tests.e2e.ft.conftest_ft.fault_injection import core, fault_forms, state
 
+from miles.ray.train.cell_monitor import compute_cell_status
+from miles.ray.train.cell_state import CellState, StateAllocatedAlive, StateAllocatedUninitialized
 from miles.utils.external_utils import command_utils
+from miles.utils.ft_utils.api_server.models import Cell, CellMetadata, CellSpec, TriState
+from miles.utils.ft_utils.indep_dp import IndepDPInfo
 from miles.utils.workers.types import ClusterBackend
 
 
-def note_injected(log: state.EventLog, cell_name: str) -> None:
+def note_injected(log: state.EventLog, cell_name: str, *, workers_hash: str = "generation-0") -> None:
     log.note_injection_attempt(
         cell_name=cell_name,
         form_name="sigkill",
         succeeded=True,
+        workers_hash=workers_hash,
     )
 
 
@@ -37,10 +42,12 @@ def cell(
     cell_type: str = "actor",
     phase: str = "Running",
     serving: bool = True,
+    allocated: bool = True,
     workers_hash: str = "generation-0",
+    health_reason: str | None = None,
 ) -> dict:
-    status = "True" if healthy else "False"
-    conditions = [{"type": "Healthy", "status": status}]
+    conditions: list[dict] = [{"type": "Allocated", "status": "True" if allocated else "False"}]
+    conditions.append({"type": "Healthy", "status": "True" if healthy else "False", "reason": health_reason})
     if cell_type == "rollout":
         conditions.append({"type": "Serving", "status": "True" if serving else "False"})
     return {
@@ -48,8 +55,57 @@ def cell(
             "name": name,
             "labels": {"miles.io/cell-type": cell_type, "miles.io/workers-hash": workers_hash},
         },
-        "status": {"phase": phase, "conditions": conditions},
+        "status": {"phase": phase, "conditions": conditions, "workers_hash": workers_hash},
     }
+
+
+def paused_cell(name: str, *, cell_type: str = "rollout", reason: str, workers_hash: str = "generation-0") -> dict:
+    built = cell(name, healthy=False, cell_type=cell_type, workers_hash=workers_hash, health_reason=reason)
+    for condition in built["status"]["conditions"]:
+        if condition["type"] == "Healthy":
+            condition["status"] = "Unknown"
+    return built
+
+
+def trainer_cell_of_state(
+    name: str,
+    *,
+    cell_state: CellState,
+    health_status: TriState,
+    workers_hash: str = "generation-0",
+) -> dict:
+    return Cell(
+        metadata=CellMetadata(
+            name=name, labels={"miles.io/cell-type": state.ACTOR_CELL_TYPE, "miles.io/cell-id": name}
+        ),
+        spec=CellSpec(),
+        status=compute_cell_status(cell_state, health_status, workers_hash=workers_hash),
+    ).model_dump(mode="json")
+
+
+def uninitialized_trainer_cell(name: str, *, workers_hash: str = "generation-0") -> dict:
+    return trainer_cell_of_state(
+        name,
+        cell_state=StateAllocatedUninitialized(worker_handles=[]),
+        health_status=TriState.UNKNOWN,
+        workers_hash=workers_hash,
+    )
+
+
+def initialized_trainer_cell(
+    name: str, *, workers_hash: str = "generation-0", health_status: TriState = TriState.TRUE
+) -> dict:
+    return trainer_cell_of_state(
+        name,
+        cell_state=StateAllocatedAlive(
+            worker_handles=[],
+            indep_dp_info=IndepDPInfo(
+                cell_index=0, num_cells=2, alive_rank=0, alive_size=2, quorum_id=1, alive_cell_indices=[0, 1]
+            ),
+        ),
+        health_status=health_status,
+        workers_hash=workers_hash,
+    )
 
 
 def names(cells: list[dict]) -> set[str]:
@@ -82,36 +138,47 @@ def staged(
         RUNNING_NOT_SERVING: "Running",
         SERVING: "Running",
     }[cell_state]
-    conditions: list[dict] = (
-        [
-            {"type": "Healthy", "status": "True"},
-            {"type": "Serving", "status": "True" if cell_state is SERVING else "False"},
-        ]
-        if phase == "Running"
-        else []
+    return cell(
+        name,
+        healthy=phase == "Running",
+        cell_type=cell_type,
+        phase=phase,
+        serving=cell_state is SERVING,
+        allocated=cell_state is not SUSPENDED,
+        workers_hash=workers_hash,
     )
-    return {
-        "metadata": {
-            "name": name,
-            "labels": {"miles.io/cell-type": cell_type, "miles.io/workers-hash": workers_hash},
-        },
-        "status": {"phase": phase, "conditions": conditions},
-    }
 
 
 def log_of(
     cell_states: list[state.ObservedCellState], *, inject_before: dict[int, int] | None = None
 ) -> state.EventLog:
     log = state.EventLog()
+    generation = 0
     for index, cell_state in enumerate(cell_states):
         for _ in range((inject_before or {}).get(index, 0)):
-            note_injected(log, "rollout-engine-0")
-        log.observe([staged("rollout-engine-0", cell_state)])
+            note_injected(log, "rollout-engine-0", workers_hash=f"generation-{generation}")
+            generation += 1
+        log.observe([staged("rollout-engine-0", cell_state, workers_hash=f"generation-{generation}")])
     return log
 
 
-def typed_cell(name: str, cell_type: str, *, healthy: bool = True, serving: bool = True) -> dict:
-    return cell(name, healthy=healthy, cell_type=cell_type, serving=serving)
+def typed_cell(
+    name: str,
+    cell_type: str,
+    *,
+    healthy: bool = True,
+    serving: bool = True,
+    workers_hash: str = "generation-0",
+    health_reason: str | None = None,
+) -> dict:
+    return cell(
+        name,
+        healthy=healthy,
+        cell_type=cell_type,
+        serving=serving,
+        workers_hash=workers_hash,
+        health_reason=health_reason,
+    )
 
 
 def config_of(backend: ClusterBackend, *, namespace: str = NAMESPACE) -> command_utils.ExecuteTrainConfig:

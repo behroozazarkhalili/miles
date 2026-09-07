@@ -65,7 +65,9 @@ class _ServerStub:
 
 
 def _make_inference_controller(**arg_overrides: object) -> InferenceController:
-    return InferenceController(make_args(**arg_overrides), engine_provider=None, router_providers=[])
+    return InferenceController(
+        make_args(**arg_overrides), engine_provider=None, router_providers=[], cell_operations=AsyncMock()
+    )
 
 
 @pytest.mark.asyncio
@@ -74,7 +76,7 @@ async def test_controller_pauses_health_checks_before_snapshotting_the_engines()
     order: list[str] = []
     controller = _make_inference_controller()
 
-    async def _record_pause(model_id: str | None = None) -> None:
+    async def _record_pause(model_id: str | None = None, *, reason: str = "") -> None:
         order.append("health_monitoring_pause")
 
     async def _record_ensure_cells_ready(model_id: str | None = None) -> None:

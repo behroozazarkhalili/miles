@@ -13,6 +13,8 @@ from miles.utils.ft_utils.health_checker import ActiveAndEpoch, SimpleHealthChec
 if TYPE_CHECKING:
     from miles.ray.train.cell import TrainerCell
 
+HEALTH_TRAINER_UNINITIALIZED = "TrainerUninitialized"
+
 
 def create_trainer_cell_health_checker(
     *,
@@ -55,7 +57,7 @@ def compute_cell_status(state: CellState, health_checker_status: TriState, *, wo
                 phase="Running",
                 conditions=[
                     CellCondition.allocated(TriState.TRUE),
-                    CellCondition.healthy(TriState.TRUE),
+                    CellCondition.healthy(TriState.TRUE, reason=HEALTH_TRAINER_UNINITIALIZED),
                 ],
                 workers_hash=workers_hash,
             )

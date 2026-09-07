@@ -11,7 +11,11 @@ from tests.fast.ray.rollout.conftest import make_args, track_server_cell
 
 from miles.ray.rollout import server_cell as server_cell_module
 from miles.ray.rollout.cell_state import CellAddrInfo, StatePendingWeights, StateServing, StateUninitialized
-from miles.ray.rollout.inference_controller import InferenceController
+from miles.ray.rollout.inference_controller import (
+    HEALTH_PAUSED_FOR_OFFLOAD,
+    HEALTH_PAUSED_FOR_WEIGHT_UPDATE,
+    InferenceController,
+)
 from miles.ray.rollout.rollout_server import RolloutServer
 from miles.ray.rollout.server_cell import ServerCell, ServerCellMetadata
 from miles.utils.arguments import get_miles_extra_args_provider
@@ -54,14 +58,22 @@ class _StubProvider:
         )
 
 
-def _make_cell(*, ft_components: list[str], global_activeness: bool = True, **arg_overrides: Any) -> ServerCell:
+def _make_cell(
+    *,
+    ft_components: list[str],
+    global_activeness: bool = True,
+    inactive_reason: str | None = None,
+    **arg_overrides: Any,
+) -> ServerCell:
     return track_server_cell(
         ServerCell(
             args=make_args(ft_components=ft_components, **arg_overrides),
             meta=_make_meta(),
             router_api_client=MagicMock(),
             provider=_StubProvider(),
-            health_checker_activeness=lambda: ActiveAndEpoch(active=global_activeness, epoch=0),
+            health_checker_activeness=lambda: ActiveAndEpoch(
+                active=global_activeness, epoch=0, inactive_reason=inactive_reason
+            ),
         )
     )
 
@@ -271,9 +283,9 @@ class TestRolloutCellHealthConditionDuringPause:
         assert _healthy_condition(cell) == CellCondition.healthy(TriState.FALSE, reason="HealthCheckFailed")
 
         async with controller.context_lock:
-            await controller._health_monitoring_pause(None)
+            await controller._health_monitoring_pause(None, reason=HEALTH_PAUSED_FOR_OFFLOAD)
 
-        assert _healthy_condition(cell) == CellCondition.healthy(TriState.UNKNOWN, reason="HealthCheckUnknown")
+        assert _healthy_condition(cell) == CellCondition.healthy(TriState.UNKNOWN, reason=HEALTH_PAUSED_FOR_OFFLOAD)
         checker.stop()
 
 
@@ -367,3 +379,40 @@ async def _settle(clock: FakeClock) -> None:
         if clock.pending_count >= 1:
             return
         await asyncio.sleep(0)
+
+
+class TestPausedHealthReason:
+    """A cell whose probing the controller paused must say why, so an injector can tell the reasons apart."""
+
+    async def test_a_weight_update_pause_names_itself(self):
+        """A fault landing inside the update window is the case the weight-update fault tolerance exists for."""
+        cell = _make_cell(
+            ft_components=["rollout"],
+            global_activeness=False,
+            inactive_reason=HEALTH_PAUSED_FOR_WEIGHT_UPDATE,
+        )
+        await cell.init()
+        await cell.tick()
+
+        [condition] = [c for c in cell.cell_status().conditions if c.type == "Healthy"]
+        assert (condition.status, condition.reason) == (TriState.UNKNOWN, HEALTH_PAUSED_FOR_WEIGHT_UPDATE)
+
+    async def test_an_offload_pause_names_itself(self):
+        """Colocate offload hands the GPUs to the trainer, and that must never read as an update window."""
+        cell = _make_cell(
+            ft_components=["rollout"], global_activeness=False, inactive_reason=HEALTH_PAUSED_FOR_OFFLOAD
+        )
+        await cell.init()
+        await cell.tick()
+
+        [condition] = [c for c in cell.cell_status().conditions if c.type == "Healthy"]
+        assert (condition.status, condition.reason) == (TriState.UNKNOWN, HEALTH_PAUSED_FOR_OFFLOAD)
+
+    async def test_a_cell_nobody_paused_keeps_the_ordinary_unknown_reason(self):
+        """A cell that has simply not been probed yet is not evidence of anything, and must not borrow a reason."""
+        cell = _make_cell(ft_components=["rollout"])
+        await cell.init()
+        await cell.tick()
+
+        [condition] = [c for c in cell.cell_status().conditions if c.type == "Healthy"]
+        assert condition.reason != HEALTH_PAUSED_FOR_WEIGHT_UPDATE

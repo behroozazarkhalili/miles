@@ -4,9 +4,14 @@ import dataclasses
 from datetime import datetime
 from typing import Literal
 
-from tests.e2e.ft.conftest_ft.fault_injection.state import Event, InjectionEvent, ObservationsEvent, ObservedCellState
-
-STALE_STATUS_GRACE_SECONDS: float = 120.0
+from tests.e2e.ft.conftest_ft.fault_injection.state import (
+    Event,
+    InjectionEvent,
+    ObservationsEvent,
+    ObservedCellState,
+    cell_info_is_in_service,
+    cell_info_is_paused_for_weight_update,
+)
 
 
 def compute_num_injections(events: list[Event], *, cell_type: str | None = None, harmed_only: bool = True) -> int:
@@ -36,42 +41,58 @@ def compute_num_successful_injections_of_form(events: list[Event], *, form_name:
     )
 
 
-def compute_cells_not_serving_after_injection(
-    events: list[Event], *, cell_type: str, grace_seconds: float | None = None
-) -> dict[str, list[str]]:
-    if grace_seconds is None:
-        grace_seconds = STALE_STATUS_GRACE_SECONDS
-
+def compute_cells_not_serving_after_injection(events: list[Event], *, cell_type: str) -> dict[str, list[str]]:
     cell_type_of_name = _compute_cell_type_of_name(events)
-    last_injection_time_of_name: dict[str, datetime] = {
-        event.cell_name: event.timestamp
-        for event in events
-        if isinstance(event, InjectionEvent)
-        and event.succeeded
-        and event.harmed
-        and cell_type_of_name.get(event.cell_name) == cell_type
+    observed_states = compute_states_of_cell_name(events)
+    return {
+        entry.cell_name: [one.value for one in observed_states.get(entry.cell_name, [])]
+        for entry in compute_pending_injections(events)
+        if cell_type_of_name.get(entry.cell_name) == cell_type
     }
 
-    served: set[str] = set()
+
+@dataclasses.dataclass(frozen=True)
+class PendingInjection:
+    cell_name: str
+    workers_hash: str
+    injected_at: datetime
+    outcome_known: bool
+
+
+def compute_pending_injections(events: list[Event]) -> list[PendingInjection]:
+    pending: dict[str, PendingInjection] = {}
+    for event in events:
+        if isinstance(event, InjectionEvent):
+            if event.harmed:
+                pending[event.cell_name] = PendingInjection(
+                    cell_name=event.cell_name,
+                    workers_hash=event.workers_hash,
+                    injected_at=event.timestamp,
+                    outcome_known=event.succeeded,
+                )
+            continue
+        for name, entry in list(pending.items()):
+            info = event.cell_infos.get(name)
+            if info is not None and info.workers_hash != entry.workers_hash and cell_info_is_in_service(info):
+                del pending[name]
+    return sorted(pending.values(), key=lambda entry: entry.injected_at)
+
+
+def compute_injection_eligibility(events: list[Event]) -> set[tuple[str, str]]:
+    eligible_hash_of_name: dict[str, str] = {}
     for event in events:
         if not isinstance(event, ObservationsEvent):
             continue
-        for name, injected_at in last_injection_time_of_name.items():
-            info = event.cell_infos.get(name)
-            if (
-                name not in served
-                and info is not None
-                and info.alive
-                and info.state is ObservedCellState.SERVING
-                and (event.timestamp - injected_at).total_seconds() >= grace_seconds
+        for name in [name for name in eligible_hash_of_name if name not in event.cell_infos]:
+            del eligible_hash_of_name[name]
+        for name, info in event.cell_infos.items():
+            if cell_info_is_in_service(info):
+                eligible_hash_of_name[name] = info.workers_hash
+            elif not (
+                cell_info_is_paused_for_weight_update(info) and eligible_hash_of_name.get(name) == info.workers_hash
             ):
-                served.add(name)
-
-    observed_states = compute_states_of_cell_name(events)
-    return {
-        name: [one.value for one in observed_states.get(name, [])]
-        for name in sorted(set(last_injection_time_of_name) - served)
-    }
+                eligible_hash_of_name.pop(name, None)
+    return {(name, workers_hash) for name, workers_hash in eligible_hash_of_name.items()}
 
 
 def compute_successful_form_names(events: list[Event], *, cell_type: str) -> set[str]:

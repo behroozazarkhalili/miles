@@ -1,7 +1,7 @@
 from pathlib import Path
 
 import pytest
-from tests.e2e.ft.conftest_ft.fault_injection import entrypoint, fault_forms, state, views
+from tests.e2e.ft.conftest_ft.fault_injection import entrypoint, fault_forms, state
 from tests.e2e.ft.conftest_ft.scenario_random_crash import _assert_drawn_fault_forms_worked, assert_healing
 
 from miles.utils.audit_utils.event_logger.logger import EventLogger
@@ -38,13 +38,20 @@ def _all_forms_of_ray_run() -> fault_forms.CellFaultForms:
     return fault_forms.create_cell_fault_forms(base_url="http://control", config=config)
 
 
-def _actor_cell(name: str = _ACTOR_CELL_NAME) -> dict:
+def _actor_cell(name: str = _ACTOR_CELL_NAME, *, generation: int = 0) -> dict:
     return {
         "metadata": {
             "name": name,
-            "labels": {"miles.io/cell-type": "actor", "miles.io/workers-hash": "generation-0"},
+            "labels": {"miles.io/cell-type": "actor", "miles.io/workers-hash": f"generation-{generation}"},
         },
-        "status": {"phase": "Running", "conditions": [{"type": "Healthy", "status": "True"}]},
+        "status": {
+            "phase": "Running",
+            "conditions": [
+                {"type": "Allocated", "status": "True"},
+                {"type": "Healthy", "status": "True"},
+            ],
+            "workers_hash": f"generation-{generation}",
+        },
     }
 
 
@@ -52,12 +59,13 @@ def _note_actor_injections(
     injector: entrypoint.FaultInjectorHandle, count: int, *, name: str = _ACTOR_CELL_NAME
 ) -> None:
     log = injector.event_log
-    for _ in range(count):
-        log.observe([_actor_cell(name)])
+    for generation in range(count):
+        log.observe([_actor_cell(name, generation=generation)])
         log.note_injection_attempt(
             cell_name=name,
             form_name="inject_fault:sigkill",
             succeeded=True,
+            workers_hash=f"generation-{generation}",
         )
 
 
@@ -70,33 +78,33 @@ def _note_form_attempts(
             cell_name=name,
             form_name=form_name,
             succeeded=succeeded,
+            workers_hash="generation-0",
         )
 
 
-def _note_rollout_injection(log: state.EventLog) -> None:
+def _note_rollout_injection(log: state.EventLog, *, generation: int = 0) -> None:
     log.note_injection_attempt(
         cell_name=_ROLLOUT_CELL_NAME,
         form_name="inject_fault:sigkill",
         succeeded=True,
+        workers_hash=f"generation-{generation}",
     )
 
 
-def _rollout_cell(cell_state: state.ObservedCellState) -> dict:
+def _rollout_cell(cell_state: state.ObservedCellState, *, generation: int = 0) -> dict:
     phase = "Pending" if cell_state is state.ObservedCellState.PENDING else "Running"
-    conditions = (
-        []
-        if phase == "Pending"
-        else [
+    conditions: list[dict] = [{"type": "Allocated", "status": "True"}]
+    if phase == "Running":
+        conditions += [
             {"type": "Healthy", "status": "True"},
             {"type": "Serving", "status": "True" if cell_state is state.ObservedCellState.SERVING else "False"},
         ]
-    )
     return {
         "metadata": {
             "name": _ROLLOUT_CELL_NAME,
-            "labels": {"miles.io/cell-type": "rollout", "miles.io/workers-hash": "generation-0"},
+            "labels": {"miles.io/cell-type": "rollout", "miles.io/workers-hash": f"generation-{generation}"},
         },
-        "status": {"phase": phase, "conditions": conditions},
+        "status": {"phase": phase, "conditions": conditions, "workers_hash": f"generation-{generation}"},
     }
 
 
@@ -153,12 +161,12 @@ class TestAssertHealing:
         """A rollout-only soak that ends with its last victim still relaunching must fail."""
         injector = _injector(cell_types=("rollout",))
         log = injector.event_log
-        log.observe([_rollout_cell(state.ObservedCellState.SERVING)])
-        _note_rollout_injection(log)
-        log.observe([_rollout_cell(state.ObservedCellState.PENDING)])
-        log.observe([_rollout_cell(state.ObservedCellState.SERVING)])
-        _note_rollout_injection(log)
-        log.observe([_rollout_cell(state.ObservedCellState.PENDING)])
+        log.observe([_rollout_cell(state.ObservedCellState.SERVING, generation=0)])
+        _note_rollout_injection(log, generation=0)
+        log.observe([_rollout_cell(state.ObservedCellState.PENDING, generation=1)])
+        log.observe([_rollout_cell(state.ObservedCellState.SERVING, generation=1)])
+        _note_rollout_injection(log, generation=1)
+        log.observe([_rollout_cell(state.ObservedCellState.PENDING, generation=2)])
 
         with pytest.raises(AssertionError, match="Rollout recovery witness failed"):
             assert_healing(("rollout",), injector=injector, event_dir=tmp_path / "events", context="soak")
@@ -167,25 +175,24 @@ class TestAssertHealing:
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
     ) -> None:
         """The witness must stay invisible on the path a healthy soak actually takes."""
-        monkeypatch.setattr(views, "STALE_STATUS_GRACE_SECONDS", 0.0)
         injector = _injector(cell_types=("rollout",))
         log = injector.event_log
-        log.observe([_rollout_cell(state.ObservedCellState.SERVING)])
+        log.observe([_rollout_cell(state.ObservedCellState.SERVING, generation=0)])
         for _ in range(2):
-            _note_rollout_injection(log)
-        log.observe([_rollout_cell(state.ObservedCellState.PENDING)])
-        log.observe([_rollout_cell(state.ObservedCellState.SERVING)])
+            _note_rollout_injection(log, generation=0)
+        log.observe([_rollout_cell(state.ObservedCellState.PENDING, generation=1)])
+        log.observe([_rollout_cell(state.ObservedCellState.SERVING, generation=1)])
 
         assert_healing(("rollout",), injector=injector, event_dir=tmp_path / "events", context="soak")
 
-    def test_rollout_soak_rejects_a_serve_still_inside_the_stale_window(self, tmp_path: Path) -> None:
-        """A serve observed right after the kill can be the dead cell's stale reading, and proves nothing."""
+    def test_rollout_soak_rejects_a_serve_by_the_generation_that_was_killed(self, tmp_path: Path) -> None:
+        """A serve observed right after the kill is the dead incarnation's stale reading, and proves nothing."""
         injector = _injector(cell_types=("rollout",))
         log = injector.event_log
-        log.observe([_rollout_cell(state.ObservedCellState.SERVING)])
+        log.observe([_rollout_cell(state.ObservedCellState.SERVING, generation=0)])
         for _ in range(2):
-            _note_rollout_injection(log)
-        log.observe([_rollout_cell(state.ObservedCellState.SERVING)])
+            _note_rollout_injection(log, generation=0)
+        log.observe([_rollout_cell(state.ObservedCellState.SERVING, generation=0)])
 
         with pytest.raises(AssertionError, match="Rollout recovery witness failed"):
             assert_healing(("rollout",), injector=injector, event_dir=tmp_path / "events", context="soak")

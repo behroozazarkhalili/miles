@@ -5,7 +5,7 @@ from collections.abc import Callable
 
 from tests.e2e.ft.conftest_ft.fault_injection.core import (
     POLL_INTERVAL_SECONDS,
-    QUIESCENT_POLLS_REQUIRED,
+    UNKNOWN_INJECTION_RESOLUTION_TIMEOUT_SECONDS,
     list_cells,
     run_fault_injection_loop,
 )
@@ -30,7 +30,7 @@ class FaultInjectorHandle:
         get_virtual_cells: Callable[[], list[dict]] | None = None,
         injection_enabled: Callable[[], bool] | None = None,
         poll_interval_seconds: float = POLL_INTERVAL_SECONDS,
-        quiescent_polls_required: int = QUIESCENT_POLLS_REQUIRED,
+        unknown_injection_timeout_seconds: float = UNKNOWN_INJECTION_RESOLUTION_TIMEOUT_SECONDS,
     ) -> None:
         self.event_log = EventLog()
         self.cell_fault_forms = cell_fault_forms
@@ -49,7 +49,7 @@ class FaultInjectorHandle:
                 get_virtual_cells=get_virtual_cells,
                 injection_enabled=injection_enabled,
                 poll_interval_seconds=poll_interval_seconds,
-                quiescent_polls_required=quiescent_polls_required,
+                unknown_injection_timeout_seconds=unknown_injection_timeout_seconds,
             )
 
         self._worker = PollingWorker(name="ft-random-fault-injector", run=inject_until_stopped)
@@ -85,7 +85,7 @@ def spawn_fault_injector(
     get_virtual_cells: Callable[[], list[dict]] | None = None,
     injection_enabled: Callable[[], bool] | None = None,
     poll_interval_seconds: float = POLL_INTERVAL_SECONDS,
-    quiescent_polls_required: int = QUIESCENT_POLLS_REQUIRED,
+    unknown_injection_timeout_seconds: float = UNKNOWN_INJECTION_RESOLUTION_TIMEOUT_SECONDS,
 ) -> FaultInjectorHandle:
     handle = FaultInjectorHandle(
         base_url=base_url,
@@ -95,7 +95,7 @@ def spawn_fault_injector(
         get_virtual_cells=get_virtual_cells,
         injection_enabled=injection_enabled,
         poll_interval_seconds=poll_interval_seconds,
-        quiescent_polls_required=quiescent_polls_required,
+        unknown_injection_timeout_seconds=unknown_injection_timeout_seconds,
     )
     handle.start()
     return handle

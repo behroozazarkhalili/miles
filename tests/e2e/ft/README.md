@@ -340,11 +340,10 @@ Assertions:
 - **Why the shared deterministic recipe**: the assertion is deterministic replay across fresh inference engines, not true-on-policy training. Reusing the same FlashInfer recipe as the main deterministic trainer-FT test avoids a second, incompatible attention-backend contract.
 - **Why `--sglang-disable-radix-cache`**: a replacement engine serves with a cold prefix cache where the baseline's was warm, and deterministic inference is nowhere documented as prefix-cache-length invariant.
 - **Why this recipe disables batch-variant MM fallback**: a rollout worker loss changes co-batching while the pool is healing; permitting an `einsum` fallback would make the same seeded request depend on that temporary batch shape. The scenario injects the environment override without changing the production default.
-- **Why `--rollout-health-check-interval 1`**: healthy generation can finish between two five-second polls; the short scenario needs at least one fresh Serving observation before its lock-protected injection attempt.
+- **Why `--rollout-health-check-interval 1`**: healthy generation can finish between two five-second polls; the short scenario needs at least one fresh Serving observation before it may pick a target.
 - **Why this scenario polls the fault window every 0.2 seconds**: colocated generation windows are only a few seconds long, so the generic two-second scheduler cadence can miss every Serving observation in an eight-rollout run.
-- **Why one quiescent poll on Ray only**: colocate exposes Serving only between train phases, and on Ray the injection endpoint takes the inference-controller lock and atomically rejects inactive servers, so the generic stable-serving gate is redundant. The Kubernetes forms (`exec_sigkill`, `delete_pod`) act on the pod without that lock, so a stale Serving poll or a slow `kubectl` would land the fault after the colocated engines are already offloaded; Kubernetes therefore keeps the generic 60-poll gate.
 - **Why the final two rollouts accept no new fault**: the scheduler keeps observing recovery but closes admission after rollout 5, so teardown cannot race a newly accepted replacement.
-- **Why Ray checks Serving again inside the injection lock**: the lock excludes weight-update and offload transitions, while the Serving check also rejects the subsequent colocated trainer phase after `offload()` has released the lock.
+- **Why an offloaded engine is never a target**: colocate hands the shared GPUs to the trainer, and the controller reports that pause as `EnginesOffloaded`, which the injector rejects. There is no longer a lock in the injection path to reject it instead.
 - **Why every namespace, not just `train/`**: an engine crash shows up first in `rollout/raw_reward` or `rollout/log_probs`. `perf/` is left out by name, being wall-clock and throughput that a relaunch moves by definition, and a metric in neither namespace fails the run rather than being dropped quietly.
 - **Why the weights-moved gate**: bitwise equality is also satisfied by two runs that trained on nothing.
 - **Why not a loss or reward curve**: neither is a progress signal here — the reward is `deterministic_random`, a hash of the response, and GRPO's surrogate loss is not monotone even while a run learns. Over eight rollouts neither moves for a reason worth asserting, and the weights either changed or they did not.
@@ -371,13 +370,15 @@ Architecture (external fault injection, not inside the training loop):
      a. GET /api/v1/cells, keeping only the targeted cell types
      b. Append that whole snapshot to the injector's event log, its only state
      c. Collect the cell kinds whose own schedule is due; stop here if none
-     d. A due kind is ready only at a quiescent point: every replica of that kind present,
-        Healthy and (for rollout) Serving for 60 consecutive polls (~120s) - long enough to
-        outlast the ~95s stale-status window - and at least one spare replica to survive
-        the kill
-     e. Draw a ready kind, a cell of that kind and one of its fault forms - preferring a form
-        the log shows has never worked - apply it, record the attempt, reset that kind's
-        quiescence streak, then draw its next injection time
+     d. Stop here while any harmed cell is still owed a recovery, run-wide: a cell is owed one
+        until it is observed in service under a workers_hash different from the one the fault
+        was aimed at
+     e. Stop here unless EVERY enabled kind has recovered: every replica that kind has ever
+        shown is present, its current (cell_id, workers_hash) is eligible, and at least one
+        spare replica survives a kill
+     f. Draw a due kind, a cell of that kind and one of its fault forms - preferring a form
+        the log shows has never worked - apply it, record the attempt with the target's
+        workers_hash, then draw that kind's next injection time
   3. inject_fault() runs on the actor's own ray concurrency group thread and kills the process,
      or the test layer deletes the pod on kubernetes
   4. The health checker notices by heartbeat timeout
@@ -386,15 +387,29 @@ Architecture (external fault injection, not inside the training loop):
 
 Per-kind schedules: exponential, mean that kind's --*-crash-interval-seconds
 
+Eligibility, per (cell_id, workers_hash), read off the observations alone:
+  in service     -> Healthy=True and Allocated=True, plus Serving=True for rollout cells;
+                    trainer cells publish no Serving condition and are not asked for one.
+                    Healthy=True with reason TrainerUninitialized does not count: a trainer
+                    cell reports that from the moment it is allocated, before it has joined
+                    the run
+  grants         -> the first in-service observation of a generation makes it eligible at once
+  carries        -> a weight-update pause (Healthy=Unknown, reason WeightUpdateInProgress,
+                    Allocated=True, Serving=True for rollout) keeps an eligibility that
+                    generation already had, and grants none it did not
+  drops          -> any other reading: explicitly unhealthy, de-allocated, out of the router,
+                    paused for an offload, or the cell absent from the listing
+  never inherits -> a new workers_hash starts with none
+
 Witnesses, counted per kind:
   forms   -> every form the enabled components make available succeeded at least once, so a
              soak that clears the injection floors on one form still has to draw the others
   train   -> >= 2 accepted actor injections, >= 2 healed cells across the
              CellReconfigureEvents, and every injected cell index paired with a healing of
              that same index - no debt left when training ends
-  rollout -> >= 2 accepted rollout injections, and every injected cell observed Serving
-             at least once on a reading taken >= 120s after its last injection - late
-             enough that the ~95s stale-status window cannot have produced it
+  rollout -> >= 2 accepted rollout injections, and every injected cell observed in service
+             at least once under a workers_hash other than the one it was injected at - a
+             reading the killed incarnation cannot produce however stale it is
 
 Faults are random, so beyond the witnesses neither an exact sequence nor the end-state
 membership is asserted.
@@ -402,15 +417,22 @@ membership is asserted.
 
 - **Why per-kind schedules and counting**: each kind's cadence stays what it would be in a single-kind soak, and the trainer assertion reads only `actor` injections while the rollout one reads only `rollout` — a mixed soak cannot let one kind's crashes pay for the other's missing heal.
 - **Why rollout gets the longer interval**: the replacement pays a full sglang launch plus a weight sync before it can serve again.
-- **No per-kind quota**: when the trainer has no spare replica for a long stretch every injection lands on rollout, and the failure form is a loud "too few trainer injections" rather than a silent pass.
-- **Why injections wait for quiescence**: the api server reports a just-killed cell Healthy for ~95s, far longer than the poll interval, and indep_dp cannot heal from zero survivors, so a naive Healthy count would eventually kill the last replica. A 60-poll all-serving streak (~120s, the same bound the recovery witness uses) outlasts that window, so by the time a kind is ready again its readings are fresh and every replica really serves; the injector itself keeps no per-cell recovery state to corrupt. A failed injection attempt forfeits the streak too - the kill, not the response, may be what survived the failure.
-- **A form that leaves its cell running**: `BaseFaultForm.harms_cell` is false for it, so the draw is recorded without charging that cell a recovery; the reset quiescence streak alone paces the next injection.
-- **Why quiescence requires `Serving`, not just `Healthy`**: `Healthy` and even `Running` include a replacement that got weights but cannot answer requests yet, so a kind counting such a replica as recovered would be injected into mid-relaunch.
-- **Why quiescence counts replicas against the most ever seen**: a deleted pod vanishes from the listing instead of reading unhealthy, and the survivors all serve; only the missing replica says the kind is still recovering.
+- **No per-kind quota, and no redirection either**: a kind without a spare replica does not hand its budget to the other kind - it stops the run's injections until it recovers. A stretch of that shows up as a loud "too few injections" for whichever kind fell short, never as a silent pass.
+- **Why recovery is proved by identity, not by waiting**: the api server reports a just-killed cell Healthy for ~95s, far longer than the poll interval, and indep_dp cannot heal from zero survivors, so a naive Healthy count would eventually kill the last replica. Waiting a fixed time is only a guess about how stale that reading may be; the `workers_hash` the api server carries names the incarnation directly, so a Serving reading under a *different* hash is evidence the killed one cannot manufacture at any age.
+- **Why only one harm is outstanding run-wide**: a trainer loss takes its assigned inference cells down with it, and a second fault landing during that cascade hits a fleet that is already a replica short and leaves nobody able to say which fault the damage came from. The per-kind clocks stay independent; only the admission is serialized.
+- **Why every kind, not just the due one, has to be back**: the victim of a trainer crash is the trainer, and its debt clears as soon as a replacement trainer is in service - but the inference cells that trainer was writing to are retired by the same update and are still relaunching. Checking only the due kind would let the very next draw harm the trainer again while its targets are down. The gate therefore reads every enabled kind, and a kind that is a replica short blocks the whole run rather than redirecting the fault at another kind.
+- **Why eligibility is per generation, not per poll**: a pause makes health Unknown, so accepting a pause on its own would let a replacement that has never been probed pass as a spare the moment a weight update starts. Tying the qualification to `(cell_id, workers_hash)` means the pause can only carry forward what a real in-service observation of that same generation already established, and a cell that read unhealthy cannot be laundered back by the next pause.
+- **Why no waiting window**: the qualification is evidence, not age. One honest in-service reading is enough, and no number of stale ones ever is.
+- **A form that leaves its cell running**: `BaseFaultForm.harms_cell` is false for it, so the draw is recorded without charging that cell a recovery, and it never holds up the next injection.
+- **Why a rollout target must be `Serving`, not just `Healthy`**: `Healthy` and even `Running` include a replacement that got weights but cannot answer requests yet, so treating such a replica as recovered would land the fault mid-relaunch. Trainer cells publish no `Serving` condition at all (`compute_cell_status` emits `Allocated` and `Healthy`), so demanding one there would stop every trainer soak; they are judged by `Healthy` and `Allocated`.
+- **Why a trainer cell needs `TrainerUninitialized`**: `StateAllocatedUninitialized` reports `Healthy=True` — the cell exists and its workers answer — but it has not run `init()` and holds no rank in the run. Without a way to tell that apart, a replacement would clear its predecessor's recovery debt and count as a spare the instant it was allocated, licensing a second crash of the one trainer that had actually initialized. The reason is set where that status is built (`cell_monitor.HEALTH_TRAINER_UNINITIALIZED`) and only there; a cell whose `Healthy` comes from a real probe never carries it. Nothing waits a fixed time for initialization, and no `Serving` condition is invented for trainer cells.
+- **Why a weight-update pause still counts as injectable**: the controller pauses health probing for the duration of an update, and a fault landing inside that window is exactly what the weight-update fault tolerance has to survive. The pause carries an explicit `WeightUpdateInProgress` reason, so it is distinguishable from a cell nobody has probed and from `EnginesOffloaded`, neither of which is a legal target.
+- **Why replicas are counted against the most ever seen**: a deleted pod vanishes from the listing instead of reading unhealthy, and the survivors all serve; only the missing replica says the kind is still recovering.
+- **An injection whose outcome is unknown**: a request that raised may still have landed, so the cell is owed a recovery exactly as a successful one is, and it is never retried blindly. If no replacement generation serves within `UNKNOWN_INJECTION_RESOLUTION_TIMEOUT_SECONDS`, the injector thread raises and `stop_and_join` re-raises it into the test: whether the fault landed is unknowable at that point, so the run cannot claim either outcome.
 - **Why every enabled form has to land**: the floors count injections, not forms, so `inject_fault:sigkill` alone could clear them while `delete_pod` is never tried. This witness makes the draw's preference for an untried form binding.
 - **Why the per-cell pairing**: a floor of ">= 2 healings" passes whenever the last crash never recovered. The default intervals are short enough that a soak reliably clears the floors.
-- **Why the step budget is 60**: a rollout injection needs a 60-poll (~120s) quiescent streak plus a mean-240s exponential wait, and a weight update resets the streak, so the second accepted rollout injection the witness demands takes well over ten minutes. The budget buys that time instead of lowering the quiescence gate that keeps the injector from killing a kind's last live replica.
-- **Why the rollout witness is one-sided**: the trainer witness reads the run's own CellReconfigureEvents, which miss nothing; the rollout witness reads sampled polls, which miss windows by construction. It therefore never demands seeing the down half of a recovery - it demands a Serving reading fresh enough (>= 120s after the cell's last injection, past the ~95s staleness) to prove the survivor really serves. Undercounting an intermediate recovery cannot fail the run; claiming one that never happened cannot pass it.
+- **Why the step budget is 60**: a rollout injection waits for the previous victim to serve again under a new generation, plus a mean-240s exponential wait, so the second accepted rollout injection the witness demands takes well over ten minutes. The budget buys that time instead of lowering the gate that keeps the injector from killing a kind's last live replica.
+- **Why the rollout witness is one-sided**: the trainer witness reads the run's own CellReconfigureEvents, which miss nothing; the rollout witness reads sampled polls, which miss windows by construction. It therefore never demands seeing the down half of a recovery - it demands a Serving reading under a generation other than the one that was killed. Undercounting an intermediate recovery cannot fail the run; claiming one that never happened cannot pass it.
 - **Stopping the injector**: `stop_and_join` asserts the thread actually stopped, since a thread still mid-injection could crash a cell nothing will heal, and would race the witness being read.
 
 ### `scenario_realistic_gsm8k`

@@ -2,7 +2,11 @@ from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
-from miles.ray.train.cell_monitor import compute_cell_status, create_trainer_cell_health_checker
+from miles.ray.train.cell_monitor import (
+    HEALTH_TRAINER_UNINITIALIZED,
+    compute_cell_status,
+    create_trainer_cell_health_checker,
+)
 from miles.ray.train.cell_state import StateAllocatedAlive, StateAllocatedErrored, StateAllocatedUninitialized
 from miles.utils.ft_utils.api_server.models import TriState
 from miles.utils.ft_utils.health_checker import ActiveAndEpoch, SimpleHealthCheckerConfig
@@ -71,6 +75,22 @@ class TestComputeCellStatusOtherStates:
         assert result.phase == "Running"
         healthy = _find_condition(result, "Healthy")
         assert healthy.status == TriState.TRUE
+
+    @pytest.mark.parametrize("health_status", [TriState.TRUE, TriState.FALSE, TriState.UNKNOWN])
+    def test_uninitialized_says_why_it_reports_healthy(self, health_status: TriState):
+        """Nothing probed this cell yet, and a reader that cannot tell it apart would count it as a live replica."""
+        state = StateAllocatedUninitialized(worker_handles=[_make_worker_handle_mock()])
+
+        result = compute_cell_status(state, health_status, workers_hash="pseudo-hash-0")
+
+        assert _find_condition(result, "Healthy").reason == HEALTH_TRAINER_UNINITIALIZED
+
+    @pytest.mark.parametrize("health_status", [TriState.TRUE, TriState.FALSE, TriState.UNKNOWN])
+    def test_an_initialized_cell_never_borrows_the_uninitialized_reason(self, health_status: TriState):
+        """Its Healthy condition is a real probe result, and mislabelling it would hide a working cell."""
+        result = compute_cell_status(_make_alive_state(), health_status, workers_hash="pseudo-hash-0")
+
+        assert _find_condition(result, "Healthy").reason != HEALTH_TRAINER_UNINITIALIZED
 
     @pytest.mark.parametrize("health_status", [TriState.TRUE, TriState.FALSE, TriState.UNKNOWN])
     def test_errored_always_reports_unhealthy(self, health_status: TriState):

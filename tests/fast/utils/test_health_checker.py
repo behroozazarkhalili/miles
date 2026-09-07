@@ -958,3 +958,44 @@ class TestShippedRolloutConfig:
         assert checker.status == TriState.FALSE
         assert checker._consecutive_failures == 1
         checker.stop()
+
+
+class TestActivenessTrackerReason:
+    """A paused probe reads Unknown, and only the reason says whether that pause is a safe moment."""
+
+    def test_a_pause_carries_the_reason_it_was_paused_for(self):
+        """A weight update and a colocate offload both pause probing, and they are not interchangeable."""
+        tracker = ActivenessTracker(active=True)
+
+        tracker.bump_active(False, reason="WeightUpdateInProgress")
+
+        assert tracker.get().inactive_reason == "WeightUpdateInProgress"
+
+    def test_resuming_clears_the_reason(self):
+        """A resumed cell is not paused for anything, and a leftover reason would claim otherwise."""
+        tracker = ActivenessTracker(active=True)
+        tracker.bump_active(False, reason="WeightUpdateInProgress")
+
+        tracker.bump_active(True)
+
+        assert tracker.get().inactive_reason is None
+
+    def test_changing_the_reason_bumps_the_epoch(self):
+        """The checker restarts its wait on every epoch change, and a silent reason swap would hide the new pause."""
+        tracker = ActivenessTracker(active=True)
+        tracker.bump_active(False, reason="EnginesOffloaded")
+        first = tracker.get().epoch
+
+        tracker.bump_active(False, reason="WeightUpdateInProgress")
+
+        assert tracker.get().epoch != first
+
+    def test_repeating_the_same_pause_does_not_bump_the_epoch(self):
+        """Every pause counted as a new epoch would reset the first-probe wait forever."""
+        tracker = ActivenessTracker(active=True)
+        tracker.bump_active(False, reason="EnginesOffloaded")
+        first = tracker.get().epoch
+
+        tracker.bump_active(False, reason="EnginesOffloaded")
+
+        assert tracker.get().epoch == first

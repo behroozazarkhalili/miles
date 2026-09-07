@@ -79,7 +79,9 @@ class ServerCell:
         controller_active_and_epoch = self.health_checker_activeness()
         cell_active = isinstance(self._state, (StatePendingWeights, StateServing))
         return ActiveAndEpoch(
-            active=cell_active and controller_active_and_epoch.active, epoch=controller_active_and_epoch.epoch
+            active=cell_active and controller_active_and_epoch.active,
+            epoch=controller_active_and_epoch.epoch,
+            inactive_reason=controller_active_and_epoch.inactive_reason,
         )
 
     def __del__(self) -> None:
@@ -100,7 +102,7 @@ class ServerCell:
                     phase="Running",
                     conditions=[
                         CellCondition.allocated(TriState.TRUE),
-                        CellCondition.from_health_checker_status(self._health_checker.status),
+                        self._compute_healthy_condition(),
                         CellCondition.serving(TriState.TRUE if self.is_serving else TriState.FALSE),
                     ],
                     workers_hash=self.meta.workers_hash,
@@ -126,6 +128,13 @@ class ServerCell:
 
             case _:
                 raise NotImplementedError(f"Unknown state: {self._state}")
+
+    def _compute_healthy_condition(self) -> CellCondition:
+        status = self._health_checker.status
+        activeness = self._get_health_checker_active_and_epoch()
+        if status is TriState.UNKNOWN and not activeness.active and activeness.inactive_reason is not None:
+            return CellCondition.healthy(TriState.UNKNOWN, reason=activeness.inactive_reason)
+        return CellCondition.from_health_checker_status(status)
 
     @property
     def is_uninitialized(self) -> bool:

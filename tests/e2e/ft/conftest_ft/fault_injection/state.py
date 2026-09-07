@@ -6,11 +6,46 @@ from datetime import datetime, timezone
 
 from pydantic import Field
 
+from miles.ray.rollout.inference_controller import HEALTH_PAUSED_FOR_WEIGHT_UPDATE
+from miles.ray.train.cell_monitor import HEALTH_TRAINER_UNINITIALIZED
 from miles.utils.pydantic_utils import FrozenStrictBaseModel
+
+ACTOR_CELL_TYPE: str = "actor"
+ROLLOUT_CELL_TYPE: str = "rollout"
+
+
+def cell_type_of(cell: dict) -> str:
+    return cell["metadata"]["labels"]["miles.io/cell-type"]
 
 
 def cell_is_alive(cell: dict) -> bool:
-    return any(cond["type"] == "Healthy" and cond["status"] == "True" for cond in cell["status"]["conditions"])
+    return _condition_status(cell, "Healthy") == "True"
+
+
+def cell_is_allocated(cell: dict) -> bool:
+    return _condition_status(cell, "Allocated") == "True"
+
+
+def cell_health_reason(cell: dict) -> str | None:
+    for cond in cell["status"]["conditions"]:
+        if cond["type"] == "Healthy":
+            return cond.get("reason")
+    return None
+
+
+def cell_workers_hash(cell: dict) -> str:
+    workers_hash = cell["status"]["workers_hash"]
+    assert (
+        workers_hash
+    ), f"cell {cell['metadata']['name']} reports no worker generation, so it has no identity to track"
+    return workers_hash
+
+
+def _condition_status(cell: dict, condition_type: str) -> str | None:
+    for cond in cell["status"]["conditions"]:
+        if cond["type"] == condition_type:
+            return cond["status"]
+    return None
 
 
 class ObservedCellState(enum.Enum):
@@ -39,6 +74,7 @@ class InjectionEvent(BaseEvent):
     cell_name: str
     form_name: str
     succeeded: bool
+    workers_hash: str
     harmed: bool = True
 
 
@@ -46,6 +82,29 @@ class CellInfo(FrozenStrictBaseModel):
     cell_type: str
     state: ObservedCellState
     alive: bool
+    allocated: bool
+    health_reason: str | None
+    workers_hash: str
+
+
+def cell_info_is_in_service(info: CellInfo) -> bool:
+    if not (info.alive and info.allocated):
+        return False
+    if info.health_reason == HEALTH_TRAINER_UNINITIALIZED:
+        return False
+    if info.cell_type != ROLLOUT_CELL_TYPE:
+        return True
+    return info.state is ObservedCellState.SERVING
+
+
+def cell_info_is_paused_for_weight_update(info: CellInfo) -> bool:
+    if info.alive or not info.allocated:
+        return False
+    if info.health_reason != HEALTH_PAUSED_FOR_WEIGHT_UPDATE:
+        return False
+    if info.cell_type != ROLLOUT_CELL_TYPE:
+        return True
+    return info.state is ObservedCellState.SERVING
 
 
 class ObservationsEvent(BaseEvent):
@@ -68,27 +127,33 @@ class EventLog:
         with self._lock:
             return list(self._events)
 
-    def note_injection_attempt(self, *, cell_name: str, form_name: str, succeeded: bool, harmed: bool = True) -> None:
-        self._append(InjectionEvent(cell_name=cell_name, form_name=form_name, succeeded=succeeded, harmed=harmed))
-
-    def observe(self, cells: list[dict]) -> None:
+    def note_injection_attempt(
+        self, *, cell_name: str, form_name: str, succeeded: bool, workers_hash: str, harmed: bool = True
+    ) -> None:
         self._append(
-            ObservationsEvent(
-                cell_infos={
-                    cell["metadata"]["name"]: CellInfo(
-                        cell_type=cell_type_of(cell),
-                        state=compute_observed_cell_state(cell),
-                        alive=cell_is_alive(cell),
-                    )
-                    for cell in cells
-                }
+            InjectionEvent(
+                cell_name=cell_name,
+                form_name=form_name,
+                succeeded=succeeded,
+                harmed=harmed,
+                workers_hash=workers_hash,
             )
         )
+
+    def observe(self, cells: list[dict]) -> None:
+        self._append(ObservationsEvent(cell_infos={c["metadata"]["name"]: compute_cell_info(c) for c in cells}))
 
     def _append(self, event: Event) -> None:
         with self._lock:
             self._events.append(event)
 
 
-def cell_type_of(cell: dict) -> str:
-    return cell["metadata"]["labels"]["miles.io/cell-type"]
+def compute_cell_info(cell: dict) -> CellInfo:
+    return CellInfo(
+        cell_type=cell_type_of(cell),
+        state=compute_observed_cell_state(cell),
+        alive=cell_is_alive(cell),
+        allocated=cell_is_allocated(cell),
+        health_reason=cell_health_reason(cell),
+        workers_hash=cell_workers_hash(cell),
+    )

@@ -11,6 +11,7 @@ from tests.e2e.deploy.conftest_deploy.hot_restart import scenario_hot_restart_re
 from tests.e2e.deploy.conftest_deploy.hot_restart.evidence import HotRestartRecord
 from tests.e2e.deploy.conftest_deploy.hot_restart.fault_form import HotRestartFaultForm
 from tests.e2e.ft.conftest_ft import scenario_realistic_gsm8k
+from tests.e2e.ft.conftest_ft.fault_injection import state
 from tests.e2e.ft.conftest_ft.fault_injection.state import InjectionEvent
 
 from miles.utils.audit_utils.event_logger.logger import EVENTS_DIRNAME, EventLogger
@@ -87,6 +88,7 @@ class TestTheInjectionPlan:
         """A draw before the final fifteen rollouts still reaches the ordinary scheduler."""
         form = MagicMock(spec=HotRestartFaultForm)
         form.is_within_injection_window.return_value = True
+        form.records = ()
         cells = scenario._create_virtual_cells_before(form)
 
         assert len(cells) == 2
@@ -101,12 +103,26 @@ class TestTheInjectionPlan:
 
     def test_the_plan_supplies_two_healthy_virtual_cells(self):
         """The regular scheduler sees a spare target without borrowing a real FT cell."""
-        cells = scenario._create_virtual_cells()
+        cells = scenario._create_virtual_cells(num_take_overs=0)
 
         assert [cell["metadata"]["name"] for cell in cells] == list(scenario._VIRTUAL_CELL_NAMES)
         assert all(
             cell["metadata"]["labels"]["miles.io/cell-type"] == scenario._HOT_RESTART_CELL_TYPE for cell in cells
         )
+        assert all(state.cell_info_is_in_service(state.compute_cell_info(cell)) for cell in cells)
+
+    def test_a_take_over_moves_the_virtual_cells_to_a_new_generation(self):
+        """The injector proves recovery by identity, so a script that was replaced must not read as the old one."""
+        before = scenario._create_virtual_cells(num_take_overs=0)
+        after = scenario._create_virtual_cells(num_take_overs=1)
+
+        assert state.cell_workers_hash(before[0]) != state.cell_workers_hash(after[0])
+
+    def test_the_virtual_cells_of_one_generation_share_it(self):
+        """They stand for one orchestration script, so a per-cell identity would invent a fleet that does not exist."""
+        cells = scenario._create_virtual_cells(num_take_overs=2)
+
+        assert len({state.cell_workers_hash(cell) for cell in cells}) == 1
 
     def test_the_only_fault_the_plan_may_draw_is_a_hot_restart(self):
         """A pod kill mixed in would make the trainer boot uuid this test pins change for a second reason."""
@@ -186,11 +202,14 @@ def _injection(*, succeeded: bool) -> InjectionEvent:
         form_name=scenario.HOT_RESTART_FORM_NAME,
         succeeded=succeeded,
         harmed=False,
+        workers_hash="hot-restart-virtual-cell-take-over-0",
     )
 
 
 def _crash(*, succeeded: bool) -> InjectionEvent:
-    return InjectionEvent(cell_name="actor-1", form_name="crash_pod", succeeded=succeeded, harmed=True)
+    return InjectionEvent(
+        cell_name="actor-1", form_name="crash_pod", succeeded=succeeded, harmed=True, workers_hash="generation-0"
+    )
 
 
 class TestWhatEachTakeOverCost:

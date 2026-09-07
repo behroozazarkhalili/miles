@@ -77,6 +77,7 @@ class SimpleHealthCheckerConfig(StrictBaseModel):
 class ActiveAndEpoch(NamedTuple):
     active: bool
     epoch: int
+    inactive_reason: str | None = None
 
 
 class ActivenessTracker:
@@ -86,10 +87,11 @@ class ActivenessTracker:
     def get(self) -> ActiveAndEpoch:
         return self._state
 
-    def bump_active(self, active: bool) -> None:
-        if active == self._state.active:
+    def bump_active(self, active: bool, *, reason: str | None = None) -> None:
+        inactive_reason = None if active else reason
+        if active == self._state.active and inactive_reason == self._state.inactive_reason:
             return
-        self._state = ActiveAndEpoch(active=active, epoch=self._state.epoch + 1)
+        self._state = ActiveAndEpoch(active=active, epoch=self._state.epoch + 1, inactive_reason=inactive_reason)
 
 
 class BaseHealthChecker(abc.ABC):

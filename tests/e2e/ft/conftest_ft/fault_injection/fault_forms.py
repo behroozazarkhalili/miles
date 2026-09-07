@@ -9,6 +9,7 @@ from tests.e2e.ft.conftest_ft.fault_injection.pod_manipulation import (
     list_pod_names_of_cell,
     sigkill_process_patterns_in_pod,
 )
+from tests.e2e.ft.conftest_ft.fault_injection.state import ACTOR_CELL_TYPE, ROLLOUT_CELL_TYPE
 
 from miles.utils.external_utils import command_utils
 from miles.utils.external_utils.command_utils.helm_backend.naming import ReleaseName
@@ -22,9 +23,6 @@ DELETE_POD_FORM_NAME: str = "delete_pod"
 EXEC_SIGKILL_FORM_NAME: str = "exec_sigkill"
 ENGINE_CONTAINER_NAME: str = "engine"
 SGLANG_PROCESS_PATTERN: str = "sglang::"
-
-ACTOR_CELL_TYPE: str = "actor"
-ROLLOUT_CELL_TYPE: str = "rollout"
 
 
 class BaseFaultForm(abc.ABC):

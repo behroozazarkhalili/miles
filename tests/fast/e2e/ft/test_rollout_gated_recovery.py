@@ -4,6 +4,7 @@ import asyncio
 import contextlib
 from collections.abc import Callable
 from typing import Any
+from unittest.mock import AsyncMock
 
 import pytest
 from tests.e2e.ft.conftest_ft.fault_injection import state, views
@@ -130,14 +131,6 @@ class _FakeWorkerManager:
             await self._reconcile(cell_id, self.cell_info(cell_id))
 
 
-class _FakeStopCellController:
-    def __init__(self, *, worker_manager: _FakeWorkerManager) -> None:
-        self._worker_manager = worker_manager
-
-    async def stop_cell_between_weight_updates(self, cell_id: str) -> None:
-        await self._worker_manager.stop_cells.remote([cell_id])
-
-
 class _Harness:
     def __init__(self, *, monkeypatch: pytest.MonkeyPatch) -> None:
         self.router = _FakeRouter()
@@ -180,6 +173,7 @@ class _Harness:
         self.controller._watcher_disposers = []
         self.controller._ticker = None
         self.controller._health_checker_activeness = ActivenessTracker(active=True)
+        self.controller._cell_operations = AsyncMock()
         self.controller.servers = {
             "default": RolloutServer(
                 server_cells={},
@@ -196,10 +190,7 @@ class _Harness:
         self.worker_manager = _FakeWorkerManager(cell_ids=_CELL_IDS, reconcile=self.controller._reconcile)
         self.handler = _CellHandler(
             cell_type="rollout",
-            operations=RayCellOperations(
-                worker_manager_handle=self.worker_manager,
-                resolve_inference_controller=lambda: _FakeStopCellController(worker_manager=self.worker_manager),
-            ),
+            operations=RayCellOperations(worker_manager_handle=self.worker_manager),
             controllers=[self.controller],
             pool_ids=[_POOL_ID],
         )
@@ -327,8 +318,9 @@ async def test_the_next_window_puts_the_replacement_engine_back_in_the_router(ha
 async def test_the_observed_sequence_satisfies_the_soak_recovery_witness(harness: _Harness) -> None:
     """The fast-layer stand-in is only worth anything if the e2e witness accepts the sequence it produces."""
     log = state.EventLog()
-    log.observe(list((await harness.observe()).values()))
-    note_injected(log, _CELL_IDS[0])
+    observed = await harness.observe()
+    log.observe(list(observed.values()))
+    note_injected(log, _CELL_IDS[0], workers_hash=observed[_CELL_IDS[0]]["status"]["workers_hash"])
     harness.crash(_CELL_IDS[0])
 
     await harness.run_ft_controller_once()
@@ -336,14 +328,15 @@ async def test_the_observed_sequence_satisfies_the_soak_recovery_witness(harness
     await harness.open_weight_update_window()
     log.observe(list((await harness.observe()).values()))
 
-    assert views.compute_cells_not_serving_after_injection(log.events, cell_type="rollout", grace_seconds=0.0) == {}
+    assert views.compute_cells_not_serving_after_injection(log.events, cell_type="rollout") == {}
 
 
 async def test_the_witness_rejects_a_replacement_that_never_reaches_the_router(harness: _Harness) -> None:
     """A weight update that silently skips the replaced cell leaves it Running forever, and must fail the soak."""
     log = state.EventLog()
-    log.observe(list((await harness.observe()).values()))
-    note_injected(log, _CELL_IDS[0])
+    observed = await harness.observe()
+    log.observe(list(observed.values()))
+    note_injected(log, _CELL_IDS[0], workers_hash=observed[_CELL_IDS[0]]["status"]["workers_hash"])
     harness.crash(_CELL_IDS[0])
 
     await harness.run_ft_controller_once()
@@ -351,5 +344,5 @@ async def test_the_witness_rejects_a_replacement_that_never_reaches_the_router(h
     await harness.open_weight_update_window(mark_weights_ready=False)
     log.observe(list((await harness.observe()).values()))
 
-    offenders = views.compute_cells_not_serving_after_injection(log.events, cell_type="rollout", grace_seconds=0.0)
+    offenders = views.compute_cells_not_serving_after_injection(log.events, cell_type="rollout")
     assert set(offenders) == {_CELL_IDS[0]}

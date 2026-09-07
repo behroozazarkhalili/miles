@@ -59,6 +59,7 @@ def spec_inference_controller(args) -> ServeWorkerSpec:
             args=args,
             engine_provider=_compute_controller_engine_provider(args, capability=ctx.capability),
             router_providers=compute_router_providers(args, capability=ctx.capability),
+            cell_operations=ctx.capability.cell_operations(),
         ),
     )
 

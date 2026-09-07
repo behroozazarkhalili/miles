@@ -28,7 +28,7 @@ from miles.utils.ft_utils.api_server.models import CellStatus
 from miles.utils.init_once import InitOnce, init_once
 from miles.utils.logging_utils import configure_logger
 from miles.utils.misc import SimpleTicker
-from miles.utils.test_utils.fault_injector import FailureMode
+from miles.utils.workers.cell_operations.base import BaseCellOperations, CellTerminationOutcome
 from miles.utils.workers.registration.hub import RegistrationHub
 from miles.utils.workers.registration.models import RegistrationSnapshot
 from miles.utils.workers.worker_provider.base import BaseWorkerProvider, CellInfo, StopWatchFn
@@ -40,6 +40,8 @@ TICK_INTERVAL_SECONDS = 5.0
 CELL_TICK_TIMEOUT_SECONDS = 120.0
 CELLS_READY_POLL_INTERVAL_SECONDS = 2.0
 CELLS_READY_TIMEOUT_SECONDS = 3600.0
+HEALTH_PAUSED_FOR_WEIGHT_UPDATE = "WeightUpdateInProgress"
+HEALTH_PAUSED_FOR_OFFLOAD = "EnginesOffloaded"
 
 
 @enforce_lock_discipline
@@ -51,11 +53,13 @@ class InferenceController:
         *,
         engine_provider: BaseWorkerProvider,
         router_providers: Sequence[BaseWorkerProvider],
+        cell_operations: BaseCellOperations,
     ) -> None:
         self._init_once = InitOnce(type(self).__name__)
         self.args = args
         self._engine_provider = engine_provider
         self._router_providers = router_providers
+        self._cell_operations = cell_operations
         self.context_lock = ContextLock("InferenceController")
         self.servers: dict[str, RolloutServer] = {}
         self._eval_fleet: InferenceControllerEvalFleet | None = None
@@ -87,27 +91,6 @@ class InferenceController:
         dashboard_hooks.register_router(self.args)
 
         await self.wait_expected_num_cells()
-
-    # TEMPORARY: exists only so a suspend can take this lock, reverted with the weight-update fault tolerance work
-    @with_lock
-    async def stop_cell_between_weight_updates(self, cell_id: str) -> None:
-        await self._engine_provider.stop_cells(cell_ids=[cell_id])
-
-    # TEMPORARY: exists only so fault injection can take this lock, reverted with the weight-update fault tolerance work
-    @with_lock
-    async def inject_fault_between_weight_updates(self, cell_id: str, *, mode: FailureMode, sub_index: int) -> None:
-        # TEMPORARY: colocate cannot kill rollout workers while trainer ranks own the shared GPUs
-        server = next((srv for srv in self.servers.values() if cell_id in srv.server_cells), None)
-        if server is None:
-            raise KeyError(f"Unknown rollout cell {cell_id!r}")
-        if not server.health_checker_activeness.get().active:
-            raise RuntimeError(f"Rollout cell {cell_id!r} is offloaded; refusing fault injection")
-
-        await self._engine_provider._worker_manager_handle.inject_fault.remote(
-            cell_id,
-            mode=mode.value,
-            worker_in_cell_index=sub_index,
-        )
 
     # -------------------------- take over -----------------------------
 
@@ -204,7 +187,7 @@ class InferenceController:
 
     @requires_lock
     async def _offload(self, tags: list[str] | None):
-        await self._health_monitoring_pause(None)
+        await self._health_monitoring_pause(None, reason=HEALTH_PAUSED_FOR_OFFLOAD)
         for srv in self.servers.values():
             await srv.offload(tags=tags)
 
@@ -218,7 +201,7 @@ class InferenceController:
     @acquires_lock
     async def start_update_weights(self, model_id: str | None = None) -> "UpdatableEngines":
         """Return engines eligible for weight updates."""
-        await self._health_monitoring_pause(model_id)
+        await self._health_monitoring_pause(model_id, reason=HEALTH_PAUSED_FOR_WEIGHT_UPDATE)
         await self._ensure_cells_ready(model_id=model_id)
 
         srv = self._get_updatable_server(model_id=model_id)
@@ -273,8 +256,33 @@ class InferenceController:
     async def _mark_cells_errored(
         self, *, snapshot_cell_id_to_hashes: dict[str, str], cell_ids: Sequence[str]
     ) -> None:
-        for cell in self._cells_of_snapshot(snapshot_cell_id_to_hashes=snapshot_cell_id_to_hashes, cell_ids=cell_ids):
+        cells = self._cells_of_snapshot(snapshot_cell_id_to_hashes=snapshot_cell_id_to_hashes, cell_ids=cell_ids)
+        for cell in cells:
             await cell.mark_errored()
+
+        outcomes = await asyncio.gather(
+            *[self._terminate_errored_cell(cell) for cell in cells], return_exceptions=True
+        )
+        for cell, outcome in zip(cells, outcomes, strict=True):
+            if isinstance(outcome, BaseException):
+                logger.error(
+                    f"Cell {cell.meta.cell_id} was taken out of service but could not be stopped, so its paused "
+                    f"generate requests may hang until the external reconciler removes it",
+                    exc_info=outcome,
+                )
+
+    @requires_lock
+    async def _terminate_errored_cell(self, cell: ServerCell) -> None:
+        outcome = await self._cell_operations.terminate_incarnation(
+            cell_id=cell.meta.cell_id, expected_workers_hash=cell.meta.workers_hash
+        )
+        if outcome is CellTerminationOutcome.STALE:
+            logger.error(
+                f"Cell {cell.meta.cell_id} already runs a generation other than {cell.meta.workers_hash}, so this "
+                f"incarnation was left alone and its exit stays unconfirmed; its paused requests may still hang"
+            )
+            return
+        logger.info(f"Cell {cell.meta.cell_id} ({cell.meta.workers_hash}) is confirmed stopped: {outcome.value}")
 
     @requires_lock
     def _cells_of_snapshot(
@@ -421,9 +429,9 @@ class InferenceController:
     # -------------------------- utils -----------------------------
 
     @requires_lock
-    async def _health_monitoring_pause(self, model_id: str | None) -> None:
+    async def _health_monitoring_pause(self, model_id: str | None, *, reason: str) -> None:
         for srv in self._get_servers_of_model_id(model_id):
-            srv.health_checker_activeness.bump_active(False)
+            srv.health_checker_activeness.bump_active(False, reason=reason)
 
     @requires_lock
     async def _health_monitoring_resume(self, model_id: str | None) -> None:

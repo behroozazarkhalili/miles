@@ -203,11 +203,18 @@ def create_hot_restart_forms(run: Gsm8kRun, *, max_allowed_rollout_id: int) -> C
     return {_HOT_RESTART_CELL_TYPE: [form]}
 
 
-def _create_virtual_cells() -> list[dict]:
+def _create_virtual_cells(*, num_take_overs: int) -> list[dict]:
     return [
         {
             "metadata": {"name": name, "labels": {"miles.io/cell-type": _HOT_RESTART_CELL_TYPE}},
-            "status": {"phase": "Running", "conditions": [{"type": "Healthy", "status": "True"}]},
+            "status": {
+                "phase": "Running",
+                "conditions": [
+                    {"type": "Allocated", "status": "True"},
+                    {"type": "Healthy", "status": "True"},
+                ],
+                "workers_hash": f"{_HOT_RESTART_CELL_TYPE}-take-over-{num_take_overs}",
+            },
         }
         for name in _VIRTUAL_CELL_NAMES
     ]
@@ -216,7 +223,7 @@ def _create_virtual_cells() -> list[dict]:
 def _create_virtual_cells_before(form: HotRestartFaultForm | None) -> list[dict]:
     if form is None or not form.is_within_injection_window():
         return []
-    return _create_virtual_cells()
+    return _create_virtual_cells(num_take_overs=len(form.records))
 
 
 def build_checkpoint_args(dump_dir: str) -> str:
