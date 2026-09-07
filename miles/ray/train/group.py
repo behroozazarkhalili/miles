@@ -560,6 +560,7 @@ class TrainerController:
         mode: str,
         sub_index: int,
         request_id: str,
+        target: str,
     ) -> FaultHookArmingReport:
         try:
             handle = self._resolve_fault_hook_source(
@@ -570,7 +571,7 @@ class TrainerController:
             return FaultHookArmingReport(refused_because=str(refusal))
 
         await asyncio.wait_for(
-            handle.arm_fault_hook(hook=hook, mode=mode, request_id=request_id),
+            handle.arm_fault_hook(hook=hook, mode=mode, request_id=request_id, target=target),
             timeout=_ARM_FAULT_HOOK_TIMEOUT_SECONDS,
         )
         return FaultHookArmingReport()

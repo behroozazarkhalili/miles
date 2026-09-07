@@ -13,6 +13,7 @@ from tests.fast.utils.workers.fake_ray import EVENT_CREATE, EVENT_KILL, READINES
 
 from miles.ray.placement_group import PlacementGroupInfo
 from miles.utils.workers import ray_worker_manager
+from miles.utils.workers.cell_operations.base import FaultInjectionOutcome
 from miles.utils.workers.command_actor import CommandActor
 from miles.utils.workers.naming import compute_cell_id, compute_worker_name
 from miles.utils.workers.ray_worker_manager import RayWorkerManager, _BaseActorManager, _CommandActorManager
@@ -2007,7 +2008,7 @@ class TestInjectFault:
         """A multi-node engine is crashed by crashing one of its node ranks."""
         manager = await _launch([_make_spec("engine", num_workers_per_cell=2)])
 
-        manager.inject_fault("engine-00000", mode="sigkill", worker_in_cell_index=1)
+        await manager.inject_fault("engine-00000", mode="sigkill", worker_in_cell_index=1)
 
         calls = fake_ray_cluster.calls_of("inject_fault")
         assert [call.args for call in calls] == [("sigkill",)]
@@ -2018,7 +2019,7 @@ class TestInjectFault:
         manager = await _launch([_make_spec("engine")])
         fake_ray_cluster.handles[0].failing_methods["inject_fault"] = RuntimeError("actor died")
 
-        manager.inject_fault("engine-00000", mode="sigkill", worker_in_cell_index=0)
+        await manager.inject_fault("engine-00000", mode="sigkill", worker_in_cell_index=0)
 
     async def test_injecting_into_a_suspended_cell_is_rejected(self, fake_ray_cluster: FakeRayCluster):
         """A suspended cell has no worker to crash."""
@@ -2026,25 +2027,101 @@ class TestInjectFault:
         await manager.stop_cells(["engine-00000"])
 
         with pytest.raises(RuntimeError, match="not alive"):
-            manager.inject_fault("engine-00000", mode="sigkill", worker_in_cell_index=0)
+            await manager.inject_fault("engine-00000", mode="sigkill", worker_in_cell_index=0)
 
     async def test_a_worker_index_beyond_the_cell_is_rejected(self, fake_ray_cluster: FakeRayCluster):
         """Injecting into a neighbouring cell by accident would corrupt the test's premise."""
         manager = await _launch([_make_spec("engine", num_cells=2, num_workers_per_cell=1)])
 
         with pytest.raises(IndexError, match="out of range"):
-            manager.inject_fault("engine-00000", mode="sigkill", worker_in_cell_index=1)
+            await manager.inject_fault("engine-00000", mode="sigkill", worker_in_cell_index=1)
 
     async def test_a_negative_worker_index_is_rejected(self, fake_ray_cluster: FakeRayCluster):
         """Negative indexing would silently select the last worker instead of failing."""
         manager = await _launch([_make_spec("engine", num_workers_per_cell=2)])
 
         with pytest.raises(IndexError, match="out of range"):
-            manager.inject_fault("engine-00000", mode="sigkill", worker_in_cell_index=-1)
+            await manager.inject_fault("engine-00000", mode="sigkill", worker_in_cell_index=-1)
 
     async def test_an_unknown_cell_is_rejected(self, fake_ray_cluster: FakeRayCluster):
         """A typo must not silently inject nothing."""
         manager = await _launch([_make_spec("engine")])
 
         with pytest.raises(AssertionError):
-            manager.inject_fault("engine-00007", mode="sigkill", worker_in_cell_index=0)
+            await manager.inject_fault("engine-00007", mode="sigkill", worker_in_cell_index=0)
+
+
+class TestInjectFaultIntoAnObservedIncarnation:
+    async def test_the_fault_lands_when_the_cell_still_runs_the_observed_incarnation(
+        self, fake_ray_cluster: FakeRayCluster
+    ):
+        """The caller observed this generation and asks for it by name, and it is the one still running."""
+        manager = await _launch([_make_spec("engine")])
+        observed = manager.get_cell_infos(pool_ids=["engine"])["engine-00000"].workers_hash
+
+        outcome = await manager.inject_fault(
+            "engine-00000", mode="sigkill", worker_in_cell_index=0, expected_workers_hash=observed
+        )
+
+        assert outcome == FaultInjectionOutcome.INJECTED.value
+        assert [call.args for call in fake_ray_cluster.calls_of("inject_fault")] == [("sigkill",)]
+
+    async def test_a_replacement_started_since_is_not_harmed(self, fake_ray_cluster: FakeRayCluster):
+        """A verdict issued against a dead incarnation must not be paid for by the process that replaced it."""
+        manager = await _launch([_make_spec("engine")])
+        stale = manager.get_cell_infos(pool_ids=["engine"])["engine-00000"].workers_hash
+        await manager.stop_cells(["engine-00000"])
+        await manager.start_cells(["engine-00000"])
+
+        outcome = await manager.inject_fault(
+            "engine-00000", mode="sigkill", worker_in_cell_index=0, expected_workers_hash=stale
+        )
+
+        assert outcome == FaultInjectionOutcome.STALE.value
+        assert fake_ray_cluster.calls_of("inject_fault") == []
+
+    async def test_the_check_and_the_submit_are_one_membership_step(self, fake_ray_cluster: FakeRayCluster):
+        """Checking the hash and then calling an unconditional inject would leave a window this closes."""
+        manager = await _launch([_make_spec("engine")])
+        observed = manager.get_cell_infos(pool_ids=["engine"])["engine-00000"].workers_hash
+
+        async with manager._membership_lock:
+            injection = asyncio.create_task(
+                manager.inject_fault(
+                    "engine-00000", mode="sigkill", worker_in_cell_index=0, expected_workers_hash=observed
+                )
+            )
+            await asyncio.sleep(0)
+
+            assert not injection.done()
+            assert fake_ray_cluster.calls_of("inject_fault") == []
+
+        assert await injection == FaultInjectionOutcome.INJECTED.value
+
+    async def test_a_replacement_that_lands_while_the_injection_waits_is_not_harmed(
+        self, fake_ray_cluster: FakeRayCluster
+    ):
+        """The membership the injection is admitted into is the one it is checked against, not the one it saw."""
+        manager = await _launch([_make_spec("engine")])
+        observed = manager.get_cell_infos(pool_ids=["engine"])["engine-00000"].workers_hash
+
+        async with manager._membership_lock:
+            injection = asyncio.create_task(
+                manager.inject_fault(
+                    "engine-00000", mode="sigkill", worker_in_cell_index=0, expected_workers_hash=observed
+                )
+            )
+            await asyncio.sleep(0)
+            manager._find_cell("engine-00000").generation += 1
+
+        assert await injection == FaultInjectionOutcome.STALE.value
+        assert fake_ray_cluster.calls_of("inject_fault") == []
+
+    async def test_an_unconditional_request_still_injects(self, fake_ray_cluster: FakeRayCluster):
+        """The wall-clock injector names no incarnation, and its behaviour must be unchanged."""
+        manager = await _launch([_make_spec("engine")])
+
+        outcome = await manager.inject_fault("engine-00000", mode="sigkill", worker_in_cell_index=0)
+
+        assert outcome == FaultInjectionOutcome.INJECTED.value
+        assert [call.args for call in fake_ray_cluster.calls_of("inject_fault")] == [("sigkill",)]

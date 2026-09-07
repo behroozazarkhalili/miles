@@ -450,13 +450,21 @@ class TestStartApiServerRegistration:
                     "hook": "weight_update.before_p2p_write",
                     "mode": "sigkill",
                     "request_id": "req-1",
+                    "target": "remote_inference_cell",
                 },
             )
             suspended = await client.patch("/api/v1/cells/trainer-engine-actor-0", json={"spec": {"suspend": True}})
 
         assert [item["metadata"]["name"] for item in listed.json()["items"]] == ["inference-engine-0-0-0"]
         assert armed.status_code == 200
-        assert cell.armed == [dict(hook="weight_update.before_p2p_write", mode="sigkill", request_id="req-1")]
+        assert cell.armed == [
+            dict(
+                hook="weight_update.before_p2p_write",
+                mode="sigkill",
+                request_id="req-1",
+                target="remote_inference_cell",
+            )
+        ]
         assert suspended.status_code == 404
 
     @pytest.mark.asyncio
@@ -712,8 +720,46 @@ class TestArmFaultHook:
                 mode="sigkill",
                 sub_index=2,
                 request_id="req-1",
+                target="local",
             )
         ]
+
+    @pytest.mark.asyncio
+    async def test_a_remote_target_survives_the_route(
+        self, source_controller: MockSourceController, async_client: httpx.AsyncClient
+    ) -> None:
+        """Whether the fault harms the trainer or the engine it is writing to is the request's own choice."""
+        resp = await async_client.post(
+            f"/api/v1/cells/{SOURCE_CELL_ID}/arm-fault-hook",
+            json={
+                "expected_workers_hash": SOURCE_WORKERS_HASH,
+                "hook": "weight_update.after_p2p_submit",
+                "mode": "sigkill",
+                "request_id": "req-1",
+                "target": "remote_inference_cell",
+            },
+        )
+
+        assert resp.status_code == 200
+        assert source_controller.armed[0]["target"] == "remote_inference_cell"
+
+    @pytest.mark.asyncio
+    async def test_arming_targets_the_armed_process_by_default(
+        self, source_controller: MockSourceController, async_client: httpx.AsyncClient
+    ) -> None:
+        """A request that names no target must not be read as a licence to crash somebody else's cell."""
+        resp = await async_client.post(
+            f"/api/v1/cells/{SOURCE_CELL_ID}/arm-fault-hook",
+            json={
+                "expected_workers_hash": SOURCE_WORKERS_HASH,
+                "hook": "weight_update.before_all_gather",
+                "mode": "sigkill",
+                "request_id": "req-1",
+            },
+        )
+
+        assert resp.status_code == 200
+        assert source_controller.armed[0]["target"] == "local"
 
     @pytest.mark.asyncio
     async def test_arming_uses_zero_sub_index_by_default(
@@ -748,10 +794,13 @@ class TestArmFaultHook:
 
         unknown_hook = await async_client.post(url, json={**armed, "hook": "weight_update.before_typo"})
         unknown_mode = await async_client.post(url, json={**armed, "mode": "nuke"})
+        unknown_target = await async_client.post(url, json={**armed, "target": "somebody_else"})
         no_request_id = await async_client.post(url, json={k: v for k, v in armed.items() if k != "request_id"})
         extra_field = await async_client.post(url, json={**armed, "hold_ms": 100})
 
-        assert [resp.status_code for resp in (unknown_hook, unknown_mode, no_request_id, extra_field)] == [422] * 4
+        assert [
+            resp.status_code for resp in (unknown_hook, unknown_mode, unknown_target, no_request_id, extra_field)
+        ] == [422] * 5
         assert source_controller.armed == []
 
     @pytest.mark.asyncio

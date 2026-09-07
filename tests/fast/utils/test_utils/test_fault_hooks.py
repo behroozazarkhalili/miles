@@ -10,7 +10,15 @@ from miles.utils.audit_utils.event_logger.logger import EventLogger, read_events
 from miles.utils.audit_utils.event_logger.models import Event, FaultHookFireEvent
 from miles.utils.audit_utils.process_identity import SimpleProcessIdentity
 from miles.utils.test_utils import fault_hooks
-from miles.utils.test_utils.fault_hooks import FaultHookAlreadyArmedError, FaultHookName, arm_fault_hook
+from miles.utils.test_utils.fault_hooks import (
+    FaultHookAlreadyArmedError,
+    FaultHookName,
+    FaultHookOutcome,
+    FaultHookTarget,
+    RemoteInferenceTarget,
+    arm_fault_hook,
+)
+from miles.utils.test_utils.receiver_fault import ReceiverFaultRefusedError, ReceiverIdentity
 
 _HOOK = FaultHookName.WEIGHT_UPDATE_BEFORE_ALL_GATHER
 _OTHER_HOOK = FaultHookName.WEIGHT_UPDATE_BEFORE_P2P_WRITE
@@ -212,6 +220,256 @@ class TestFireEvidence:
         assert injected == ["sigkill"]
 
 
+_RECEIVER = ReceiverIdentity(
+    receiver_boot_uuid="boot-1", session_id="session-1", rank=3, control_url="http://10.0.0.9:41111"
+)
+_REMOTE_TARGET = RemoteInferenceTarget(cell_id="engine-0", workers_hash="hash-1", receiver=_RECEIVER)
+
+
+@pytest.fixture
+def remote_executor(monkeypatch: pytest.MonkeyPatch) -> list[tuple[RemoteInferenceTarget, str, str]]:
+    delivered: list[tuple[RemoteInferenceTarget, str, str]] = []
+
+    def execute(*, target: RemoteInferenceTarget, mode, request_id: str) -> FaultHookOutcome:
+        delivered.append((target, mode.value, request_id))
+        return FaultHookOutcome.ACCEPTED
+
+    monkeypatch.setattr(fault_hooks, "_REMOTE_EXECUTOR", execute)
+    return delivered
+
+
+class TestArmingARemoteFault:
+    def test_a_remote_request_at_a_hook_with_no_target_is_refused(
+        self, registry: fault_hooks._FaultHookRegistry, remote_executor: list
+    ) -> None:
+        """A point that writes to nobody could only aim at a guessed cell, and guessing is not targeting."""
+        with pytest.raises(fault_hooks.FaultHookTargetUnsupportedError):
+            arm_fault_hook(
+                hook=FaultHookName.WEIGHT_UPDATE_AFTER_BASE_WEIGHTS.value,
+                mode="sigkill",
+                request_id="req-1",
+                target=FaultHookTarget.REMOTE_INFERENCE_CELL.value,
+            )
+
+        assert registry.armed_hooks() == {}
+
+    def test_a_remote_request_in_a_process_that_cannot_reach_a_cell_is_refused(
+        self, registry: fault_hooks._FaultHookRegistry, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Accepting it would answer ok and then drop the fault when the hook is reached."""
+        monkeypatch.setattr(fault_hooks, "_REMOTE_EXECUTOR", None)
+
+        with pytest.raises(fault_hooks.FaultHookTargetUnsupportedError):
+            arm_fault_hook(
+                hook=_OTHER_HOOK.value,
+                mode="sigkill",
+                request_id="req-1",
+                target=FaultHookTarget.REMOTE_INFERENCE_CELL.value,
+            )
+
+        assert registry.armed_hooks() == {}
+
+    def test_an_unknown_target_is_refused_before_anything_is_armed(
+        self, registry: fault_hooks._FaultHookRegistry, remote_executor: list
+    ) -> None:
+        """The target decides who dies, so a value nobody implements must not be read as the default."""
+        with pytest.raises(ValueError):
+            arm_fault_hook(hook=_OTHER_HOOK.value, mode="sigkill", request_id="req-1", target="somebody_else")
+
+        assert registry.armed_hooks() == {}
+
+
+class TestReachingARemoteFault:
+    def test_the_fault_is_delivered_to_the_target_the_site_names(
+        self,
+        registry: fault_hooks._FaultHookRegistry,
+        injected: list[str],
+        remote_executor: list,
+    ) -> None:
+        """The victim comes from the write's own context, never from the request, which names no cell."""
+        arm_fault_hook(
+            hook=_OTHER_HOOK.value,
+            mode="sigkill",
+            request_id="req-1",
+            target=FaultHookTarget.REMOTE_INFERENCE_CELL.value,
+        )
+
+        fault_hooks.reach_fault_hook(_OTHER_HOOK, remote_target=_REMOTE_TARGET)
+
+        assert remote_executor == [(_REMOTE_TARGET, "sigkill", "req-1")]
+        assert injected == []
+
+    def test_a_site_that_names_no_target_refuses_to_guess(
+        self, registry: fault_hooks._FaultHookRegistry, remote_executor: list
+    ) -> None:
+        """Falling back to any cell id would let a fault land on a target this rank never wrote to."""
+        arm_fault_hook(
+            hook=_OTHER_HOOK.value,
+            mode="sigkill",
+            request_id="req-1",
+            target=FaultHookTarget.REMOTE_INFERENCE_CELL.value,
+        )
+
+        with pytest.raises(AssertionError, match="named no inference target"):
+            fault_hooks.reach_fault_hook(_OTHER_HOOK)
+
+        assert remote_executor == []
+
+    def test_a_local_request_ignores_the_target_the_site_offers(
+        self, registry: fault_hooks._FaultHookRegistry, injected: list[str], remote_executor: list
+    ) -> None:
+        """The same site serves both kinds of request, and a local one must harm the rank that reached it."""
+        arm_fault_hook(hook=_OTHER_HOOK.value, mode="sigkill", request_id="req-1")
+
+        fault_hooks.reach_fault_hook(_OTHER_HOOK, remote_target=_REMOTE_TARGET)
+
+        assert injected == ["sigkill"]
+        assert remote_executor == []
+
+    def test_a_refused_remote_fault_is_recorded_as_a_stale_target(
+        self,
+        registry: fault_hooks._FaultHookRegistry,
+        monkeypatch: pytest.MonkeyPatch,
+        tmp_path: Path,
+    ) -> None:
+        """A fault the backend refused harmed nobody, and a witness reading the fire must be able to tell."""
+        monkeypatch.setattr(
+            event_logger_module,
+            "_event_logger",
+            EventLogger(log_dir=tmp_path, source=SimpleProcessIdentity(component="main"), file_name="worker.jsonl"),
+        )
+        monkeypatch.setattr(
+            fault_hooks, "_REMOTE_EXECUTOR", lambda *, target, mode, request_id: FaultHookOutcome.STALE_TARGET
+        )
+
+        arm_fault_hook(
+            hook=_OTHER_HOOK.value,
+            mode="sigkill",
+            request_id="req-1",
+            target=FaultHookTarget.REMOTE_INFERENCE_CELL.value,
+        )
+        fault_hooks.reach_fault_hook(_OTHER_HOOK, remote_target=_REMOTE_TARGET)
+
+        [fire] = [event for event in read_events(tmp_path) if isinstance(event, FaultHookFireEvent)]
+        assert fire.outcome == FaultHookOutcome.STALE_TARGET.value
+        assert (fire.victim_cell_id, fire.victim_workers_hash) == ("engine-0", "hash-1")
+
+    def test_a_delivered_remote_fault_records_its_victim(
+        self,
+        registry: fault_hooks._FaultHookRegistry,
+        monkeypatch: pytest.MonkeyPatch,
+        tmp_path: Path,
+        remote_executor: list,
+    ) -> None:
+        """The trigger and the victim are different cells, and a run has to be able to tell them apart."""
+        monkeypatch.setattr(
+            event_logger_module,
+            "_event_logger",
+            EventLogger(log_dir=tmp_path, source=SimpleProcessIdentity(component="main"), file_name="worker.jsonl"),
+        )
+
+        arm_fault_hook(
+            hook=_OTHER_HOOK.value,
+            mode="sigkill",
+            request_id="req-1",
+            target=FaultHookTarget.REMOTE_INFERENCE_CELL.value,
+        )
+        fault_hooks.reach_fault_hook(_OTHER_HOOK, remote_target=_REMOTE_TARGET)
+
+        [fire] = [event for event in read_events(tmp_path) if isinstance(event, FaultHookFireEvent)]
+        assert (fire.target, fire.outcome) == (FaultHookTarget.REMOTE_INFERENCE_CELL.value, "accepted")
+        assert (fire.victim_cell_id, fire.victim_worker_in_cell_index) == ("engine-0", None)
+        assert (fire.victim_receiver_rank, fire.victim_receiver_boot_uuid, fire.victim_session_id) == (
+            3,
+            "boot-1",
+            "session-1",
+        )
+
+
+class TestRemoteOutcomesAreNotFires:
+    def test_an_accepted_request_is_not_recorded_as_fired(
+        self,
+        registry: fault_hooks._FaultHookRegistry,
+        monkeypatch: pytest.MonkeyPatch,
+        tmp_path: Path,
+        remote_executor: list,
+    ) -> None:
+        """The receiver taking the request is not the receiver signalling itself, and a witness must tell them apart."""
+        monkeypatch.setattr(
+            event_logger_module,
+            "_event_logger",
+            EventLogger(log_dir=tmp_path, source=SimpleProcessIdentity(component="main"), file_name="worker.jsonl"),
+        )
+
+        arm_fault_hook(
+            hook=_OTHER_HOOK.value,
+            mode="sigkill",
+            request_id="req-1",
+            target=FaultHookTarget.REMOTE_INFERENCE_CELL.value,
+        )
+        fault_hooks.reach_fault_hook(_OTHER_HOOK, remote_target=_REMOTE_TARGET)
+
+        [fire] = [event for event in read_events(tmp_path) if isinstance(event, FaultHookFireEvent)]
+        assert fire.outcome == FaultHookOutcome.ACCEPTED.value
+
+    def test_an_unknown_answer_is_recorded_as_unknown(
+        self,
+        registry: fault_hooks._FaultHookRegistry,
+        monkeypatch: pytest.MonkeyPatch,
+        tmp_path: Path,
+    ) -> None:
+        """A lost answer may still have landed, so it is neither a fire nor a stale target."""
+        monkeypatch.setattr(
+            event_logger_module,
+            "_event_logger",
+            EventLogger(log_dir=tmp_path, source=SimpleProcessIdentity(component="main"), file_name="worker.jsonl"),
+        )
+        monkeypatch.setattr(
+            fault_hooks, "_REMOTE_EXECUTOR", lambda *, target, mode, request_id: FaultHookOutcome.UNKNOWN
+        )
+
+        arm_fault_hook(
+            hook=_OTHER_HOOK.value,
+            mode="sigkill",
+            request_id="req-1",
+            target=FaultHookTarget.REMOTE_INFERENCE_CELL.value,
+        )
+        fault_hooks.reach_fault_hook(_OTHER_HOOK, remote_target=_REMOTE_TARGET)
+
+        [fire] = [event for event in read_events(tmp_path) if isinstance(event, FaultHookFireEvent)]
+        assert fire.outcome == FaultHookOutcome.UNKNOWN.value
+
+    def test_a_refusal_is_recorded_and_then_raised(
+        self,
+        registry: fault_hooks._FaultHookRegistry,
+        monkeypatch: pytest.MonkeyPatch,
+        tmp_path: Path,
+    ) -> None:
+        """A refusal leaves the request unaccounted for, and a run that swallowed it would report green."""
+        monkeypatch.setattr(
+            event_logger_module,
+            "_event_logger",
+            EventLogger(log_dir=tmp_path, source=SimpleProcessIdentity(component="main"), file_name="worker.jsonl"),
+        )
+
+        def refuse(*, target, mode, request_id):
+            raise ReceiverFaultRefusedError("pending_action_exists")
+
+        monkeypatch.setattr(fault_hooks, "_REMOTE_EXECUTOR", refuse)
+
+        arm_fault_hook(
+            hook=_OTHER_HOOK.value,
+            mode="sigkill",
+            request_id="req-1",
+            target=FaultHookTarget.REMOTE_INFERENCE_CELL.value,
+        )
+        with pytest.raises(ReceiverFaultRefusedError):
+            fault_hooks.reach_fault_hook(_OTHER_HOOK, remote_target=_REMOTE_TARGET)
+
+        [fire] = [event for event in read_events(tmp_path) if isinstance(event, FaultHookFireEvent)]
+        assert fire.outcome == FaultHookOutcome.REFUSED.value
+
+
 class TestWeightUpdateSpan:
     def test_a_fire_outside_an_update_names_no_version(
         self, registry: fault_hooks._FaultHookRegistry, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
@@ -229,6 +487,25 @@ class TestWeightUpdateSpan:
 
         [fire] = [event for event in read_events(tmp_path) if isinstance(event, FaultHookFireEvent)]
         assert fire.weight_version is None
+
+    def test_a_frozen_span_wins_over_the_one_open_now(
+        self, registry: fault_hooks._FaultHookRegistry, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        """A writer that reaches its hook after the next update started must not name that next update."""
+        monkeypatch.setattr(
+            event_logger_module,
+            "_event_logger",
+            EventLogger(log_dir=tmp_path, source=SimpleProcessIdentity(component="main"), file_name="worker.jsonl"),
+        )
+        monkeypatch.setattr(fault_hooks, "inject_fault", lambda mode: None)
+        frozen = fault_hooks.WeightUpdateSpan(weight_version=3)
+
+        arm_fault_hook(hook=_HOOK.value, mode="sigkill", request_id="req-1")
+        with fault_hooks.weight_update_span(weight_version=4):
+            fault_hooks.reach_fault_hook(_HOOK, span=frozen)
+
+        [fire] = [event for event in read_events(tmp_path) if isinstance(event, FaultHookFireEvent)]
+        assert fire.weight_version == 3
 
     def test_the_span_is_visible_from_a_thread_the_update_did_not_create(self) -> None:
         """The p2p write hooks run on per-cell writer threads, which no contextvar would reach."""

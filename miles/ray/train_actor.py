@@ -27,7 +27,10 @@ from miles.utils.misc import NodeProbeMixin, get_current_node_ip, get_free_port
 from miles.utils.object_store import StoreObjectRef
 from miles.utils.test_utils.det_process_group import DET_NCCL_BACKEND_NAME, register_det_nccl_backend
 from miles.utils.test_utils.fault_hooks import arm_fault_hook as _arm_fault_hook
+from miles.utils.test_utils.fault_hooks import install_remote_fault_executor
 from miles.utils.test_utils.fault_injector import inject_fault as _inject_fault
+from miles.utils.test_utils.remote_fault_executor import CellOperationsRemoteFaultExecutor
+from miles.utils.workers.backend_capability.base import BackendCapability
 from miles.utils.workers.env_vars import CELL_INDEX_ENV_VAR
 from miles.utils.workers.rpc.common.metadata import rpc
 from miles.utils.workers.rpc.common.wire_types import Pickled
@@ -56,6 +59,7 @@ class TrainRayActor(NodeProbeMixin):
         rank: int,
         role: Literal["actor", "critic"],
         cell_index: int,
+        capability: BackendCapability,
     ):
         self._init_once = InitOnce(type(self).__name__)
 
@@ -82,6 +86,7 @@ class TrainRayActor(NodeProbeMixin):
         )
 
         object_store.init_instance(args)
+        install_remote_fault_executor(CellOperationsRemoteFaultExecutor(capability=capability))
 
     def propose_master_addr_and_port(self) -> tuple[str, int]:
         return get_current_node_ip(), get_free_port(start_port=random.randint(20000, 21000))
@@ -178,8 +183,8 @@ class TrainRayActor(NodeProbeMixin):
         _inject_fault(mode=mode)
 
     @rpc(concurrency_group="fault_injector")
-    def arm_fault_hook(self, *, hook: str, mode: str, request_id: str) -> None:
-        _arm_fault_hook(hook=hook, mode=mode, request_id=request_id)
+    def arm_fault_hook(self, *, hook: str, mode: str, request_id: str, target: str) -> None:
+        _arm_fault_hook(hook=hook, mode=mode, request_id=request_id, target=target)
 
     @rpc(concurrency_group="kill_self")
     def kill_self(self) -> None:

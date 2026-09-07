@@ -176,6 +176,7 @@ def _create_api_app(registry: _CellRegistry, sources: _FaultHookSourceRegistry) 
                 mode=body.mode,
                 sub_index=body.sub_index,
                 request_id=body.request_id,
+                target=body.target,
             )
         except FaultHookSourceNotFoundError as err:
             raise _K8sError(

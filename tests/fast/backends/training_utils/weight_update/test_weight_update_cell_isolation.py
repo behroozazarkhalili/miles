@@ -67,6 +67,9 @@ class _FakeCellIsolatingProtocol:
         self.rollout_engines = list(rollout_engines)
         self.inference_cell_health = InferenceCellHealth(engine_cell_ids)
 
+    def bind_target_incarnations(self, workers_hash_of_cell_id) -> None:
+        self.bound_incarnations = dict(workers_hash_of_cell_id)
+
     def begin_sync(self, weight_version, iter_buckets) -> bool:
         return True
 

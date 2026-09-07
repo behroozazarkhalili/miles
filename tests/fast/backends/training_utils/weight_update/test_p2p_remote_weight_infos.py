@@ -10,6 +10,9 @@ from types import ModuleType, SimpleNamespace
 
 import pytest
 
+from miles.backends.sglang_utils.sglang_api_client import RemoteInstanceTransferEngineInfo
+from miles.utils.test_utils.receiver_fault import ReceiverIdentity
+
 _MODULE = "miles.backends.training_utils.weight_update.protocols.p2p_transfer_utils"
 
 
@@ -24,6 +27,15 @@ _EXTERNAL_SDK_ATTRIBUTES = {
 }
 
 
+def _receiver_identity(*, session_id: str, rank: int) -> ReceiverIdentity:
+    return ReceiverIdentity(
+        receiver_boot_uuid=f"boot-{session_id}",
+        session_id=session_id,
+        rank=rank,
+        control_url=f"http://10.0.0.9:4111{rank}",
+    )
+
+
 class _FakeRolloutEngine:
     def __init__(self, engine_index: int):
         self._engine_index = engine_index
@@ -31,7 +43,15 @@ class _FakeRolloutEngine:
 
     async def get_remote_instance_transfer_engine_info(self, rank: int):
         self.calls.append(("get_remote_instance_transfer_engine_info", {"rank": rank}))
-        return f"session-{self._engine_index}-{rank}", {f"weight-{rank}": (0x1000 + rank, 4, 2)}
+        session_id = f"session-{self._engine_index}-{rank}"
+        return RemoteInstanceTransferEngineInfo(
+            session_id=session_id,
+            weights_info={f"weight-{rank}": (0x1000 + rank, 4, 2)},
+            receiver_identity=self._receiver_identity(session_id=session_id, rank=rank),
+        )
+
+    def _receiver_identity(self, *, session_id: str, rank: int) -> ReceiverIdentity | None:
+        return None
 
     async def get_parallelism_info(self, rank: int):
         self.calls.append(("get_parallelism_info", {"rank": rank}))
@@ -44,8 +64,27 @@ class _FakeRolloutEngine:
 
 class _JsonRolloutEngine(_FakeRolloutEngine):
     async def get_remote_instance_transfer_engine_info(self, rank: int):
-        session_id, weights_info = await super().get_remote_instance_transfer_engine_info(rank)
-        return session_id, {name: list(location) for name, location in weights_info.items()}
+        info = await super().get_remote_instance_transfer_engine_info(rank)
+        return RemoteInstanceTransferEngineInfo(
+            session_id=info.session_id,
+            weights_info={name: list(location) for name, location in info.weights_info.items()},
+            receiver_identity=info.receiver_identity,
+        )
+
+
+class _FaultControlledRolloutEngine(_FakeRolloutEngine):
+    def _receiver_identity(self, *, session_id: str, rank: int) -> ReceiverIdentity | None:
+        return _receiver_identity(session_id=session_id, rank=rank)
+
+
+class _WrongSessionRolloutEngine(_FakeRolloutEngine):
+    def _receiver_identity(self, *, session_id: str, rank: int) -> ReceiverIdentity | None:
+        return _receiver_identity(session_id=f"{session_id}-other", rank=rank)
+
+
+class _WrongRankRolloutEngine(_FakeRolloutEngine):
+    def _receiver_identity(self, *, session_id: str, rank: int) -> ReceiverIdentity | None:
+        return _receiver_identity(session_id=session_id, rank=rank + 1)
 
 
 @contextmanager
@@ -159,7 +198,9 @@ class TestQueryRemoteWeightInfos:
             (0, 1): "session-0-1",
             (1, 0): "session-1-0",
         }
-        assert weight_infos == {
+        assert {
+            session_id: (info.weights_info, info.parallelism_info) for session_id, info in weight_infos.items()
+        } == {
             "session-0-0": ({"weight-0": (0x1000, 4, 2)}, {"tp_rank": 0}),
             "session-0-1": ({"weight-1": (0x1001, 4, 2)}, {"tp_rank": 1}),
             "session-1-0": ({"weight-0": (0x1000, 4, 2)}, {"tp_rank": 0}),
@@ -187,6 +228,48 @@ class TestQueryRemoteWeightInfos:
         assert (location.address, location.numel, location.element_size) == (0x1000, 4, 2)
 
 
+class TestReceiverIdentity:
+    """A fault can only be aimed at a receiver whose identity arrived with the weights it is about to be written."""
+
+    def test_the_identity_of_this_session_and_rank_is_kept(self, p2p_transfer_utils):
+        """The write addresses one session on one rank, and that is the process a fault may name."""
+        engines = [_FaultControlledRolloutEngine(0)]
+
+        query = _query(p2p_transfer_utils, engines, [(0, 0), (0, 1)])
+
+        identities = [info.receiver_identity for info in query.remote_weight_infos_by_session_id.values()]
+        assert [identity.rank for identity in identities] == [0, 1]
+        assert [identity.session_id for identity in identities] == ["session-0-0", "session-0-1"]
+
+    def test_an_engine_without_fault_control_still_transfers(self, p2p_transfer_utils):
+        """Fault control is a test switch; a run without it must keep updating weights, only without a remote fault."""
+        engines = [_FakeRolloutEngine(0)]
+
+        query = _query(p2p_transfer_utils, engines, [(0, 0)])
+
+        assert query.failures_by_engine_ind == {}
+        assert query.remote_weight_infos_by_session_id["session-0-0"].receiver_identity is None
+        assert query.remote_weight_infos_by_session_id["session-0-0"].weights_info
+
+    def test_an_identity_of_another_session_fails_that_target(self, p2p_transfer_utils):
+        """Weights of one session paired with the identity of another would let a fault hit the wrong incarnation."""
+        engines = [_WrongSessionRolloutEngine(0)]
+
+        query = _query(p2p_transfer_utils, engines, [(0, 0)])
+
+        assert isinstance(query.failures_by_engine_ind[0], AssertionError)
+        assert query.remote_weight_infos_by_session_id == {}
+
+    def test_an_identity_of_another_rank_fails_that_target(self, p2p_transfer_utils):
+        """A multi-rank engine answers per rank, and the fault must not be recorded against a rank never written."""
+        engines = [_WrongRankRolloutEngine(0)]
+
+        query = _query(p2p_transfer_utils, engines, [(0, 0)])
+
+        assert isinstance(query.failures_by_engine_ind[0], AssertionError)
+        assert query.remote_weight_infos_by_session_id == {}
+
+
 class _DeadRolloutEngine(_FakeRolloutEngine):
     async def get_remote_instance_transfer_engine_info(self, rank: int):
         self.calls.append(("get_remote_instance_transfer_engine_info", {"rank": rank}))
@@ -196,7 +279,7 @@ class _DeadRolloutEngine(_FakeRolloutEngine):
 class _NamelessRolloutEngine(_FakeRolloutEngine):
     async def get_remote_instance_transfer_engine_info(self, rank: int):
         self.calls.append(("get_remote_instance_transfer_engine_info", {"rank": rank}))
-        return None, {}
+        return RemoteInstanceTransferEngineInfo(session_id="", weights_info={})
 
 
 class TestQueryFailureAttribution:

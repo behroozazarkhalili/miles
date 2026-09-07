@@ -52,7 +52,11 @@ def _patched_p2p(p2p, replica_factory: _ReplicaFactory):
         patch.object(p2p, "RankParallelismConfig"),
         patch.object(p2p, "ParameterMapper"),
     ):
-        yield SimpleNamespace(query=query, create_transfer_engine=create_transfer_engine)
+        yield SimpleNamespace(
+            query=query,
+            create_transfer_engine=create_transfer_engine,
+            remote_session_info=p2p.RemoteSessionInfo,
+        )
 
 
 def _connect(
@@ -73,7 +77,12 @@ def _connect(
     answered = [pair for pair in pairs if pair[0] not in query_failures]
     targets_to_session_id = {pair: f"{session_prefix}-{pair[0]}-{pair[1]}" for pair in answered}
     patches.query.return_value = SimpleNamespace(
-        remote_weight_infos_by_session_id={targets_to_session_id[pair]: ({}, layout_of(pair)) for pair in answered},
+        remote_weight_infos_by_session_id={
+            targets_to_session_id[pair]: patches.remote_session_info(
+                weights_info={}, parallelism_info=layout_of(pair), receiver_identity=None
+            )
+            for pair in answered
+        },
         targets_to_session_id=targets_to_session_id,
         session_id_to_server_args={
             targets_to_session_id[pair]: SimpleNamespace(rl_quant_profile=quant_profile) for pair in answered

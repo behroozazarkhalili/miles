@@ -21,7 +21,7 @@ from miles.utils.audit_utils.process_identity import (
     TrainerControllerProcessIdentity,
     TrainProcessIdentity,
 )
-from miles.utils.test_utils.fault_hooks import FaultHookName
+from miles.utils.test_utils.fault_hooks import FaultHookName, FaultHookOutcome, FaultHookTarget
 from miles.utils.test_utils.fault_injector import FailureMode
 
 _HOOK = FaultHookName.WEIGHT_UPDATE_BEFORE_ALL_GATHER
@@ -61,16 +61,19 @@ def _source(*, component: str = "actor", model_id: str | None = None, cell_index
 def _armed(
     *,
     sub_index: int = 0,
+    hook: FaultHookName = _HOOK,
     trainer_hash: str = _ARMED_HASH,
     inference: dict[str, str] | None = None,
     snapshot_at: datetime = _T0,
     expected_source=None,
+    target: FaultHookTarget = FaultHookTarget.LOCAL,
 ) -> hook_injection.ArmedFaultHook:
     return hook_injection.ArmedFaultHook(
         cell_name=_ARMED_CELL,
         sub_index=sub_index,
-        hook=_HOOK,
+        hook=hook,
         mode=FailureMode.SIGKILL,
+        target=target,
         request_id=_REQUEST_ID,
         expected_source=expected_source or _source(rank=sub_index),
         trainer_workers_hash=trainer_hash,
@@ -93,14 +96,27 @@ def _fire(
     weight_version: int | None = _WEIGHT_VERSION,
     source=None,
     request_id: str = _REQUEST_ID,
+    hook: str = _HOOK.value,
+    target: FaultHookTarget = FaultHookTarget.LOCAL,
+    outcome: FaultHookOutcome = FaultHookOutcome.FIRED,
+    victim: tuple[str, str] | None = None,
+    receiver_rank: int | None = 1,
 ) -> FaultHookFireEvent:
     return FaultHookFireEvent(
         timestamp=at,
         source=source or _source(),
-        hook=_HOOK.value,
+        hook=hook,
         mode=FailureMode.SIGKILL.value,
         request_id=request_id,
         weight_version=weight_version,
+        target=target.value,
+        outcome=outcome.value,
+        victim_cell_id=None if victim is None else victim[0],
+        victim_workers_hash=None if victim is None else victim[1],
+        victim_worker_in_cell_index=None,
+        victim_receiver_rank=None if victim is None else receiver_rank,
+        victim_receiver_boot_uuid=None if victim is None else "boot-1",
+        victim_session_id=None if victim is None else "session-1",
     )
 
 
@@ -189,6 +205,7 @@ class TestTheArmRequestNamesTheGenerationItChose:
             sub_index=2,
             hook=_HOOK,
             mode=FailureMode.SIGKILL,
+            target=FaultHookTarget.LOCAL,
             request_id=_REQUEST_ID,
             trainer_snapshot=snapshot,
             inference_snapshot=hook_injection.CellSnapshot(
@@ -201,6 +218,7 @@ class TestTheArmRequestNamesTheGenerationItChose:
             "expected_workers_hash": _ARMED_HASH,
             "hook": _HOOK.value,
             "mode": FailureMode.SIGKILL.value,
+            "target": FaultHookTarget.LOCAL.value,
             "sub_index": 2,
             "request_id": _REQUEST_ID,
         }
@@ -621,3 +639,178 @@ class TestProgressWitness:
         _write_events(tmp_path, file_name="main.jsonl", events=[_publication(at=_at(9), checksums=[{"w": "h"}])])
 
         hook_injection.assert_weights_published_after(tmp_path, after=_at(5))
+
+
+_VICTIM = "rollout-engine-00000"
+_VICTIM_HASH = "engine-generation-0"
+
+
+def _remote_armed(**kwargs) -> hook_injection.ArmedFaultHook:
+    return _armed(
+        hook=FaultHookName.WEIGHT_UPDATE_AFTER_P2P_SUBMIT,
+        target=FaultHookTarget.REMOTE_INFERENCE_CELL,
+        **kwargs,
+    )
+
+
+def _remote_fire(*, victim=(_VICTIM, _VICTIM_HASH), outcome=FaultHookOutcome.ACCEPTED) -> FaultHookFireEvent:
+    return _fire(
+        hook=FaultHookName.WEIGHT_UPDATE_AFTER_P2P_SUBMIT.value,
+        target=FaultHookTarget.REMOTE_INFERENCE_CELL,
+        outcome=outcome,
+        victim=victim,
+    )
+
+
+class TestRemoteFireWitness:
+    @pytest.mark.parametrize(
+        "outcome", [FaultHookOutcome.STALE_TARGET, FaultHookOutcome.UNKNOWN, FaultHookOutcome.REFUSED]
+    )
+    def test_an_answer_that_is_not_an_acceptance_fails_the_run(self, tmp_path: Path, outcome: FaultHookOutcome):
+        """A stale, unknown or refused answer means the receiver of this transfer was never asked to die."""
+        _write_events(tmp_path, file_name="actor.jsonl", events=[_remote_fire(outcome=outcome)])
+
+        with pytest.raises(AssertionError, match="not the accepted"):
+            hook_injection.assert_hook_fired(_remote_armed(expected_source=_source()), event_dir=tmp_path)
+
+    def test_an_accepted_remote_answer_passes_the_fire_witness(self, tmp_path: Path):
+        """Accepting is what the receiver records; the harm itself is asserted by the witnesses that follow."""
+        _write_events(tmp_path, file_name="actor.jsonl", events=[_remote_fire()])
+
+        fire = hook_injection.assert_hook_fired(_remote_armed(expected_source=_source()), event_dir=tmp_path)
+
+        assert fire.outcome == FaultHookOutcome.ACCEPTED.value
+
+    def test_a_local_fire_outcome_does_not_satisfy_a_remote_request(self, tmp_path: Path):
+        """A local fault kills the trainer; recording it as the remote one would credit the wrong process."""
+        _write_events(tmp_path, file_name="actor.jsonl", events=[_remote_fire(outcome=FaultHookOutcome.FIRED)])
+
+        with pytest.raises(AssertionError, match="not the accepted"):
+            hook_injection.assert_hook_fired(_remote_armed(expected_source=_source()), event_dir=tmp_path)
+
+    def test_a_local_fire_does_not_satisfy_a_remote_request(self, tmp_path: Path):
+        """The two actions harm different processes, so one must never be read as the other."""
+        _write_events(
+            tmp_path, file_name="actor.jsonl", events=[_fire(hook=FaultHookName.WEIGHT_UPDATE_AFTER_P2P_SUBMIT.value)]
+        )
+
+        with pytest.raises(AssertionError, match="fired against"):
+            hook_injection.assert_hook_fired(_remote_armed(expected_source=_source()), event_dir=tmp_path)
+
+
+class TestRemoteVictimWitness:
+    def test_a_fire_without_receiver_identity_fails_the_run(self):
+        """A victim named only by cell id could have been chosen from a listing rather than from the write."""
+        log = _healthy_run_log(trainer_hashes=[_ARMED_HASH, _ARMED_HASH])
+
+        with pytest.raises(AssertionError, match="carries no receiver incarnation"):
+            hook_injection.assert_remote_victim_was_harmed(
+                _remote_fire(receiver_rank=None),
+                log.events,
+                armed=_remote_armed(),
+                assignment=_assignment(),
+            )
+
+    def test_a_fire_naming_no_victim_fails_the_run(self):
+        """Without a victim there is nothing to hold harmed, and a green run would prove only that a hook ran."""
+        log = _healthy_run_log(trainer_hashes=[_ARMED_HASH])
+
+        with pytest.raises(AssertionError, match="names no target"):
+            hook_injection.assert_remote_victim_was_harmed(
+                _remote_fire(victim=None), log.events, armed=_remote_armed(), assignment=_assignment()
+            )
+
+    def test_a_victim_outside_this_updates_assignment_fails_the_run(self):
+        """A cell this sender was not writing to in this update is not a target of this write."""
+        log = _healthy_run_log(trainer_hashes=[_ARMED_HASH])
+
+        with pytest.raises(AssertionError, match="not what the update assigned"):
+            hook_injection.assert_remote_victim_was_harmed(
+                _remote_fire(victim=("rollout-engine-00003", _VICTIM_HASH)),
+                log.events,
+                armed=_remote_armed(),
+                assignment=_assignment(),
+            )
+
+    def test_a_victim_incarnation_that_was_not_in_service_fails_the_run(self):
+        """An incarnation nobody observed serving cannot be shown to have been taken out of service by this fault."""
+        log = _healthy_run_log(trainer_hashes=[_ARMED_HASH])
+        armed = _remote_armed(inference={**_ASSIGNED, **_UNRELATED, _VICTIM: "engine-generation-9"})
+
+        with pytest.raises(AssertionError, match="was not running"):
+            hook_injection.assert_remote_victim_was_harmed(
+                _remote_fire(), log.events, armed=armed, assignment=_assignment()
+            )
+
+    def test_a_victim_still_running_that_incarnation_fails_the_run(self):
+        """The engine the write reached has to lose the incarnation it was reached at."""
+        log = _healthy_run_log(
+            trainer_hashes=[_ARMED_HASH, _ARMED_HASH],
+            assigned_after=dict(_ASSIGNED),
+        )
+
+        with pytest.raises(AssertionError, match="still runs"):
+            hook_injection.assert_remote_victim_was_harmed(
+                _remote_fire(), log.events, armed=_remote_armed(), assignment=_assignment()
+            )
+
+    def test_the_named_incarnation_being_replaced_passes(self):
+        """This is the claim: the target of this very write lost the incarnation the write reached it at."""
+        log = _healthy_run_log(trainer_hashes=[_ARMED_HASH, _ARMED_HASH])
+
+        victim = hook_injection.assert_remote_victim_was_harmed(
+            _remote_fire(), log.events, armed=_remote_armed(), assignment=_assignment()
+        )
+
+        assert victim == _VICTIM
+
+    def test_a_victim_that_never_served_again_fails_the_run(self):
+        """A harmed engine that never comes back leaves the fleet a replica short."""
+        log = EventLog()
+        _observe(log, trainer_hash=_ARMED_HASH, engines={**_ASSIGNED, **_UNRELATED})
+        log.observe(
+            [
+                cell(_ARMED_CELL, healthy=True, cell_type="actor", workers_hash=_ARMED_HASH),
+                staged(_VICTIM, RUNNING_NOT_SERVING, workers_hash="engine-generation-1"),
+                staged("rollout-engine-00001", SERVING, workers_hash=_VICTIM_HASH),
+                *[staged(name, SERVING, workers_hash=h) for name, h in _UNRELATED.items()],
+            ]
+        )
+
+        with pytest.raises(AssertionError, match="never observed healthy and Serving under a replacement"):
+            hook_injection.assert_remote_victim_recovered(log.events, fire=_remote_fire(), since=_T0)
+
+    def test_a_victim_serving_again_under_a_replacement_passes(self):
+        """Recovery of an engine is a Serving reading under a generation the killed one cannot produce."""
+        log = _healthy_run_log(trainer_hashes=[_ARMED_HASH, _ARMED_HASH])
+
+        hook_injection.assert_remote_victim_recovered(log.events, fire=_remote_fire(), since=_T0)
+
+    def test_a_victim_that_never_changed_incarnation_has_no_harm_moment(self):
+        """Without an observation of the replacement there is no point in time after the harm to read anything at."""
+        log = _healthy_run_log(trainer_hashes=[_ARMED_HASH], assigned_after=dict(_ASSIGNED))
+
+        with pytest.raises(AssertionError, match="never observed under an incarnation other than"):
+            hook_injection.compute_victim_harm_observed_at(log.events, fire=_remote_fire(), armed=_remote_armed())
+
+
+class TestScenarioRecipe:
+    def test_the_run_enables_the_receiver_fault_control_and_the_transfer_engine_seed(self):
+        """Without both flags the engines publish no receiver identity and no remote fault can name one."""
+        assert "--sglang-enable-p2p-fault-injection " in hook_injection.P2P_WEIGHT_TRANSFER_ARGS
+        assert (
+            "--sglang-remote-instance-weight-loader-start-seed-via-transfer-engine "
+            in hook_injection.P2P_WEIGHT_TRANSFER_ARGS
+        )
+        assert "--update-weight-transfer-mode p2p " in hook_injection.P2P_WEIGHT_TRANSFER_ARGS
+
+    def test_no_cluster_backend_is_ruled_out(self):
+        """Both backends reach the receiver through its own endpoint, so neither is refused up front any more."""
+        assert not hasattr(hook_injection, "assert_backend_binds_faults_to_incarnations")
+
+    def test_a_remote_request_expects_an_acceptance_and_a_local_one_a_fire(self):
+        """The two actions are delivered by different processes and record different evidence of delivery."""
+        assert hook_injection._EXPECTED_OUTCOME_OF_TARGET == {
+            FaultHookTarget.LOCAL: FaultHookOutcome.FIRED,
+            FaultHookTarget.REMOTE_INFERENCE_CELL: FaultHookOutcome.ACCEPTED,
+        }

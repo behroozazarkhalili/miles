@@ -11,7 +11,7 @@ from fastapi import FastAPI
 
 import miles.ray.train.group as group_module
 from miles.ray.train.group import TrainerController
-from miles.utils.test_utils.fault_hooks import FaultHookName
+from miles.utils.test_utils.fault_hooks import FaultHookName, FaultHookTarget
 from miles.utils.test_utils.fault_injector import FailureMode
 from miles.utils.workers.cell_operations.base import BaseCellOperations
 from miles.utils.workers.rpc.client.handle import RpcWorkerHandle
@@ -35,12 +35,12 @@ class _RecordingHandle:
         self._before_arm = before_arm
         self.hangs = False
 
-    async def arm_fault_hook(self, *, hook: str, mode: str, request_id: str) -> None:
+    async def arm_fault_hook(self, *, hook: str, mode: str, request_id: str, target: str) -> None:
         if self._before_arm is not None:
             await self._before_arm()
         if self.hangs:
             await asyncio.Event().wait()
-        self.armed.append(dict(hook=hook, mode=mode, request_id=request_id))
+        self.armed.append(dict(hook=hook, mode=mode, request_id=request_id, target=target))
 
 
 class _FakeCell:
@@ -73,6 +73,7 @@ async def _arm(controller: TrainerController, *, expected_workers_hash: str = _H
         mode=FailureMode.SIGKILL.value,
         sub_index=sub_index,
         request_id="req-1",
+        target=FaultHookTarget.REMOTE_INFERENCE_CELL.value,
     )
 
 
@@ -86,7 +87,14 @@ class TestArmingTheGenerationTheCallerChose:
 
         assert report.refused_because is None
         assert handles[0].armed == []
-        assert handles[1].armed == [dict(hook="weight_update.before_p2p_write", mode="sigkill", request_id="req-1")]
+        assert handles[1].armed == [
+            dict(
+                hook="weight_update.before_p2p_write",
+                mode="sigkill",
+                request_id="req-1",
+                target="remote_inference_cell",
+            )
+        ]
 
     async def test_a_snapshot_of_a_replaced_generation_arms_nothing(self):
         """The caller chose the generation it saw, and the replacement is a cell nobody asked to harm."""
@@ -163,8 +171,8 @@ class _HookableWorker:
         self.armed: list[dict[str, object]] = []
 
     @rpc(concurrency_group="fault_injector")
-    def arm_fault_hook(self, *, hook: str, mode: str, request_id: str) -> None:
-        self.armed.append(dict(hook=hook, mode=mode, request_id=request_id))
+    def arm_fault_hook(self, *, hook: str, mode: str, request_id: str, target: str) -> None:
+        self.armed.append(dict(hook=hook, mode=mode, request_id=request_id, target=target))
 
 
 class _EndpointTransport(httpx.AsyncBaseTransport):

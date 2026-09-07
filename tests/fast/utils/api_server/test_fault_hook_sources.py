@@ -3,7 +3,7 @@ from __future__ import annotations
 import pytest
 
 from miles.utils.ft_utils.api_server.fault_hook_sources import FaultHookSourceNotFoundError, _FaultHookSourceRegistry
-from miles.utils.test_utils.fault_hooks import FaultHookName
+from miles.utils.test_utils.fault_hooks import FaultHookName, FaultHookTarget
 from miles.utils.test_utils.fault_injector import FailureMode
 
 from .conftest import SOURCE_CELL_ID, SOURCE_WORKERS_HASH, MockHandler, MockSourceController, make_source_status
@@ -19,6 +19,7 @@ async def _arm(registry: _FaultHookSourceRegistry, *, cell_id: str = SOURCE_CELL
         mode=FailureMode.SIGKILL,
         sub_index=2,
         request_id="req-1",
+        target=FaultHookTarget.REMOTE_INFERENCE_CELL,
     )
 
 
@@ -58,6 +59,7 @@ class TestRoutingAnArm:
                 mode="sigkill",
                 sub_index=2,
                 request_id="req-1",
+                target="remote_inference_cell",
             )
         ]
 
@@ -98,6 +100,7 @@ class TestRoutingAnArm:
             mode=FailureMode.SIGKILL,
             sub_index=0,
             request_id="req-1",
+            target=FaultHookTarget.LOCAL,
         )
 
         assert report.refused_because == "it now runs another incarnation"

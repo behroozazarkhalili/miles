@@ -7,8 +7,15 @@ from typing import Any
 import pytest
 
 from miles.utils.test_utils.fault_injector import FailureMode
+from miles.utils.test_utils.receiver_fault import ReceiverFaultOutcome, ReceiverIdentity
+from miles.utils.workers.cell_operations import base as cell_operations_base
 from miles.utils.workers.cell_operations import kubernetes as cell_operations_kubernetes
-from miles.utils.workers.cell_operations.base import CellTerminationNotConfirmedError, CellTerminationOutcome
+from miles.utils.workers.cell_operations.base import (
+    CellTerminationNotConfirmedError,
+    CellTerminationOutcome,
+    FaultInjectionOutcome,
+    IncarnationBoundInjectionUnsupportedError,
+)
 from miles.utils.workers.cell_operations.kubernetes import KubernetesCellOperations
 from miles.utils.workers.worker_handle import WorkerUnreachableError
 from miles.utils.workers.worker_info import WorkerInfo
@@ -47,6 +54,21 @@ class FakeHandle:
     async def submit_without_result(self, method_name: str, /, **kwargs: Any) -> None:
         self._submissions.append((self._name, method_name, kwargs["mode"]))
         await self.inject_fault(mode=kwargs["mode"])
+
+
+_RECEIVER = ReceiverIdentity(
+    receiver_boot_uuid="boot-1", session_id="session-1", rank=0, control_url="http://10.0.0.9:41111"
+)
+ACCEPTED = ReceiverFaultOutcome.ACCEPTED
+STALE_TARGET = ReceiverFaultOutcome.STALE_TARGET
+
+
+def _recording_receiver(asked: list[dict], outcome: ReceiverFaultOutcome):
+    async def request(*, receiver, mode, request_id):
+        asked.append({"receiver": receiver, "mode": mode, "request_id": request_id})
+        return outcome
+
+    return request
 
 
 class FakeProvider:
@@ -91,6 +113,12 @@ class FakeProvider:
 
     def cell_info(self, cell_id: str) -> CellInfo | None:
         return self._infos.get(cell_id)
+
+    def cell_incarnation(self, cell_id: str) -> CellIncarnation | None:
+        info = self._infos.get(cell_id)
+        if info is None:
+            return None
+        return CellIncarnation(cell_id=cell_id, workers_hash=info.workers_hash, pods=[])
 
     def pod_names_of_cell(self, cell_id: str) -> list[str]:
         info = self._infos.get(cell_id)
@@ -389,6 +417,112 @@ class TestInjectFault:
 
         with pytest.raises(AssertionError, match="not served over rpc"):
             asyncio.run(operations.inject_fault(cell_id="engine-0", mode=FailureMode.SIGKILL, sub_index=0))
+
+
+class TestIncarnationBoundInjection:
+    def test_a_request_naming_an_incarnation_but_no_receiver_is_refused(self):
+        """A worker handle built now pins the process that replies, so honouring this would harm a replacement."""
+        operations = _operations({"engine-0": _info(cell_id="engine-0", workers=("engine-0-0",))})
+
+        with pytest.raises(IncarnationBoundInjectionUnsupportedError, match="without a receiver identity"):
+            asyncio.run(
+                operations.inject_fault(
+                    cell_id="engine-0",
+                    mode=FailureMode.SIGKILL,
+                    sub_index=0,
+                    expected_workers_hash="hash-1",
+                )
+            )
+
+        assert operations._provider.submissions == []
+
+    def test_a_receiver_request_reaches_the_receiver_of_the_observed_incarnation(
+        self, monkeypatch: pytest.MonkeyPatch
+    ):
+        """Kubernetes engines answer no rpc, and the receiver's own endpoint is what makes the fault identity-bound."""
+        operations = _operations({"engine-0": _info(cell_id="engine-0", workers=("engine-0-0",))})
+        asked: list[dict] = []
+        monkeypatch.setattr(cell_operations_base, "request_receiver_fault", _recording_receiver(asked, ACCEPTED))
+
+        outcome = asyncio.run(
+            operations.inject_fault(
+                cell_id="engine-0",
+                mode=FailureMode.SIGKILL,
+                expected_workers_hash="h",
+                receiver=_RECEIVER,
+                request_id="req-1",
+            )
+        )
+
+        assert outcome is FaultInjectionOutcome.ACCEPTED
+        assert asked == [{"receiver": _RECEIVER, "mode": FailureMode.SIGKILL, "request_id": "req-1"}]
+        assert operations._provider.submissions == []
+
+    def test_a_replaced_cell_is_not_asked_at_all(self, monkeypatch: pytest.MonkeyPatch):
+        """The observed incarnation is already gone, so the receiver of this transfer cannot be reached."""
+        operations = _operations({"engine-0": _info(cell_id="engine-0", workers=("engine-0-0",))})
+        asked: list[dict] = []
+        monkeypatch.setattr(cell_operations_base, "request_receiver_fault", _recording_receiver(asked, ACCEPTED))
+
+        outcome = asyncio.run(
+            operations.inject_fault(
+                cell_id="engine-0",
+                mode=FailureMode.SIGKILL,
+                expected_workers_hash="other-hash",
+                receiver=_RECEIVER,
+                request_id="req-1",
+            )
+        )
+
+        assert outcome is FaultInjectionOutcome.STALE
+        assert asked == []
+
+    def test_a_replacement_after_the_check_is_refused_by_the_receiver(self, monkeypatch: pytest.MonkeyPatch):
+        """The observation can go stale between the check and the request; only the receiver can close that window."""
+        operations = _operations({"engine-0": _info(cell_id="engine-0", workers=("engine-0-0",))})
+        asked: list[dict] = []
+        monkeypatch.setattr(cell_operations_base, "request_receiver_fault", _recording_receiver(asked, STALE_TARGET))
+
+        outcome = asyncio.run(
+            operations.inject_fault(
+                cell_id="engine-0",
+                mode=FailureMode.SIGKILL,
+                expected_workers_hash="h",
+                receiver=_RECEIVER,
+                request_id="req-1",
+            )
+        )
+
+        assert outcome is FaultInjectionOutcome.STALE
+        assert asked == [{"receiver": _RECEIVER, "mode": FailureMode.SIGKILL, "request_id": "req-1"}]
+
+    def test_no_worker_rpc_handle_is_built_for_a_receiver_request(self, monkeypatch: pytest.MonkeyPatch):
+        """Building one would pin whichever process answers, which is the window the receiver identity closes."""
+        operations = _operations(
+            {"engine-0": _info(cell_id="engine-0", workers=("engine-0-0",))}, unserved_workers=("engine-0-0",)
+        )
+        monkeypatch.setattr(cell_operations_base, "request_receiver_fault", _recording_receiver([], ACCEPTED))
+
+        outcome = asyncio.run(
+            operations.inject_fault(
+                cell_id="engine-0",
+                mode=FailureMode.SIGKILL,
+                expected_workers_hash="h",
+                receiver=_RECEIVER,
+                request_id="req-1",
+            )
+        )
+
+        assert outcome is FaultInjectionOutcome.ACCEPTED
+
+    def test_an_unconditional_request_still_injects(self):
+        """The wall-clock injector names no incarnation, and its path is unchanged."""
+        operations = _operations({"engine-0": _info(cell_id="engine-0", workers=("engine-0-0",))})
+
+        outcome = asyncio.run(operations.inject_fault(cell_id="engine-0", mode=FailureMode.SIGKILL, sub_index=0))
+
+        assert outcome is FaultInjectionOutcome.INJECTED
+        assert operations._provider.submissions == [("engine-0-0", "inject_fault", "sigkill")]
 
 
 async def _stop_watching() -> None:

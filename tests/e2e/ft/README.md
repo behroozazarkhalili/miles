@@ -20,6 +20,8 @@
 | `scenario_random_crash_fully_async` | `kill_train_rollout__dp2_cp2` |
 | `scenario_realistic_gsm8k_fully_async` | `test_realistic_gsm8k_fully_async__kill_train_rollout.py`, no modes |
 | `scenario_weight_update_all_gather` | `kill_train_rollout__dp2_tp2` |
+| `scenario_weight_update_p2p_local` | `kill_train_rollout__dp2_tp2` |
+| `scenario_weight_update_p2p_remote` | `kill_train_rollout__dp2_tp2` |
 
 - **Forced absences**, one reason each:
     - `kill_train__dp4_cp2_tp2_pp2_ep2_etp2__moe_full` is multi-node, and no multi-node CI lane exists.
@@ -45,6 +47,8 @@
 | `scenario_random_crash_fully_async` | soak | same, through `train_async.py --fully-async` |
 | `scenario_realistic_gsm8k_fully_async` | soak | same, through `train_async.py --fully-async` |
 | `scenario_weight_update_all_gather` | targeted | a trainer worker dying inside the weight update's own TP all-gather is survived |
+| `scenario_weight_update_p2p_local` | targeted | a sender dying at the p2p write it is about to issue is survived |
+| `scenario_weight_update_p2p_remote` | targeted | the engine a sender has just submitted a write to dying is survived, and confined to that engine |
 
 ### Modes
 
@@ -105,7 +109,7 @@ PYTHONPATH=. python tests/e2e/ft/conftest_ft/scenario_trainer_no_failure.py run 
 - **Debugging**: prefer the individual subcommands over `run` — with a shared `--dump-dir` (plus `--phase` when multi-phase) you re-run only what changed.
 - **`scenario_rollout_deterministic`**: the comparison subcommands, with the injection constants fixed in the module rather than exposed as options.
 - **`scenario_random_crash`**: only `run`, with `--mode` / `--seed` / `--num-steps` / `--trainer-crash-interval-seconds` / `--rollout-crash-interval-seconds` / `--fully-async`.
-- **`scenario_weight_update_all_gather`**: only `run`, with `--mode` / `--num-steps`; what it arms is fixed in the module.
+- **`scenario_weight_update_all_gather`**, **`scenario_weight_update_p2p_local`**, **`scenario_weight_update_p2p_remote`**: only `run`, with `--mode` / `--num-steps`; what each arms is fixed in its module.
 - **`scenario_realistic_gsm8k`**: only `run`, with `--seed` / `--num-rollout` / `--trainer-crash-interval-seconds` / `--rollout-crash-interval-seconds` / `--metric-threshold` / `--fully-async`; no `--mode`.
 - **`scenario_*_fully_async`**: only `run`, with the same options minus `--fully-async`, which they pin.
 - **Dumps**: `resolve_dump_dir` in `conftest_ft/app.py` puts them under `$MILES_TEST_DUMPS_ROOT/<run_id>/<test_name>/`, falling back to `/node_public/dumps` when the cluster sets no root. A comparison scenario's `run` deletes them when it ends; the soak scenarios (`scenario_random_crash`, `scenario_realistic_gsm8k`) only clear a stale directory before starting, so a finished soak leaves its dumps behind for inspection. The run id is what stops two agents running the same test from deleting each other's dumps.
@@ -158,8 +162,25 @@ hf upload --repo-type dataset fzyzcjy/miles-test-rollout-Qwen3-30B-A3B-5layer \
 - **Who accepts one**: trainer cells only — the hooks live in trainer worker processes, and the only thing asked to arm one is the trainer controller that owns the named cell, so anything else is not a fault hook source at all rather than a requester left waiting for a fault nothing reaches.
 - **Every arm names the incarnation it chose**: `expected_workers_hash` is required and non-empty, and it is the hash the caller saw when it picked the source. The owning trainer controller matches it against the generation it currently holds and freezes that worker's already-held handle before its first `await`, so a replacement created afterwards can only be reached through a handle this request never took. It refuses — 400, with the reason — when the cell is gone, runs another hash, has not finished `init`, or has no such `sub_index`; it never re-aims at the replacement and never retries. No handle is built for the arm and none re-handshakes: under kubernetes the frozen handle was pinned to a boot uuid when the cell ran `init`, so a process that merely reuses the endpoint is refused by the rpc boot guard before the call is submitted. The call goes out on the worker's `fault_injector` concurrency group and is bounded, so arming waits for neither the training step nor the weight update.
 - **One-shot and exclusive**: a second arm at an already armed point is refused instead of replacing the first, and the slot frees itself when the fault fires.
-- **`weight_update.before_all_gather`**: `all_gather_params_async` in `hf_weight_iterator_direct.py`, inside the `tp_size > 1` branch, immediately before the real `dist.all_gather(..., async_op=True)`.
-- **A fire names the update it happened in**: `WeightUpdater.update_weights` opens a process-wide weight-update span, the fire event carries its version, and the trainer controller writes one `WeightUpdateAssignmentEvent` per sender before calling it. That pair is what lets a scenario say which engines the harmed sender owned.
+| Hook | Site | Runs on | Remote-capable |
+| --- | --- | --- | --- |
+| `weight_update.before_all_gather` | `all_gather_params_async`, inside the `tp_size > 1` branch, immediately before the real `dist.all_gather(..., async_op=True)` | the trainer rank | no |
+| `weight_update.before_p2p_write` | `_P2PInferenceCellUpdater._write_one_peer`, immediately before `batch_transfer_sync_write` | that cell's writer thread, with the peer and the span frozen at submit | yes |
+| `weight_update.after_p2p_submit` | `_P2PInferenceCellUpdater.submit_write`, once the future exists and is pending | the submitting rank | yes |
+| `weight_update.after_base_weights` | `UpdateWeightP2P.after_base_weights`, once every pending write has been collected | the submitting rank | no |
+
+- **Two actions, chosen at arming time**: `local` crashes the trainer worker that reached the point; `remote_inference_cell` crashes the engine that point is writing to. Nothing else is offered — the registry takes no callback and no cell name.
+- **A remote request never names its victim**: the site does, from the connection it actually established. The target is built from the `RemoteWeightInfo` of the peer being written to — its cell id, the `workers_hash` that cell was reached at and the receiver's own boot uuid, session and rank — so no request can name a cell or a rank this write never reached. The receiver's rank is not a `worker_in_cell_index`, and the event records the two separately rather than assuming the leader worker.
+- **The before-write hook reads the span frozen at submit**: the writer thread can reach the transfer after the update that queued it has ended and the next one has opened its own span, so the version is captured when the write is submitted and travels with the task.
+- **Refused before it is accepted**: arming `remote_inference_cell` at a hook with no single target, or in a process that cannot reach a cell at all, fails the arm rather than being dropped later.
+- **Bound to the incarnation, not to the name**: the fault carries the expected `workers_hash` all the way into the operation that delivers it. On ray the worker manager compares it and submits to the captured actor inside one hold of its membership lock, so no replacement can appear between the check and the submit. Comparing the hash first and then calling an unconditional inject would leave exactly that window.
+- **A refused fault is not harm**: an incarnation that is already gone yields `stale_target`, which is recorded on the fire and fails the scenario's witness. Nothing is retried blindly.
+- **The receiver closes the window, not the control plane**: the engine process that holds the transfer-engine session mints a `receiver_boot_uuid` per session and serves an `/inject_fault` endpoint that only acts on a request naming that uuid, that session and that rank. Both backends check the cell incarnation first — ray inside one hold of the worker manager's membership lock, kubernetes against the observed pods — and then send the same bounded HTTP request to the control url frozen at connect time. Neither builds a worker rpc handle for it, because a handle built now pins whichever process answers.
+- **The identity rides with the weights**: `receiver_identity` comes back in the same metadata response as the session id and the weight buffers, so a reader cannot pair fresh weights with a stale identity. Miles verifies the identity's session and rank against the peer it is about to write to and fails that target otherwise; an engine running without the fault-control flag publishes no identity, transfers normally, and refuses a remote fault at the site rather than falling back to killing by name.
+- **The request and the answer are matched field by field**: the post carries `request_id`, the expected uuid, session and rank, and a mode the receiver actually implements. A 200 must answer `accepted` for the same request id, uuid, session and rank; a 409 naming an identity mismatch or an inactive receiver is the incarnation being gone, and its body may legitimately report the replacement's identity, so only the request id is matched there. A pending-action conflict, a payload conflict, any other status and a body that answers for another request are explicit failures, and a timeout or a disconnect is `unknown` — never a delivery and never a blind retry.
+- **Accepting is not firing**: the receiver signals itself after it answers, so the fire event records `accepted` for a remote fault and `fired` only for a local one. The scenario still has to see the victim lose the incarnation the write reached and come back under a replacement.
+- **`weight_update.after_base_weights` has no entry of its own**: it is a local-only point strictly later in the same update than `before_p2p_write`, so an entry there would crash a sender in the same shape `scenario_weight_update_p2p_local` already proves. It is wired and unit-tested so a soak can draw it.
+- **A fire names the update it happened in**: `WeightUpdater.update_weights` opens a process-wide weight-update span, the fire event carries its version, and the trainer controller writes one `WeightUpdateAssignmentEvent` per sender before calling it. That pair is what lets a scenario say which engines the harmed sender owned, and it is what the p2p scenarios join their fire to as well.
 
 ### Fault Forms and Receivers
 
@@ -371,6 +392,7 @@ Requires: real disaggregated engines, TP2, ft_components == ("train", "rollout")
           >= 2 engines
 Regime: --update-weight-transfer-mode p2p
         --sglang-remote-instance-weight-loader-start-seed-via-transfer-engine
+        --sglang-enable-p2p-fault-injection
         --save <dump>/ckpt --save-interval 1, --mini-ft-controller-enable
 
 1. A background thread polls /api/v1/cells every 2s and records every snapshot
@@ -411,6 +433,36 @@ Witnesses:
 - **Why the healing witness is anchored to that assignment**: a run has other reconfigures, and picking any eviction and any healing from the whole log would let an earlier unrelated crash pay for this fault.
 - **Why both ft components**: a trainer that dies mid-update takes its assigned engines down with it, so the run only recovers if engines are recoverable too.
 - **What the progress witness cannot yet say**: `InferenceEngineWeightChecksumEvent` names no cell, so "an unrelated engine published after the fault" is asserted as that engine still Serving its original incarnation plus a non-empty publication of the run. Op33 gives the event a cell and a version, and this witness tightens to that engine's own publication.
+
+### `scenario_weight_update_p2p_local` and `scenario_weight_update_p2p_remote`
+
+```
+Type: targeted; same runner, mode, regime and readiness gate as scenario_weight_update_all_gather
+Entries: test_weight_update_p2p_local__kill_train_rollout__dp2_tp2.py,
+         test_weight_update_p2p_remote__kill_train_rollout__dp2_tp2.py, both ft-short
+Steps: 8 (DEFAULT_NUM_STEPS)
+
+p2p_local:  arms weight_update.before_p2p_write with sigkill, target local
+  Witnesses: exactly the all-gather scenario's, at a different point -- fire and assignment join,
+             the armed trainer incarnation evicted and healed, every engine that assignment names
+             replaced and serving again, an engine outside it still serving its original
+             incarnation, and a non-empty publication after that assignment
+
+p2p_remote: arms weight_update.after_p2p_submit with sigkill, target remote_inference_cell
+  Witnesses: fire (one, in the armed worker, target remote, outcome fired rather than stale),
+             assignment join, the fire carries the receiver uuid, session and rank of the peer it
+             wrote to, the victim named by the fire is one of that assignment's engines at
+             the incarnation it held when the hook was armed, that incarnation gone by the end,
+             the victim Serving again under a replacement, an engine outside the assignment still
+             serving its original incarnation, and a non-empty publication after that assignment
+```
+
+- **Why these two of the four hooks**: one local and one remote case, each at the moment its kind is hardest — the sender dies with a transfer half-issued, and the target dies while a write to it is in flight. A cross product of hooks and actions would buy repeats of the same two shapes at 8 GPU-hours each.
+- **Why the remote case does not assert healing of the victim's cell index**: engines are not trainer cells and produce no `CellReconfigureEvent`; the incarnation the api server reports is the evidence, exactly as in the rollout soak.
+- **Why the victim is checked against the assignment and the arm snapshot**: the fire names a cell and a hash from inside the write, and both have to be the cell this update gave that sender and the incarnation the run watched serving. Otherwise a fire could name anything and a later unrelated replacement would look like harm.
+- **Why a stale outcome fails rather than retries**: the fault was refused because the incarnation was already gone, so nothing was harmed. This is the one shape that must never be counted as an injection, and an unknown answer is not one either.
+- **Why neither backend is ruled out**: the fault is delivered by the receiver process itself, which exists on both, so the scenario is no longer restricted to ray.
+- **Why an unrelated engine has to keep serving**: a fault aimed at one target that stopped every engine would satisfy a witness that only asked whether the victim died.
 
 ### `scenario_random_crash`
 

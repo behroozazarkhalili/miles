@@ -9,7 +9,7 @@ from miles.ray import placement_group, train_actor
 from miles.ray.train_actor import TrainRayActor
 from miles.utils.init_once import InitOnce
 from miles.utils.test_utils import fault_hooks
-from miles.utils.test_utils.fault_hooks import FaultHookAlreadyArmedError, FaultHookName
+from miles.utils.test_utils.fault_hooks import FaultHookAlreadyArmedError, FaultHookName, FaultHookTarget
 from miles.utils.workers.env_vars import CELL_INDEX_ENV_VAR, SUBPROCESS_INDEX_ENV_VAR
 
 
@@ -253,7 +253,10 @@ class TestArmFaultHook:
         actor = _actor_with(InitOnce("TrainRayActor"))
 
         actor.arm_fault_hook(
-            hook=FaultHookName.WEIGHT_UPDATE_BEFORE_P2P_WRITE.value, mode="sigkill", request_id="req-1"
+            hook=FaultHookName.WEIGHT_UPDATE_BEFORE_P2P_WRITE.value,
+            mode="sigkill",
+            request_id="req-1",
+            target=FaultHookTarget.LOCAL.value,
         )
         assert injected == []
 
@@ -272,10 +275,10 @@ class TestArmFaultHook:
         actor = _actor_with(InitOnce("TrainRayActor"))
         hook = FaultHookName.WEIGHT_UPDATE_AFTER_P2P_SUBMIT.value
 
-        actor.arm_fault_hook(hook=hook, mode="sigkill", request_id="req-1")
+        actor.arm_fault_hook(hook=hook, mode="sigkill", request_id="req-1", target=FaultHookTarget.LOCAL.value)
 
         with pytest.raises(FaultHookAlreadyArmedError):
-            actor.arm_fault_hook(hook=hook, mode="exit", request_id="req-2")
+            actor.arm_fault_hook(hook=hook, mode="exit", request_id="req-2", target=FaultHookTarget.LOCAL.value)
 
     def test_an_unknown_hook_name_is_refused_by_the_trainer(self, monkeypatch: pytest.MonkeyPatch):
         """A name no production site carries would sit armed forever and silently pass the test it was meant for."""
@@ -283,4 +286,9 @@ class TestArmFaultHook:
         actor = _actor_with(InitOnce("TrainRayActor"))
 
         with pytest.raises(ValueError):
-            actor.arm_fault_hook(hook="weight_update.before_typo", mode="sigkill", request_id="req-1")
+            actor.arm_fault_hook(
+                hook="weight_update.before_typo",
+                mode="sigkill",
+                request_id="req-1",
+                target=FaultHookTarget.LOCAL.value,
+            )

@@ -904,6 +904,7 @@ class MegatronTrainRayActor(TrainRayActor):
                 engine_gpu_counts=engine_gpu_counts,
                 engine_gpu_offsets=engine_gpu_offsets,
                 engine_cell_ids=engine_cell_ids,
+                workers_hash_of_cell_id=snapshot_cell_id_to_hashes,
             )
             self.weight_updater.conn_status.mark_reconnected(snapshot_cell_id_to_hashes)
             dist.barrier(group=get_gloo_group())

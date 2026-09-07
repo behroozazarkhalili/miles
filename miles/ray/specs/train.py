@@ -229,6 +229,7 @@ def _compute_spec_trainer(
             rank=ctx.worker_in_cell_index,
             role=config.role,
             cell_index=ctx.cell_index,
+            capability=ctx.capability,
         ),
         concurrency_groups=TRAINER_CONCURRENCY_GROUPS if args.use_fault_tolerance else None,
         meta=lambda ctx: dict(role=config.role, cell_index=ctx.cell_index),

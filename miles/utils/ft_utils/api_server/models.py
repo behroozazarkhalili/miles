@@ -9,7 +9,7 @@ from typing import Literal
 from pydantic import Field
 
 from miles.utils.pydantic_utils import StrictBaseModel
-from miles.utils.test_utils.fault_hooks import FaultHookName
+from miles.utils.test_utils.fault_hooks import FaultHookName, FaultHookTarget
 from miles.utils.test_utils.fault_injector import FailureMode
 
 
@@ -103,6 +103,7 @@ class FaultHookArming(StrictBaseModel):
     mode: FailureMode
     sub_index: int = 0
     request_id: str
+    target: FaultHookTarget = FaultHookTarget.LOCAL
 
 
 class FaultHookArmingReport(StrictBaseModel):

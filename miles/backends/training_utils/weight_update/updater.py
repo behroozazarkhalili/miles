@@ -85,6 +85,7 @@ class WeightUpdater:
         engine_gpu_offsets: Sequence[int] | None = None,
         *,
         engine_cell_ids: Sequence[str],
+        workers_hash_of_cell_id: Mapping[str, str] | None = None,
     ) -> None:
         self.protocol.connect(
             rollout_engines,
@@ -95,6 +96,7 @@ class WeightUpdater:
             self._hf_weight_iterator.placement,
             self._hf_weight_iterator.weight_update_selector,
         )
+        self.protocol.bind_target_incarnations(workers_hash_of_cell_id or {})
         assert self.protocol.is_sender is not None, "connect() must set is_sender"
         self._registered_adapters.clear()
         self._engine_cell_ids = tuple(engine_cell_ids)

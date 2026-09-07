@@ -135,8 +135,20 @@ class RecordingCellOperations(BaseCellOperations):
             raise self.error
         return self.outcome
 
-    async def inject_fault(self, *, cell_id: str, mode: Any, sub_index: int) -> None:
+    async def inject_fault(
+        self,
+        *,
+        cell_id: str,
+        mode: Any,
+        sub_index: int | None = None,
+        expected_workers_hash: str | None = None,
+        receiver: Any = None,
+        request_id: str | None = None,
+    ) -> Any:
         raise AssertionError(f"no trainer cell test injects a fault into {cell_id}")
+
+    async def incarnation_is_current(self, *, cell_id: str, expected_workers_hash: str) -> bool:
+        raise AssertionError(f"no trainer cell test reads the incarnation of {cell_id}")
 
 
 def make_provider(trainer_id: str = "actor") -> BaseWorkerProvider:

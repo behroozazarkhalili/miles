@@ -6,7 +6,7 @@ from tests.e2e.ft.conftest_ft import hook_injection, scenario_random_crash, scen
 from tests.e2e.ft.conftest_ft.fault_injection import state
 
 from miles.utils.external_utils import command_utils
-from miles.utils.test_utils.fault_hooks import FaultHookName
+from miles.utils.test_utils.fault_hooks import FaultHookName, FaultHookTarget
 from miles.utils.test_utils.fault_injector import FailureMode
 
 
@@ -138,6 +138,7 @@ class TestOneConfigPerSoak:
             num_steps=1,
             hook=FaultHookName.WEIGHT_UPDATE_BEFORE_ALL_GATHER,
             failure_mode=FailureMode.SIGKILL,
+            target=FaultHookTarget.LOCAL,
             request_id="req-1",
             sub_index=0,
         )

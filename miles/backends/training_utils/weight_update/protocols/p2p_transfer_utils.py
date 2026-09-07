@@ -9,11 +9,12 @@ from typing import NamedTuple
 
 import ray
 from sglang.srt.server_args import ServerArgs
-from miles.backends.sglang_utils.sglang_api_client import SGLangApiClient
+from miles.backends.sglang_utils.sglang_api_client import RemoteInstanceTransferEngineInfo, SGLangApiClient
 from miles.backends.training_utils.parallel import get_parallel_state
 from miles.backends.training_utils.weight_update.hf_weight_iterator import WeightUpdatePlacement
 from miles.backends.training_utils.weight_update.utils import get_data_replica_rank_and_size
 from miles.utils import async_utils
+from miles.utils.test_utils.receiver_fault import ReceiverIdentity
 
 logger = logging.getLogger(__name__)
 
@@ -142,6 +143,7 @@ class RemoteWeightInfo:
 
     session_id: str
     weights_info: dict[str, RemoteWeightLocation]  # name -> (remote_address, numel, element_size)
+    receiver_identity: ReceiverIdentity | None = None
 
 
 def create_server_args_from_dict(data_dict: dict) -> ServerArgs:
@@ -181,26 +183,52 @@ class _RemoteTargetInfo(NamedTuple):
     weights_info: dict[str, RemoteWeightLocation]
     parallelism_info: dict
     server_info: dict
+    receiver_identity: ReceiverIdentity | None
+
+
+class RemoteSessionInfo(NamedTuple):
+    weights_info: dict[str, RemoteWeightLocation]
+    parallelism_info: dict
+    receiver_identity: ReceiverIdentity | None
 
 
 class RemoteWeightQuery(NamedTuple):
-    remote_weight_infos_by_session_id: dict[str, tuple]
+    remote_weight_infos_by_session_id: dict[str, RemoteSessionInfo]
     targets_to_session_id: dict[tuple[int, int], str]
     session_id_to_server_args: dict[str, ServerArgs]
     failures_by_engine_ind: dict[int, Exception]
 
 
 async def _query_one_target(client: SGLangApiClient, engine_ind: int, engine_rank: int) -> _RemoteTargetInfo:
-    session_id, raw_weights_info = await client.get_remote_instance_transfer_engine_info(rank=engine_rank)
-    assert session_id is not None, f"Failed to get session id from rollout engine {engine_ind} rank {engine_rank}"
+    info = await client.get_remote_instance_transfer_engine_info(rank=engine_rank)
+    assert info.session_id, f"Failed to get session id from rollout engine {engine_ind} rank {engine_rank}"
     parallelism_info = await client.get_parallelism_info(rank=engine_rank)
     server_info = await client.get_server_info()
     return _RemoteTargetInfo(
-        session_id=session_id,
-        weights_info={name: RemoteWeightLocation(*location) for name, location in raw_weights_info.items()},
+        session_id=info.session_id,
+        weights_info={name: RemoteWeightLocation(*location) for name, location in info.weights_info.items()},
         parallelism_info=parallelism_info,
         server_info=server_info,
+        receiver_identity=_check_receiver_identity(info, engine_ind=engine_ind, engine_rank=engine_rank),
     )
+
+
+def _check_receiver_identity(
+    info: RemoteInstanceTransferEngineInfo, *, engine_ind: int, engine_rank: int
+) -> ReceiverIdentity | None:
+    identity = info.receiver_identity
+    if identity is None:
+        return None
+    assert identity.session_id == info.session_id, (
+        f"[P2P-Shared] engine {engine_ind} rank {engine_rank} published receiver identity of session "
+        f"{identity.session_id} alongside weights of session {info.session_id}, so the identity describes a "
+        f"different incarnation than the buffers this update would write into"
+    )
+    assert identity.rank == engine_rank, (
+        f"[P2P-Shared] engine {engine_ind} answered for rank {engine_rank} with a receiver identity of rank "
+        f"{identity.rank}, so a fault aimed at it would reach a rank this transfer never wrote to"
+    )
+    return identity
 
 
 def query_remote_weight_infos(
@@ -210,7 +238,7 @@ def query_remote_weight_infos(
     request_timeout: float,
 ) -> RemoteWeightQuery:
     """Query remote rollout engines for weight info, session IDs, and server args."""
-    remote_weight_infos_by_session_id: dict[str, tuple] = {}
+    remote_weight_infos_by_session_id: dict[str, RemoteSessionInfo] = {}
     targets_to_session_id: dict[tuple[int, int], str] = {}
     session_id_to_server_args: dict[str, ServerArgs] = {}
     failures_by_engine_ind: dict[int, Exception] = {}
@@ -236,7 +264,11 @@ def query_remote_weight_infos(
             failures_by_engine_ind.setdefault(engine_ind, error)
             continue
         session_id_to_server_args[info.session_id] = create_server_args_from_dict(info.server_info)
-        remote_weight_infos_by_session_id[info.session_id] = (info.weights_info, info.parallelism_info)
+        remote_weight_infos_by_session_id[info.session_id] = RemoteSessionInfo(
+            weights_info=info.weights_info,
+            parallelism_info=info.parallelism_info,
+            receiver_identity=info.receiver_identity,
+        )
         targets_to_session_id[(engine_ind, engine_rank)] = info.session_id
 
     return RemoteWeightQuery(

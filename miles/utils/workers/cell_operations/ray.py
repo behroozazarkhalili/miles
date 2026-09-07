@@ -5,12 +5,15 @@ import asyncio
 import ray.actor
 
 from miles.utils.test_utils.fault_injector import FailureMode
+from miles.utils.test_utils.receiver_fault import ReceiverIdentity
 from miles.utils.workers.cell_operations.base import (
     CELL_TERMINATION_NOT_CONFIRMED,
     TERMINATE_INCARNATION_TIMEOUT_SECONDS,
     BaseCellOperations,
     CellTerminationNotConfirmedError,
     CellTerminationOutcome,
+    FaultInjectionOutcome,
+    ReceiverFaultRequest,
 )
 from miles.utils.workers.worker_provider.base import CellInfo
 
@@ -54,8 +57,44 @@ class RayCellOperations(BaseCellOperations):
             )
         return CellTerminationOutcome(outcome)
 
-    async def inject_fault(self, *, cell_id: str, mode: FailureMode, sub_index: int) -> None:
-        await self._worker_manager_handle.inject_fault.remote(cell_id, mode=mode.value, worker_in_cell_index=sub_index)
+    async def inject_fault(
+        self,
+        *,
+        cell_id: str,
+        mode: FailureMode,
+        sub_index: int | None = None,
+        expected_workers_hash: str | None = None,
+        receiver: ReceiverIdentity | None = None,
+        request_id: str | None = None,
+    ) -> FaultInjectionOutcome:
+        if receiver is not None:
+            assert expected_workers_hash is not None and request_id is not None, (
+                f"a fault aimed at the receiver of {cell_id} needs both the incarnation it was observed at and the "
+                f"request id the receiver checks it against"
+            )
+            return await self._inject_receiver_fault(
+                ReceiverFaultRequest(
+                    cell_id=cell_id,
+                    expected_workers_hash=expected_workers_hash,
+                    receiver=receiver,
+                    mode=mode,
+                    request_id=request_id,
+                )
+            )
+
+        assert sub_index is not None, f"a fault aimed at a worker of {cell_id} needs the index of that worker"
+        outcome = await self._worker_manager_handle.inject_fault.remote(
+            cell_id,
+            mode=mode.value,
+            worker_in_cell_index=sub_index,
+            expected_workers_hash=expected_workers_hash,
+        )
+        return FaultInjectionOutcome(outcome)
+
+    async def incarnation_is_current(self, *, cell_id: str, expected_workers_hash: str) -> bool:
+        return await self._worker_manager_handle.incarnation_is_current.remote(
+            cell_id, expected_workers_hash=expected_workers_hash
+        )
 
 
 async def _stop_cell_incarnation(

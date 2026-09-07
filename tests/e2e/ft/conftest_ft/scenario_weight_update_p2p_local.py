@@ -21,12 +21,12 @@ from miles.utils.test_utils.fault_injector import FailureMode
 
 app: typer.Typer = typer.Typer()
 
-TEST_NAME: str = "weight_update_all_gather"
+TEST_NAME: str = "weight_update_p2p_local"
 
 DEFAULT_NUM_STEPS: int = 8
-REQUEST_ID: str = "weight-update-all-gather"
+REQUEST_ID: str = "weight-update-p2p-local"
 FAILURE_MODE: FailureMode = FailureMode.SIGKILL
-HOOK: FaultHookName = FaultHookName.WEIGHT_UPDATE_BEFORE_ALL_GATHER
+HOOK: FaultHookName = FaultHookName.WEIGHT_UPDATE_BEFORE_P2P_WRITE
 ARMED_WORKER_IN_CELL_INDEX: int = 0
 
 
@@ -45,7 +45,7 @@ def run_ci(mode: ModeOption, num_steps: NumStepsOption = DEFAULT_NUM_STEPS) -> N
 
     assert_hook_outcome(run)
 
-    print(f"Targeted all-gather fault test PASSED ({TEST_NAME}, mode={mode}, steps={num_steps})")
+    print(f"Targeted p2p write fault test PASSED ({TEST_NAME}, mode={mode}, steps={num_steps})")
 
 
 def assert_hook_outcome(run: TargetedHookRun) -> None:

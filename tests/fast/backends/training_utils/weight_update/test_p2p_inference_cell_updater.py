@@ -4,8 +4,11 @@ import time
 import pytest
 
 from miles.backends.training_utils.weight_update.inference_cell_health import InferenceCellHealth
+from miles.utils.test_utils.fault_hooks import weight_update_span
+from miles.utils.test_utils.receiver_fault import ReceiverIdentity
 
 _REGISTRY = {"layer.0": (0x1000, 4, 2), "layer.1": (0x2000, 8, 2)}
+_MISSING = object()
 _NAMES = ["layer.0", "layer.1"]
 
 
@@ -32,13 +35,25 @@ class _RecordingTransferEngine:
         return -1 if session_id in self._failing_sessions else 0
 
 
-def _remote_weight_info(utils, session_id: str, base_address: int, names: list[str] | None = None):
+def _receiver_identity(session_id: str, rank: int) -> ReceiverIdentity:
+    return ReceiverIdentity(
+        receiver_boot_uuid=f"boot-{session_id}",
+        session_id=session_id,
+        rank=rank,
+        control_url=f"http://10.0.0.9:4111{rank}",
+    )
+
+
+def _remote_weight_info(
+    utils, session_id: str, base_address: int, names: list[str] | None = None, *, rank: int = 0, identity=_MISSING
+):
     return utils.RemoteWeightInfo(
         session_id,
         {
             name: utils.RemoteWeightLocation(base_address + index, _REGISTRY[name][1], _REGISTRY[name][2])
             for index, name in enumerate(names if names is not None else _NAMES)
         },
+        _receiver_identity(session_id, rank) if identity is _MISSING else identity,
     )
 
 
@@ -604,3 +619,192 @@ class TestCollectionBudget:
         assert updater.is_errored is False
         assert sorted(session_id for session_id, _s, _t, _l in engine.writes) == ["cell-0-rank-0", "cell-0-rank-1"]
         assert updater._pending_writes == []
+
+
+class _RecordingHooks:
+    def __init__(self) -> None:
+        self.reached: list[tuple[str, object]] = []
+        self.spans: list[object] = []
+
+    def __call__(self, hook, *, remote_target=None, span=None) -> None:
+        self.reached.append((hook.value, remote_target))
+        self.spans.append(span)
+
+
+class TestFaultHookSites:
+    """The hooks name the cell this updater really writes to, at the moments the design pins them to."""
+
+    def test_the_write_hook_is_reached_before_the_native_transfer(
+        self, p2p_inference_cell_updater, p2p_transfer_utils, transfer_timeout, monkeypatch
+    ) -> None:
+        """A hook after the transfer would crash a rank whose write already left, which is a different fault."""
+        engine = _RecordingTransferEngine()
+        order: list[str] = []
+        monkeypatch.setattr(
+            engine, "batch_transfer_sync_write", lambda *args: order.append("write") or 0, raising=False
+        )
+        monkeypatch.setattr(
+            p2p_inference_cell_updater,
+            "reach_fault_hook",
+            lambda hook, remote_target=None, span=None: (
+                order.append(hook.value) if hook.value.endswith("before_p2p_write") else None
+            ),
+        )
+        updater = _cell_updater(
+            p2p_inference_cell_updater,
+            transfer_timeout,
+            engine,
+            cell_id="cell-0",
+            peers={0: _remote_weight_info(p2p_transfer_utils, "cell-0-rank-0", 0xA000)},
+        )
+        updater.bind_incarnation("hash-1")
+
+        updater.submit_write(engine_rank=0, names=_NAMES, weight_memory_registry=_REGISTRY)
+        updater.wait_for_pending_writes()
+
+        assert order == ["weight_update.before_p2p_write", "write"]
+
+    def test_the_submit_hook_is_reached_on_the_submitting_thread(
+        self, p2p_inference_cell_updater, p2p_transfer_utils, transfer_timeout, monkeypatch
+    ) -> None:
+        """It marks the moment the write became someone else's to finish, which only the submitter observes."""
+        threads: dict[str, int] = {}
+        monkeypatch.setattr(
+            p2p_inference_cell_updater,
+            "reach_fault_hook",
+            lambda hook, remote_target=None, span=None: threads.setdefault(hook.value, threading.get_ident()),
+        )
+        updater = _cell_updater(
+            p2p_inference_cell_updater,
+            transfer_timeout,
+            _RecordingTransferEngine(),
+            cell_id="cell-0",
+            peers={0: _remote_weight_info(p2p_transfer_utils, "cell-0-rank-0", 0xA000)},
+        )
+        updater.bind_incarnation("hash-1")
+
+        updater.submit_write(engine_rank=0, names=_NAMES, weight_memory_registry=_REGISTRY)
+        updater.wait_for_pending_writes()
+
+        assert threads["weight_update.after_p2p_submit"] == threading.get_ident()
+        assert threads["weight_update.before_p2p_write"] != threading.get_ident()
+
+    def test_both_hooks_carry_the_cell_and_incarnation_this_updater_reached(
+        self, p2p_inference_cell_updater, p2p_transfer_utils, transfer_timeout, monkeypatch
+    ) -> None:
+        """A remote fault may only be aimed at the target this connection established, never at a name."""
+        hooks = _RecordingHooks()
+        monkeypatch.setattr(p2p_inference_cell_updater, "reach_fault_hook", hooks)
+        updater = _cell_updater(
+            p2p_inference_cell_updater,
+            transfer_timeout,
+            _RecordingTransferEngine(),
+            cell_id="cell-0",
+            peers={0: _remote_weight_info(p2p_transfer_utils, "cell-0-rank-0", 0xA000)},
+        )
+        updater.bind_incarnation("hash-1")
+
+        updater.submit_write(engine_rank=0, names=_NAMES, weight_memory_registry=_REGISTRY)
+        updater.wait_for_pending_writes()
+
+        peer = _remote_weight_info(p2p_transfer_utils, "cell-0-rank-0", 0xA000)
+        expected = updater.remote_target_of(peer)
+        assert [target for _hook, target in hooks.reached] == [expected] * 2
+        assert (expected.cell_id, expected.workers_hash) == ("cell-0", "hash-1")
+        assert (expected.receiver.session_id, expected.receiver.rank) == ("cell-0-rank-0", 0)
+        assert expected.worker_in_cell_index is None
+
+    def test_an_updater_with_no_bound_incarnation_names_no_target(
+        self, p2p_inference_cell_updater, p2p_transfer_utils, transfer_timeout
+    ) -> None:
+        """Naming a cell without the incarnation it was reached at is what makes a stale fault possible."""
+        updater = _cell_updater(
+            p2p_inference_cell_updater,
+            transfer_timeout,
+            _RecordingTransferEngine(),
+            cell_id="cell-0",
+            peers={0: _remote_weight_info(p2p_transfer_utils, "cell-0-rank-0", 0xA000)},
+        )
+
+        assert updater.remote_target_of(_remote_weight_info(p2p_transfer_utils, "cell-0-rank-0", 0xA000)) is None
+
+    def test_a_peer_that_published_no_receiver_identity_names_no_target(
+        self, p2p_inference_cell_updater, p2p_transfer_utils, transfer_timeout
+    ) -> None:
+        """Without fault control the engine publishes no identity, and a fault must refuse rather than kill by name."""
+        peer = _remote_weight_info(p2p_transfer_utils, "cell-0-rank-0", 0xA000, identity=None)
+        updater = _cell_updater(
+            p2p_inference_cell_updater,
+            transfer_timeout,
+            _RecordingTransferEngine(),
+            cell_id="cell-0",
+            peers={0: peer},
+        )
+        updater.bind_incarnation("hash-1")
+
+        assert updater.remote_target_of(peer) is None
+
+    def test_each_hook_names_the_peer_it_is_actually_writing_to(
+        self, p2p_inference_cell_updater, p2p_transfer_utils, transfer_timeout, monkeypatch
+    ) -> None:
+        """A cell spread over ranks writes to each in turn, and a fixed leader would blame a rank never written."""
+        hooks = _RecordingHooks()
+        monkeypatch.setattr(p2p_inference_cell_updater, "reach_fault_hook", hooks)
+        updater = _cell_updater(
+            p2p_inference_cell_updater,
+            transfer_timeout,
+            _RecordingTransferEngine(),
+            cell_id="cell-0",
+            peers={
+                rank: _remote_weight_info(p2p_transfer_utils, f"cell-0-rank-{rank}", 0xA000 + 0x1000 * rank, rank=rank)
+                for rank in (0, 1)
+            },
+        )
+        updater.bind_incarnation("hash-1")
+
+        updater.submit_write(engine_rank=1, names=_NAMES, weight_memory_registry=_REGISTRY)
+        updater.wait_for_pending_writes()
+
+        assert {target.receiver.rank for _hook, target in hooks.reached} == {1}
+        assert {target.receiver.session_id for _hook, target in hooks.reached} == {"cell-0-rank-1"}
+
+    def test_the_write_hook_reads_the_span_frozen_when_the_write_was_submitted(
+        self, p2p_inference_cell_updater, p2p_transfer_utils, transfer_timeout, monkeypatch
+    ) -> None:
+        """The writer thread can reach the transfer after the next update opened its own span."""
+        hooks = _RecordingHooks()
+        monkeypatch.setattr(p2p_inference_cell_updater, "reach_fault_hook", hooks)
+        updater = _cell_updater(
+            p2p_inference_cell_updater,
+            transfer_timeout,
+            _RecordingTransferEngine(),
+            cell_id="cell-0",
+            peers={0: _remote_weight_info(p2p_transfer_utils, "cell-0-rank-0", 0xA000)},
+        )
+        updater.bind_incarnation("hash-1")
+
+        with weight_update_span(weight_version=4):
+            updater.submit_write(engine_rank=0, names=_NAMES, weight_memory_registry=_REGISTRY)
+        updater.wait_for_pending_writes()
+
+        assert [span.weight_version for span in hooks.spans] == [4, 4]
+
+    def test_a_write_that_is_skipped_reaches_no_write_hook(
+        self, p2p_inference_cell_updater, p2p_transfer_utils, transfer_timeout, monkeypatch
+    ) -> None:
+        """An errored cell performs no transfer, so a fault armed at the transfer must not fire for it."""
+        hooks = _RecordingHooks()
+        monkeypatch.setattr(p2p_inference_cell_updater, "reach_fault_hook", hooks)
+        updater = _cell_updater(
+            p2p_inference_cell_updater,
+            transfer_timeout,
+            _RecordingTransferEngine(),
+            cell_id="cell-0",
+            peers={0: _remote_weight_info(p2p_transfer_utils, "cell-0-rank-0", 0xA000)},
+        )
+        updater.bind_incarnation("hash-1")
+        updater.mark_errored(RuntimeError("already lost"))
+
+        updater.submit_write(engine_rank=0, names=_NAMES, weight_memory_registry=_REGISTRY)
+
+        assert hooks.reached == []

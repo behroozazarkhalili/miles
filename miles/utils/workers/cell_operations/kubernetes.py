@@ -9,11 +9,15 @@ from contextlib import asynccontextmanager
 from typing import Any
 
 from miles.utils.test_utils.fault_injector import FailureMode
+from miles.utils.test_utils.receiver_fault import ReceiverIdentity
 from miles.utils.workers.cell_operations.base import (
     TERMINATE_INCARNATION_TIMEOUT_SECONDS,
     BaseCellOperations,
     CellTerminationNotConfirmedError,
     CellTerminationOutcome,
+    FaultInjectionOutcome,
+    IncarnationBoundInjectionUnsupportedError,
+    ReceiverFaultRequest,
 )
 from miles.utils.workers.worker_handle import BaseWorkerHandle, WorkerUnreachableError
 from miles.utils.workers.worker_provider.base import CellInfo, StopWatchFn
@@ -110,11 +114,61 @@ class KubernetesCellOperations(BaseCellOperations):
         await self._wait_until_pods_are_gone(cell_id=cell_id, pods=incarnation.pods, deadline=deadline)
         return CellTerminationOutcome.TERMINATED
 
-    async def inject_fault(self, *, cell_id: str, mode: FailureMode, sub_index: int) -> None:
+    async def inject_fault(
+        self,
+        *,
+        cell_id: str,
+        mode: FailureMode,
+        sub_index: int | None = None,
+        expected_workers_hash: str | None = None,
+        receiver: ReceiverIdentity | None = None,
+        request_id: str | None = None,
+    ) -> FaultInjectionOutcome:
+        if receiver is not None:
+            assert expected_workers_hash is not None and request_id is not None, (
+                f"a fault aimed at the receiver of {cell_id} needs both the incarnation it was observed at and the "
+                f"request id the receiver checks it against"
+            )
+            return await self._inject_receiver_fault(
+                ReceiverFaultRequest(
+                    cell_id=cell_id,
+                    expected_workers_hash=expected_workers_hash,
+                    receiver=receiver,
+                    mode=mode,
+                    request_id=request_id,
+                )
+            )
+
+        if expected_workers_hash is not None:
+            raise IncarnationBoundInjectionUnsupportedError(
+                f"a fault without a receiver identity cannot be bound to incarnation {expected_workers_hash} of "
+                f"{cell_id} here: a worker handle built now pins whatever process answers, so a replacement started "
+                f"since would take the fault meant for the incarnation the caller observed"
+            )
+
         await self._ensure_watching()
 
+        assert sub_index is not None, f"a fault aimed at a worker of {cell_id} needs the index of that worker"
         worker_name, handle = self._resolve_handle(cell_id=cell_id, sub_index=sub_index, purpose="crash it")
         await _inject_fault_over_rpc(handle=handle, mode=mode, worker_name=worker_name)
+        return FaultInjectionOutcome.INJECTED
+
+    async def incarnation_is_current(self, *, cell_id: str, expected_workers_hash: str) -> bool:
+        await self._ensure_watching()
+
+        incarnation = self._provider.cell_incarnation(cell_id)
+        if incarnation is None:
+            logger.warning("Cell %s is no longer observed, so %s cannot be current", cell_id, expected_workers_hash)
+            return False
+        if incarnation.workers_hash != expected_workers_hash:
+            logger.warning(
+                "Cell %s now runs %s, not the %s the request was issued against",
+                cell_id,
+                incarnation.workers_hash,
+                expected_workers_hash,
+            )
+            return False
+        return True
 
     def _resolve_handle(self, *, cell_id: str, sub_index: int, purpose: str) -> tuple[str, BaseWorkerHandle]:
         (infos,) = self._provider.get_worker_infos(cell_ids=[cell_id])

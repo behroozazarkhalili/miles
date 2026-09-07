@@ -62,6 +62,7 @@ class TestTheTrainerControllerSurfaceIsCallableOverRpc:
                     mode="sigkill",
                     sub_index=1,
                     request_id="req-1",
+                    target="remote_inference_cell",
                 )
             )
         )

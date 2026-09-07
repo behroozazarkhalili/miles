@@ -21,7 +21,11 @@ from miles.utils.ray_utils import compute_ray_pin_head_options
 from miles.utils.workers.addr_allocator import PortAllocator
 from miles.utils.workers.backend_capability.base import BackendCapability, DeferredBackendCapability
 from miles.utils.workers.backend_capability.ray import RayBackendCapability
-from miles.utils.workers.cell_operations.base import CELL_TERMINATION_NOT_CONFIRMED, CellTerminationOutcome
+from miles.utils.workers.cell_operations.base import (
+    CELL_TERMINATION_NOT_CONFIRMED,
+    CellTerminationOutcome,
+    FaultInjectionOutcome,
+)
 from miles.utils.workers.command_actor import CommandActor
 from miles.utils.workers.naming import compute_cell_id, compute_worker_name
 from miles.utils.workers.ray_worker_handle import RayWorkerHandle
@@ -127,7 +131,39 @@ class RayWorkerManager:
         async with self._membership_lock:
             await asyncio.gather(*[cell.stop() for cell in self._all_cells()])
 
-    def inject_fault(self, cell_id: str, *, mode: str, worker_in_cell_index: int) -> None:
+    async def inject_fault(
+        self,
+        cell_id: str,
+        *,
+        mode: str,
+        worker_in_cell_index: int,
+        expected_workers_hash: str | None = None,
+    ) -> str:
+        if expected_workers_hash is None:
+            self._submit_fault(cell_id, mode=mode, worker_in_cell_index=worker_in_cell_index)
+            return FaultInjectionOutcome.INJECTED.value
+
+        async with self._membership_lock:
+            if (observed_hash := self._find_cell(cell_id).get_info().workers_hash) != expected_workers_hash:
+                logger.warning(
+                    f"Not injecting {mode} into {cell_id}: it now runs {observed_hash}, not the "
+                    f"{expected_workers_hash} the request was issued against"
+                )
+                return FaultInjectionOutcome.STALE.value
+            self._submit_fault(cell_id, mode=mode, worker_in_cell_index=worker_in_cell_index)
+            return FaultInjectionOutcome.INJECTED.value
+
+    async def incarnation_is_current(self, cell_id: str, *, expected_workers_hash: str) -> bool:
+        async with self._membership_lock:
+            observed_hash = self._find_cell(cell_id).get_info().workers_hash
+        if observed_hash != expected_workers_hash:
+            logger.warning(
+                f"Cell {cell_id} now runs {observed_hash}, not the {expected_workers_hash} the request was issued "
+                f"against"
+            )
+        return observed_hash == expected_workers_hash
+
+    def _submit_fault(self, cell_id: str, *, mode: str, worker_in_cell_index: int) -> None:
         cell = self._find_cell(cell_id)
         if not cell.alive:
             raise RuntimeError(f"Cell {cell_id} is not alive, cannot inject fault")

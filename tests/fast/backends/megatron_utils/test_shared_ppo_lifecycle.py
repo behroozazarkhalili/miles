@@ -646,6 +646,7 @@ class _RecordingWeightUpdater:
         engine_gpu_offsets: list[int] | None = None,
         *,
         engine_cell_ids: list[str],
+        workers_hash_of_cell_id: dict[str, str] | None = None,
     ) -> None:
         self.connect_calls.append(
             dict(
@@ -653,6 +654,7 @@ class _RecordingWeightUpdater:
                 engine_gpu_counts=engine_gpu_counts,
                 engine_gpu_offsets=engine_gpu_offsets,
                 engine_cell_ids=list(engine_cell_ids),
+                workers_hash_of_cell_id=workers_hash_of_cell_id,
             )
         )
         self.engine_cell_ids = list(engine_cell_ids)
@@ -718,6 +720,7 @@ def test_update_weights_reconnects_once_per_rollout_snapshot(
     assert [call["rollout_engines"] for call in updater.connect_calls] == [first_engines, replacement_engines]
     assert updater.connect_calls[1]["engine_gpu_counts"] == [2, 2]
     assert updater.connect_calls[1]["engine_gpu_offsets"] == [0, 2]
+    assert updater.connect_calls[1]["workers_hash_of_cell_id"] == {"cell-0": "hash-b", "cell-1": "hash-b"}
     assert updater.update_weights_calls == 3
     assert weight_version.weight_version == 3
     assert not updater.conn_status.needs_reconnect({"cell-0": "hash-b"})

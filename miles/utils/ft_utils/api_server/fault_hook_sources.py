@@ -5,7 +5,7 @@ from typing import Protocol
 
 from miles.utils.ft_utils.api_server.handles import _CellHandler
 from miles.utils.ft_utils.api_server.models import Cell, CellStatus, FaultHookArmingReport
-from miles.utils.test_utils.fault_hooks import FaultHookName
+from miles.utils.test_utils.fault_hooks import FaultHookName, FaultHookTarget
 from miles.utils.test_utils.fault_injector import FailureMode
 
 
@@ -25,6 +25,7 @@ class _FaultHookSourceController(Protocol):
         mode: str,
         sub_index: int,
         request_id: str,
+        target: str,
     ) -> FaultHookArmingReport: ...
 
 
@@ -45,6 +46,7 @@ class _FaultHookSourceRegistry:
         mode: FailureMode,
         sub_index: int,
         request_id: str,
+        target: FaultHookTarget,
     ) -> FaultHookArmingReport:
         controller = await self._resolve(cell_id)
         return await controller.arm_fault_hook(
@@ -54,6 +56,7 @@ class _FaultHookSourceRegistry:
             mode=mode.value,
             sub_index=sub_index,
             request_id=request_id,
+            target=target.value,
         )
 
     async def _resolve(self, cell_id: str) -> _FaultHookSourceController:

@@ -5,8 +5,16 @@ import logging
 import httpx
 
 from miles.utils.http_utils import GeneralHttpClientProvider
+from miles.utils.pydantic_utils import FrozenStrictBaseModel
+from miles.utils.test_utils.receiver_fault import ReceiverIdentity
 
 logger = logging.getLogger(__name__)
+
+
+class RemoteInstanceTransferEngineInfo(FrozenStrictBaseModel):
+    session_id: str
+    weights_info: dict[str, tuple[int, int, int]]
+    receiver_identity: ReceiverIdentity | None = None
 
 
 def _compute_headers(api_key: str | None) -> dict[str, str]:
@@ -136,7 +144,7 @@ class SGLangApiClient:
             payload,
         )
 
-    async def get_remote_instance_transfer_engine_info(self, rank: int):
+    async def get_remote_instance_transfer_engine_info(self, rank: int) -> RemoteInstanceTransferEngineInfo:
         # TODO: will be changed to `remote_instance_transfer_engine_info` when the sglang side is ready.
         response = await GeneralHttpClientProvider.client().get(
             f"{self.server_url}/get_remote_instance_transfer_engine_info",
@@ -145,7 +153,7 @@ class SGLangApiClient:
             timeout=5.0,
         )
         response.raise_for_status()
-        return response.json()["remote_instance_transfer_engine_info"]
+        return _parse_remote_instance_transfer_engine_info(response.json())
 
     async def get_parallelism_info(self, rank: int):
         response = await GeneralHttpClientProvider.client().get(
@@ -455,3 +463,12 @@ class SGLangApiClient:
         )
         response.raise_for_status()
         return response
+
+
+def _parse_remote_instance_transfer_engine_info(payload: dict) -> RemoteInstanceTransferEngineInfo:
+    session_id, weights_info = payload["remote_instance_transfer_engine_info"]
+    return RemoteInstanceTransferEngineInfo(
+        session_id=session_id,
+        weights_info=weights_info or {},
+        receiver_identity=payload.get("receiver_identity"),
+    )

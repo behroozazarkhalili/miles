@@ -2,7 +2,7 @@
 
 from abc import ABC, abstractmethod
 from argparse import Namespace
-from collections.abc import Callable, Iterator, Sequence
+from collections.abc import Callable, Iterator, Mapping, Sequence
 from typing import ClassVar
 
 import torch
@@ -46,6 +46,9 @@ class WeightTransferProtocol(ABC):
         placement: WeightUpdatePlacement,
         selector: str,
     ) -> None: ...
+
+    def bind_target_incarnations(self, workers_hash_of_cell_id: Mapping[str, str]) -> None:  # noqa: B027
+        return None
 
     def begin_sync(
         self,
