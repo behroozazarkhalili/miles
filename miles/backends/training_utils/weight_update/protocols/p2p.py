@@ -21,6 +21,13 @@ from sglang.srt.server_args import ServerArgs
 
 from miles.backends.sglang_utils.sglang_api_client import SGLangApiClient
 from miles.backends.training_utils.parallel import ParallelState
+from miles.backends.training_utils.weight_update.base_weight_checksums import (
+    BaseWeightChecksumRecorder,
+    BaseWeightChecksums,
+    CellChecksumEvidence,
+    digest_named_params,
+    gather_base_weight_checksums,
+)
 from miles.backends.training_utils.weight_update.hf_weight_iterator import WeightUpdatePlacement
 from miles.backends.training_utils.weight_update.inference_cell_health import InferenceCellHealth
 from miles.backends.training_utils.weight_update.protocol import WeightTransferProtocol
@@ -66,6 +73,7 @@ class UpdateWeightP2P(WeightTransferProtocol):
         self.global_rank = dist.get_rank(group=get_gloo_group())
         self._model_registered = False
         self._tensor_stager = NamedTensorStager()
+        self._checksum_recorder = BaseWeightChecksumRecorder()
         self._transfer_timeout = args.p2p_transfer_timeout
         self._transfer_engine: Any | None = None
         self._shared_params_dict: dict[str, torch.Tensor] = {}
@@ -101,6 +109,7 @@ class UpdateWeightP2P(WeightTransferProtocol):
         self, weight_version: int, iter_buckets: Callable[..., Iterator[list[tuple[str, torch.Tensor]]]]
     ) -> bool:
         """Register shared CPU pinned memory with P2P on the first sync."""
+        self._checksum_recorder.clear()
         if self.is_sender and not self._model_registered and self._shared_params_dict:
             self._weight_memory_registry = register_cpu_memory(self._shared_params_dict, self._transfer_engine)
             self._model_registered = True
@@ -128,6 +137,12 @@ class UpdateWeightP2P(WeightTransferProtocol):
             for i, meta in enumerate(self._transfer_engine_meta_list):
                 meta.model_replica.load_weights(ready_hf_tensors)
 
+                digests = (
+                    digest_named_params(names=transfer_ready_params, params_dict=self._shared_params_dict)
+                    if any(cell_updater.accepts_writes for cell_updater in meta.cell_updaters)
+                    else {}
+                )
+
                 # Last engine rank: fire-and-forget all sessions to background,
                 # as the weight will no longer be overwritten
                 submitted = []
@@ -139,6 +154,9 @@ class UpdateWeightP2P(WeightTransferProtocol):
                     )
                     if future is not None:
                         submitted.append((cell_updater, future))
+                        self._checksum_recorder.record(
+                            cell_id=cell_updater.cell_id, engine_rank=meta.engine_rank, digests=digests
+                        )
 
                 if i != last_idx:
                     # Non-last engine rank needs to be fully written to target before next update can happen.
@@ -146,6 +164,16 @@ class UpdateWeightP2P(WeightTransferProtocol):
                         cell_updater.wait_for_write(future)
 
         converted_named_tensors.clear()
+
+    def collect_base_weight_checksums(self) -> BaseWeightChecksums:
+        local_evidence = {
+            cell_id: CellChecksumEvidence(
+                engine_ranks=self._cell_updaters_by_cell_id[cell_id].engine_ranks,
+                manifest=self._checksum_recorder.manifest_of(cell_id),
+            )
+            for cell_id in self.inference_cell_health.healthy_cell_ids
+        }
+        return gather_base_weight_checksums(local_evidence=local_evidence, group=get_gloo_group())
 
     def connect(
         self,
@@ -251,6 +279,7 @@ class UpdateWeightP2P(WeightTransferProtocol):
         self.rollout_engines = []
         self.is_sender = False
         self._tensor_stager = NamedTensorStager()
+        self._checksum_recorder.clear()
 
     def _drain_pending_writes(self) -> None:
         for cell_updater in self._cell_updaters_by_cell_id.values():

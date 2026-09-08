@@ -17,6 +17,7 @@ from tqdm import tqdm
 from miles.backends.sglang_utils.sglang_api_client import SGLangApiClient
 from miles.backends.training_utils.conn_status import ConnStatusManager
 from miles.backends.training_utils.parallel import ParallelState
+from miles.backends.training_utils.weight_update.base_weight_checksums import BaseWeightChecksums
 from miles.backends.training_utils.weight_update.cell_session import _PerCellEngineSession
 from miles.backends.training_utils.weight_update.protocol import get_weight_transfer_protocol
 from miles.backends.training_utils.weight_update.report import WeightUpdateReport, build_weight_update_report
@@ -163,11 +164,12 @@ class WeightUpdater:
             protocol.after_base_weights()
             dist.barrier(group=get_gloo_group())
             self._sync_cell_failures()
+            base_weight_checksums = protocol.collect_base_weight_checksums()
 
         with timer("finalize_and_resume_engines"):
             protocol.finalize(self.weight_version)
             if protocol.use_weight_update_session and driver:
-                self._publish_weight_version(checksums)
+                self._publish_weight_version(checksums=checksums, base_weight_checksums=base_weight_checksums)
             self._sync_cell_failures()
             if protocol.use_weight_update_session and driver:
                 self._resume_engines()
@@ -203,13 +205,19 @@ class WeightUpdater:
             protocol.rollout_engines, self._hf_weight_iterator.weight_update_selector, sync_base=sync_base
         )
 
-    def _publish_weight_version(self, checksums: dict | None) -> None:
+    def _publish_weight_version(
+        self, *, checksums: dict | None, base_weight_checksums: BaseWeightChecksums | None
+    ) -> None:
         protocol = self.protocol
         if self._cell_session is not None:
-            self._cell_session.end()
+            self._cell_session.end(expected_base_weight_checksums=base_weight_checksums)
             self._cell_session.set_weight_version(self.weight_version)
             return
 
+        assert base_weight_checksums is None, (
+            f"{self.args.update_weight_transfer_mode!r} has no per-inference-cell session to address the "
+            f"base-weight checksum manifests of {sorted(base_weight_checksums or {})} to"
+        )
         end_weight_update(protocol.rollout_engines, expected_lora_checksums=checksums)
         set_weight_version(protocol.rollout_engines, self.weight_version)
 

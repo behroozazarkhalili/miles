@@ -49,6 +49,10 @@ class _P2PInferenceCellUpdater:
     def accepts_writes(self) -> bool:
         return not self._disposed and not self.is_errored
 
+    @property
+    def engine_ranks(self) -> tuple[int, ...]:
+        return tuple(sorted(self._peer_by_engine_rank))
+
     def mark_errored(self, error: BaseException) -> None:
         self._health.mark_errored(self.cell_id, error)
 

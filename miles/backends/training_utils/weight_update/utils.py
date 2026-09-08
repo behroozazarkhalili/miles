@@ -25,7 +25,8 @@ def record_lora_checksums(bucket, checksums) -> None:
         if ":" not in name:
             continue
         lora_name, hf_key = name.split(":", 1)
-        digest = hashlib.sha256(
-            tensor.detach().cpu().contiguous().flatten().view(torch.uint8).numpy().tobytes()
-        ).hexdigest()
-        checksums[lora_name][hf_key] = digest
+        checksums[lora_name][hf_key] = sha256_tensor(tensor)
+
+
+def sha256_tensor(tensor: torch.Tensor) -> str:
+    return hashlib.sha256(tensor.detach().cpu().contiguous().flatten().view(torch.uint8).numpy().tobytes()).hexdigest()

@@ -94,6 +94,7 @@ def _make_updater(
         begin_sync_versions=begin_sync_versions,
         send_bucket=MagicMock(),
         after_base_weights=MagicMock(),
+        collect_base_weight_checksums=lambda: None,
         finalize=MagicMock(),
     )
     iterator = MagicMock()

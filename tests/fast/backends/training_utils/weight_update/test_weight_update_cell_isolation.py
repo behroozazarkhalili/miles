@@ -24,16 +24,28 @@ def _patched_health_dist(other_rank_reports: list[list[str]]):
 
 
 class _RecordingApiClient:
-    def __init__(self, calls: list[tuple[str, str]], cell_id: str, failing_method: str | None = None):
+    def __init__(
+        self,
+        calls: list[tuple[str, str]],
+        cell_id: str,
+        failing_method: str | None = None,
+        payloads: list[tuple[str, str, dict]] | None = None,
+        refusing_method: str | None = None,
+    ):
         self._calls = calls
         self._cell_id = cell_id
         self._failing_method = failing_method
+        self._payloads = payloads if payloads is not None else []
+        self._refusing_method = refusing_method
 
     def __getattr__(self, name: str):
-        async def method(**_kwargs):
+        async def method(**kwargs):
             self._calls.append((self._cell_id, name))
+            self._payloads.append((self._cell_id, name, kwargs))
             if name == self._failing_method:
                 raise ConnectionError(f"{self._cell_id} is unreachable")
+            if name == self._refusing_method:
+                return {"success": False, "message": f"[BASE-WEIGHT-CHECK] {self._cell_id} checksum mismatch"}
             return {"success": True}
 
         return method
@@ -44,7 +56,7 @@ class _FakeCellIsolatingProtocol:
     supports_lora = False
     needs_base_resync_for_lora = False
 
-    def __init__(self) -> None:
+    def __init__(self, base_weight_checksums: dict | None = None) -> None:
         self.args = None
         self.required_placement = MagicMock()
         self.inference_cell_health = InferenceCellHealth()
@@ -53,6 +65,8 @@ class _FakeCellIsolatingProtocol:
         self.group_name = "test"
         self.sent_buckets: list[list] = []
         self.spans_while_sending: list = []
+        self.base_weight_checksums = base_weight_checksums
+        self.collect_calls = 0
 
     def connect(
         self,
@@ -79,6 +93,10 @@ class _FakeCellIsolatingProtocol:
 
     def after_base_weights(self) -> None:
         pass
+
+    def collect_base_weight_checksums(self) -> dict | None:
+        self.collect_calls += 1
+        return self.base_weight_checksums
 
     def finalize(self, weight_version) -> None:
         pass
@@ -393,6 +411,88 @@ class TestCrossRankAgreement:
         assert not [entry for entry in gathered_at[2] if entry[1] == "continue_generation"]
         assert ("cell-0", "continue_generation") not in calls
         assert ("cell-1", "continue_generation") in calls
+
+
+class TestBaseWeightChecksumPublication:
+    """The manifest the engine verifies is per cell, and a cell that refuses it must not be published."""
+
+    def test_each_cell_is_verified_against_its_own_manifest(self) -> None:
+        """A manifest addressed to the wrong cell describes shards that cell never received."""
+        calls: list[tuple[str, str]] = []
+        payloads: list[tuple[str, str, dict]] = []
+        manifests = {"cell-0": {"0": {"w": "aa"}}, "cell-1": {"0": {"w": "bb"}}}
+        protocol = _FakeCellIsolatingProtocol(base_weight_checksums=manifests)
+        engines = [_RecordingApiClient(calls, cell_id, payloads=payloads) for cell_id in _CELL_IDS]
+        updater = _make_updater(engines, protocol)
+
+        _run(updater)
+
+        assert [
+            (cell_id, kwargs["expected_base_weight_checksums"])
+            for cell_id, name, kwargs in payloads
+            if name == "end_weight_update"
+        ] == [("cell-0", {"0": {"w": "aa"}}), ("cell-1", {"0": {"w": "bb"}})]
+
+    def test_a_cell_lost_by_another_rank_is_never_asked_to_verify(self) -> None:
+        """It holds a partial model, and its manifest only covers the shards that did arrive."""
+        calls: list[tuple[str, str]] = []
+        payloads: list[tuple[str, str, dict]] = []
+        manifests = {"cell-0": {"0": {"w": "aa"}}, "cell-1": {"0": {"w": "bb"}}}
+        protocol = _FakeCellIsolatingProtocol(base_weight_checksums=manifests)
+        engines = [_RecordingApiClient(calls, cell_id, payloads=payloads) for cell_id in _CELL_IDS]
+        updater = _make_updater(engines, protocol)
+
+        _run(updater, other_rank_reports=[["cell-0"]])
+
+        assert [cell_id for cell_id, name, _kwargs in payloads if name == "end_weight_update"] == ["cell-1"]
+
+    def test_every_rank_collects_the_manifests_once_per_update(self) -> None:
+        """The manifests are merged over the whole trainer cell, so a driver-only gather would hang the others."""
+        calls: list[tuple[str, str]] = []
+        protocol = _FakeCellIsolatingProtocol(base_weight_checksums={})
+        updater = _make_updater([_RecordingApiClient(calls, cell_id) for cell_id in _CELL_IDS], protocol)
+
+        _run(updater, rank=2)
+
+        assert protocol.collect_calls == 1
+        assert calls == []
+
+    def test_a_protocol_without_manifests_publishes_without_them(self) -> None:
+        """Protocols that hash nothing must keep sending no manifest at all."""
+        calls: list[tuple[str, str]] = []
+        payloads: list[tuple[str, str, dict]] = []
+        protocol = _FakeCellIsolatingProtocol()
+        engines = [_RecordingApiClient(calls, cell_id, payloads=payloads) for cell_id in _CELL_IDS]
+        updater = _make_updater(engines, protocol)
+
+        _run(updater)
+
+        assert [
+            kwargs["expected_base_weight_checksums"]
+            for _cell_id, name, kwargs in payloads
+            if name == "end_weight_update"
+        ] == [None, None]
+
+    def test_a_cell_that_refuses_the_manifest_is_neither_versioned_nor_resumed(self) -> None:
+        """Publishing a version the engine refused to verify would serve half-written weights as current."""
+        calls: list[tuple[str, str]] = []
+        manifests = {"cell-0": {"0": {"w": "aa"}}, "cell-1": {"0": {"w": "bb"}}}
+        protocol = _FakeCellIsolatingProtocol(base_weight_checksums=manifests)
+        engines = [
+            _RecordingApiClient(calls, "cell-0", refusing_method="end_weight_update"),
+            _RecordingApiClient(calls, "cell-1"),
+        ]
+        updater = _make_updater(engines, protocol)
+
+        report = _run(updater)
+
+        assert "checksum mismatch" in str(protocol.inference_cell_health.error_of("cell-0"))
+        assert ("cell-0", "update_weight_version") not in calls
+        assert ("cell-0", "continue_generation") not in calls
+        assert ("cell-1", "update_weight_version") in calls
+        assert ("cell-1", "continue_generation") in calls
+        assert report.failed_cell_ids == ("cell-0",)
+        assert report.updated_cell_ids == ("cell-1",)
 
 
 class TestWeightUpdateSpan:

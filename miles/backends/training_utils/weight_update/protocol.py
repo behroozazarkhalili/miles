@@ -9,6 +9,7 @@ import torch
 
 from miles.backends.sglang_utils.sglang_api_client import SGLangApiClient
 from miles.backends.training_utils.parallel import ParallelState
+from miles.backends.training_utils.weight_update.base_weight_checksums import BaseWeightChecksums
 from miles.backends.training_utils.weight_update.hf_weight_iterator import WeightUpdatePlacement
 from miles.backends.training_utils.weight_update.inference_cell_health import InferenceCellHealth
 
@@ -64,6 +65,9 @@ class WeightTransferProtocol(ABC):
 
     def after_base_weights(self) -> None:  # noqa: B027 — optional hook
         """Hook after the base-weight stream completes (e.g. await in-flight writes)."""
+
+    def collect_base_weight_checksums(self) -> BaseWeightChecksums | None:
+        return None
 
     def finalize(self, weight_version: int) -> None:  # noqa: B027 — optional hook
         """Hook after all sends (e.g. publish + engine reload)."""

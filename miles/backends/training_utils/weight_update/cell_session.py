@@ -5,6 +5,7 @@ from collections.abc import Callable, Coroutine, Mapping
 from concurrent.futures import TimeoutError as FutureTimeoutError
 
 from miles.backends.sglang_utils.sglang_api_client import SGLangApiClient
+from miles.backends.training_utils.weight_update.base_weight_checksums import BaseWeightChecksums
 from miles.backends.training_utils.weight_update.inference_cell_health import InferenceCellHealth
 from miles.utils import async_utils
 
@@ -25,32 +26,39 @@ class _PerCellEngineSession:
 
     def pause(self) -> None:
         mode = self.args.pause_generation_mode
-        self._call("pause_generation", lambda client: client.pause_generation(mode=mode))
+        self._call("pause_generation", lambda client, cell_id: client.pause_generation(mode=mode))
         if mode != "in_place":
-            self._call("flush_cache", lambda client: client.flush_cache())
+            self._call("flush_cache", lambda client, cell_id: client.flush_cache())
 
     def begin(self, *, selector: str, sync_base: bool) -> None:
         self._call(
             "begin_weight_update",
-            lambda client: client.begin_weight_update(selector=selector, sync_base=sync_base),
+            lambda client, cell_id: client.begin_weight_update(selector=selector, sync_base=sync_base),
         )
 
-    def end(self) -> None:
-        self._call("end_weight_update", lambda client: client.end_weight_update())
+    def end(self, *, expected_base_weight_checksums: BaseWeightChecksums | None = None) -> None:
+        self._call(
+            "end_weight_update",
+            lambda client, cell_id: client.end_weight_update(
+                expected_base_weight_checksums=(
+                    None if expected_base_weight_checksums is None else expected_base_weight_checksums.get(cell_id, {})
+                )
+            ),
+        )
 
     def set_weight_version(self, weight_version: int) -> None:
         self._call(
             "update_weight_version",
-            lambda client: client.update_weight_version(weight_version=str(weight_version)),
+            lambda client, cell_id: client.update_weight_version(weight_version=str(weight_version)),
         )
 
     def resume(self) -> None:
-        self._call("continue_generation", lambda client: client.continue_generation())
+        self._call("continue_generation", lambda client, cell_id: client.continue_generation())
 
-    def _call(self, op: str, make_request: Callable[[SGLangApiClient], Coroutine]) -> None:
+    def _call(self, op: str, make_request: Callable[[SGLangApiClient, str], Coroutine]) -> None:
         deadline = time.monotonic() + self._request_timeout
         futures = {
-            cell_id: async_utils.submit(make_request(self._clients_by_cell_id[cell_id]))
+            cell_id: async_utils.submit(make_request(self._clients_by_cell_id[cell_id], cell_id))
             for cell_id in self._health.healthy_cell_ids
         }
 

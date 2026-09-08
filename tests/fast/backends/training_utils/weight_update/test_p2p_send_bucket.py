@@ -3,7 +3,10 @@ from types import SimpleNamespace
 
 import torch
 
+from miles.backends.training_utils.weight_update.base_weight_checksums import BaseWeightChecksumRecorder
+
 _REGISTRY = {"w": (0x1000, 4, 2)}
+_SHARED_PARAMS = {"w": torch.zeros(2, dtype=torch.float32)}
 
 
 class _LoggingFuture(Future):
@@ -20,6 +23,8 @@ class _LoggingFuture(Future):
 
 
 class _RecordingCellUpdater:
+    accepts_writes = True
+
     def __init__(self, log: list[tuple], cell_id: str):
         self._log = log
         self.cell_id = cell_id
@@ -48,8 +53,9 @@ def _send_one_bucket(p2p, *, engine_ranks: list[int], cell_ids: list[str]) -> li
     protocol = SimpleNamespace(
         is_sender=True,
         _shared_param_mapper=object(),
-        _shared_params_dict={},
+        _shared_params_dict=_SHARED_PARAMS,
         _weight_memory_registry=_REGISTRY,
+        _checksum_recorder=BaseWeightChecksumRecorder(),
         _tensor_stager=SimpleNamespace(get_transfer_ready_params=lambda *_args, **_kwargs: (["w"], ready_hf_tensors)),
         _transfer_engine_meta_list=[
             p2p.TransferEngineMeta(
@@ -124,6 +130,8 @@ class TestSendBucketOrdering:
 
 
 class _ErroredCellUpdater:
+    accepts_writes = False
+
     def __init__(self, log: list[tuple], cell_id: str):
         self._log = log
         self.cell_id = cell_id
@@ -140,8 +148,9 @@ def _send_one_bucket_with_an_errored_cell(p2p, *, engine_ranks: list[int]) -> li
     protocol = SimpleNamespace(
         is_sender=True,
         _shared_param_mapper=object(),
-        _shared_params_dict={},
+        _shared_params_dict=_SHARED_PARAMS,
         _weight_memory_registry=_REGISTRY,
+        _checksum_recorder=BaseWeightChecksumRecorder(),
         _tensor_stager=SimpleNamespace(get_transfer_ready_params=lambda *_args, **_kwargs: (["w"], ready_hf_tensors)),
         _transfer_engine_meta_list=[
             p2p.TransferEngineMeta(
@@ -199,8 +208,9 @@ def _send_one_bucket_with_a_failing_wait(p2p, *, engine_ranks: list[int]) -> lis
     protocol = SimpleNamespace(
         is_sender=True,
         _shared_param_mapper=object(),
-        _shared_params_dict={},
+        _shared_params_dict=_SHARED_PARAMS,
         _weight_memory_registry=_REGISTRY,
+        _checksum_recorder=BaseWeightChecksumRecorder(),
         _tensor_stager=SimpleNamespace(get_transfer_ready_params=lambda *_args, **_kwargs: (["w"], ready_hf_tensors)),
         _transfer_engine_meta_list=[
             p2p.TransferEngineMeta(

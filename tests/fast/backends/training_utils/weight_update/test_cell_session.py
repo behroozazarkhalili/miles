@@ -43,8 +43,8 @@ class _FakeEngine:
     async def begin_weight_update(self, selector: str, sync_base: bool):
         return await self._answer("begin_weight_update", (selector, sync_base))
 
-    async def end_weight_update(self):
-        return await self._answer("end_weight_update")
+    async def end_weight_update(self, expected_base_weight_checksums=None):
+        return await self._answer("end_weight_update", expected_base_weight_checksums)
 
     async def update_weight_version(self, weight_version: str):
         return await self._answer("update_weight_version", weight_version)
@@ -208,6 +208,56 @@ class TestSessionFrame:
         assert log == [("update_weight_version", "cell-0", "12")]
 
 
+class TestBaseWeightChecksumManifests:
+    """The engine verifies the bytes it received, so each cell must be told what was sent to it."""
+
+    def test_each_cell_is_told_the_manifest_of_its_own_transfer(self) -> None:
+        """A manifest built for another cell describes shards this engine never received."""
+        log: list[tuple] = []
+        engines = _fleet(log, ["cell-0", "cell-1"])
+        health = InferenceCellHealth(["cell-0", "cell-1"])
+
+        _session(engines, health).end(
+            expected_base_weight_checksums={"cell-0": {"0": {"w": "aa"}}, "cell-1": {"0": {"w": "bb"}}}
+        )
+
+        assert [(entry[1], entry[2]) for entry in log] == [
+            ("cell-0", {"0": {"w": "aa"}}),
+            ("cell-1", {"0": {"w": "bb"}}),
+        ]
+
+    def test_a_healthy_cell_missing_from_the_manifests_is_still_asked_to_verify(self) -> None:
+        """Sending no manifest at all would let a cell nobody described publish the version anyway."""
+        log: list[tuple] = []
+        engines = _fleet(log, ["cell-0"])
+        health = InferenceCellHealth(["cell-0"])
+
+        _session(engines, health).end(expected_base_weight_checksums={})
+
+        assert log == [("end_weight_update", "cell-0", {})]
+
+    def test_a_protocol_without_manifests_sends_none(self) -> None:
+        """Protocols other than p2p hash nothing, and an empty manifest would fail every engine."""
+        log: list[tuple] = []
+        engines = _fleet(log, ["cell-0"])
+        health = InferenceCellHealth(["cell-0"])
+
+        _session(engines, health).end()
+
+        assert log == [("end_weight_update", "cell-0", None)]
+
+    def test_an_errored_cell_is_not_verified(self) -> None:
+        """It is not resumed either, so asking it to verify only adds a request to a dead engine."""
+        log: list[tuple] = []
+        engines = _fleet(log, ["cell-0", "cell-1"])
+        health = InferenceCellHealth(["cell-0", "cell-1"])
+        health.mark_errored("cell-0", RuntimeError("boom"))
+
+        _session(engines, health).end(expected_base_weight_checksums={"cell-0": {}, "cell-1": {"0": {"w": "bb"}}})
+
+        assert [entry[1] for entry in log] == ["cell-1"]
+
+
 class TestNothingToDrive:
     """A rank whose cells have all failed must not hang or raise on an empty fan-out."""
 
@@ -296,7 +346,7 @@ class TestRequestDeadline:
         log: list[tuple] = []
         engines = _fleet(log, ["cell-0", "cell-1"])
 
-        async def hanging_end():
+        async def hanging_end(expected_base_weight_checksums=None):
             await asyncio.Event().wait()
 
         engines["cell-0"].end_weight_update = hanging_end

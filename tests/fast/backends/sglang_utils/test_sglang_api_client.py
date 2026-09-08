@@ -834,7 +834,19 @@ class TestWeightControlPayloads:
         """Closing the session takes no selector: post-processing covers the full model."""
         await client.end_weight_update()
 
-        assert recorder.calls[0][2]["json"] == {"expected_lora_checksums": None}
+        assert recorder.calls[0][2]["json"] == {
+            "expected_lora_checksums": None,
+            "expected_base_weight_checksums": None,
+        }
+
+    async def test_end_weight_update_forwards_the_base_weight_manifest(self, client, recorder):
+        """The engine verifies the received base weights against this manifest before it transforms them."""
+        await client.end_weight_update(expected_base_weight_checksums={"0": {"model.w": "aa"}})
+
+        assert recorder.calls[0][2]["json"] == {
+            "expected_lora_checksums": None,
+            "expected_base_weight_checksums": {"0": {"model.w": "aa"}},
+        }
 
     async def test_update_weight_version_keeps_in_flight_requests_by_default(self, client, recorder):
         """main never aborted generation on a version bump, and the broadcast path relies on that default."""
