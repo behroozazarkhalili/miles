@@ -1,9 +1,11 @@
 # Miles training-CLI flags not yet in docs/user-guide/cli-reference.md.
 # Baseline for tests/fast/utils/test_cli_reference_sync.py -- built to shrink.
 # Document a flag in cli-reference.md, then delete its line here.
-# 248 flags (339 scanned) as of generation.
+# 250 flags (339 scanned) as of generation.
 --allgather-cp
 --allow-partial-train-step
+--api-server-host
+--api-server-port
 --apply-chat-template-kwargs
 --async-data-buffer-capacity-factor
 --async-max-concurrent-samples
@@ -25,6 +27,7 @@
 --ci-inject-rollout-data-path
 --ci-inject-rollout-data-start-rollout-id
 --ci-load-grad-norm
+--ci-metric-checker-expect-num
 --ci-metric-checker-key
 --ci-metric-checker-threshold
 --ci-save-grad-norm
@@ -32,7 +35,6 @@
 --ci-test
 --clear-quantized-weight-workspaces-on-offload
 --colocate-memory-peak-device
---control-server-port
 --critic-load
 --critic-lr
 --critic-lr-warmup-iters
