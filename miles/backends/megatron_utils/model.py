@@ -705,7 +705,8 @@ def train_one_step(
                 if parallel_state.indep_dp.size > 1
                 else aggregate_train_losses(losses_reduced, metric_num_rollouts)
             )
-            update_adaptive_entropy(args, loss_reduced)
+            if not disable_optimizer and valid_step:
+                update_adaptive_entropy(args, loss_reduced)
             return loss_reduced, grad_norm, outcome
 
     return {}, grad_norm, outcome
